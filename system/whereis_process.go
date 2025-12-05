@@ -182,7 +182,7 @@ func (w *whereis) fetchAvailableBookNodes() ([]gen.Atom, error) {
 	if err != nil {
 		return nil, err
 	}
-	nodes = append(nodes, w.Node().Name())
+	nodes = uniqNodes(append(nodes, w.Node().Name()))
 	w.book.SetAvailableNodes(nodes)
 	return nodes, nil
 }

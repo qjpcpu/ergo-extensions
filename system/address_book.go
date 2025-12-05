@@ -195,6 +195,10 @@ func unifyNodes(nodes []gen.Atom) []gen.Atom {
 	sort.SliceStable(nodes, func(i int, j int) bool {
 		return nodes[i] < nodes[j]
 	})
+	return uniqNodes(nodes)
+}
+
+func uniqNodes(nodes []gen.Atom) []gen.Atom {
 	dup := make(map[gen.Atom]struct{})
 	var del int
 	for i, item := range nodes {
