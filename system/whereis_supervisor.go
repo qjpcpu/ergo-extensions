@@ -7,70 +7,19 @@ import (
 
 const WhereIsSupervisor = gen.Atom("whereissup")
 
-type Options struct {
-	// DaemonIteratorFactory is a factory for creating a daemon iterator.
-	DaemonIteratorFactory DaemonIteratorFactory
-	// DaemonLaunchers is a map of daemon launchers.
-	DaemonLaunchers map[gen.Atom]Launcher
-}
-
-/*
-example:
-func (app *MyApp) Load(node gen.Node, args ...any) (gen.ApplicationSpec, error) {
-    launcherName := gen.Atom("my_launcher")
-    options := system.Options{
-        DaemonIteratorFactory: func() system.DaemonIterator {
-            limit := 20
-            return func() ([]system.DaemonProcess, bool, error) {
-                var ret []system.DaemonProcess
-                for i := 0; i < 10 && limit > 0; i++ {
-                    name := gen.Atom(fmt.Sprintf("child-%d", limit))
-                    ret = append(ret, system.DaemonProcess{
-                        ProcessName:  name,
-                        LauncherName: launcherName,
-                        Args:         []any{name},
-                    })
-                    limit--
-                }
-                return ret, limit > 0, nil
-            }
-        },
-        DaemonLaunchers: map[gen.Atom]system.Launcher{
-            launcherName: {
-                Factory: func() gen.ProcessBehavior { return &childActor{} },
-            },
-        },
-    }
-    return gen.ApplicationSpec{
-        Name:        "myapp",
-        Description: "Example application with myactor",
-        Mode:        gen.ApplicationModePermanent,
-        Group: []gen.ApplicationMemberSpec{
-            system.ApplicationMemberSepc(options),
-            {
-                Name:    "myactor",
-                Factory: factory,
-                Options: gen.ProcessOptions{},
-                Args:    []any{},
-            },
-        },
-    }, nil
-}
-*/
-func ApplicationMemberSepc(o Options) gen.ApplicationMemberSpec {
+func ApplicationMemberSepc() gen.ApplicationMemberSpec {
 	return gen.ApplicationMemberSpec{
 		Name:    WhereIsSupervisor,
-		Factory: FactoryWhereisSup(o),
+		Factory: FactoryWhereisSup(),
 	}
 }
 
-func FactoryWhereisSup(o Options) gen.ProcessFactory {
-	return func() gen.ProcessBehavior { return &WhereisSup{options: o} }
+func FactoryWhereisSup() gen.ProcessFactory {
+	return func() gen.ProcessBehavior { return &WhereisSup{} }
 }
 
 type WhereisSup struct {
 	act.Supervisor
-	options Options
 }
 
 func (sup *WhereisSup) Init(args ...any) (act.SupervisorSpec, error) {
@@ -87,13 +36,11 @@ func (sup *WhereisSup) Init(args ...any) (act.SupervisorSpec, error) {
 			Name:    WhereIsProcess,
 			Factory: factory_whereis(book),
 		},
-	}
-	if fac := sup.options.DaemonIteratorFactory; fac != nil {
-		spec.Children = append(spec.Children, act.SupervisorChildSpec{
+		{
 			Name:    DaemonMonitorProcess,
-			Factory: factory_daemon(fac, sup.options.DaemonLaunchers, book),
+			Factory: factory_daemon(book),
 			Args:    []any{},
-		})
+		},
 	}
 
 	// set strategy

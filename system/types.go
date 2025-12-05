@@ -38,7 +38,8 @@ type (
 
 	MessageLaunchAllDaemon struct{}
 	MessageLaunchOneDaemon struct {
-		Process DaemonProcess
+		Launcher gen.Atom
+		Process  DaemonProcess
 	}
 )
 
