@@ -1,10 +1,10 @@
 package system
 
 import (
+	"sync/atomic"
 	"time"
 
 	"ergo.services/ergo/act"
-	"ergo.services/ergo/app/system/inspect"
 	"ergo.services/ergo/gen"
 	"ergo.services/registrar/zk"
 )
@@ -19,22 +19,37 @@ type whereis struct {
 	broadcastNodeSet map[gen.Atom]struct{}
 	nextBroadcastAt  int64
 	registrar        gen.Registrar
+
+	pid_to_name  map[gen.PID]gen.Atom
+	name_to_pid  map[gen.Atom]gen.PID
+	processCache atomic.Value
 }
 
 func factory_whereis(book *AddressBook) gen.ProcessFactory {
-	return func() gen.ProcessBehavior { return &whereis{book: book, broadcastNodeSet: make(map[gen.Atom]struct{})} }
+	var v atomic.Value
+	v.Store(ProcessInfoList{})
+	return func() gen.ProcessBehavior {
+		return &whereis{
+			book:             book,
+			broadcastNodeSet: make(map[gen.Atom]struct{}),
+			pid_to_name:      make(map[gen.PID]gen.Atom),
+			name_to_pid:      make(map[gen.Atom]gen.PID),
+			processCache:     v,
+		}
+	}
 }
 
 func (w *whereis) Init(args ...any) error {
 	w.Log().Info("whereis process start up")
-	w.SendAfter(w.PID(), start_init{}, time.Second*1)
+	w.SendAfter(w.PID(), inspect_process_list{}, time.Second*1)
 	return nil
 }
 
 func (w *whereis) HandleMessage(from gen.PID, message any) error {
 	switch e := message.(type) {
-	case start_init:
-		w.setupRegistrarMonitoring()
+	case inspect_process_list:
+		w.inspectProcessList()
+		w.SendAfter(w.PID(), inspect_process_list{}, time.Second*1)
 	case rebroadcast:
 		if w.nextBroadcastAt > time.Now().Unix() || len(w.broadcastNodeSet) == 0 {
 			return nil
@@ -81,14 +96,6 @@ func (w *whereis) HandleCall(from gen.PID, ref gen.Ref, request any) (any, error
 
 func (w *whereis) HandleEvent(event gen.MessageEvent) error {
 	switch e := event.Message.(type) {
-	case inspect.MessageInspectProcessList:
-		nodes, err := w.fetchAvailableBookNodes()
-		if err != nil {
-			w.Log().Error("fetch nodes fail %v", err)
-			return err
-		}
-		processList := filterProcessList(mapGenProcessList(e.Node, e.Processes))
-		w.diffAndBroadcast(nodes, e.Node, processList)
 	case zk.EventNodeJoined:
 		node := w.Node().Name()
 		list := w.book.GetProcessList(node)
@@ -144,22 +151,86 @@ func (w *whereis) diffAndBroadcast(nodes []gen.Atom, selfNode gen.Atom, newList 
 	}
 }
 
-func (w *whereis) setupRegistrarMonitoring() error {
-	info, err := w.Call(inspect.Name, inspect.RequestInspectProcessList{})
+func (w *whereis) inspectProcessList() error {
+	if err := w.collectProcessList(); err != nil {
+		return err
+	}
+	nodes, err := w.fetchAvailableBookNodes()
 	if err != nil {
-		w.Log().Error("inspect processlist fail %v", err)
-		w.SendAfter(w.PID(), start_init{}, time.Second)
+		w.Log().Error("fetch nodes fail %v", err)
 		return err
 	}
-	psInfo := info.(inspect.ResponseInspectProcessList)
-	evt := psInfo.Event
-	if _, err := w.MonitorEvent(evt); err != nil {
-		w.Log().Error("monitor processlist fail %v", err)
-		w.SendAfter(w.PID(), start_init{}, time.Second)
-		return err
-	}
+	w.diffAndBroadcast(nodes, w.Node().Name(), w.processCache.Load().(ProcessInfoList))
 	return nil
+}
 
+// collectProcessList gets all processes from the current node,
+// finds the newly started and recently stopped processes,
+// updates the internal cache, and stores the full process list
+// into the processCache.
+func (w *whereis) collectProcessList() error {
+	// Get the list of all running process PIDs on the current node.
+	pidList, err := w.Node().ProcessList()
+	if err != nil {
+		return err
+	}
+
+	pidMap := make(map[gen.PID]struct{})
+	var added, del []gen.PID
+	// Iterate through the current process list to find newly added processes.
+	for _, pid := range pidList {
+		pidMap[pid] = struct{}{}
+		if _, ok := w.pid_to_name[pid]; !ok {
+			added = append(added, pid)
+		}
+	}
+	// Iterate through the old process list (pid_to_name) to find deleted (terminated) processes.
+	for pid := range w.pid_to_name {
+		if _, ok := pidMap[pid]; !ok {
+			del = append(del, pid)
+		}
+	}
+
+	// If there are no added or deleted processes, there is nothing to do.
+	if len(added) == 0 && len(del) == 0 {
+		return nil
+	}
+
+	node := w.Node()
+	// Remove deleted processes from the lookup maps.
+	for _, pid := range del {
+		name := w.pid_to_name[pid]
+		// Ensure we only delete the entry if the PID matches,
+		// avoiding issues with stale/reused process names.
+		if w.name_to_pid[name] == pid {
+			delete(w.name_to_pid, name)
+		}
+		delete(w.pid_to_name, pid)
+	}
+
+	// Add new processes to the lookup maps.
+	for _, pid := range added {
+		if info, err := node.ProcessInfo(pid); err != nil {
+			return err
+		} else {
+			w.pid_to_name[pid] = info.Name
+			w.name_to_pid[info.Name] = pid
+		}
+	}
+
+	// Rebuild the full process list from the updated name_to_pid map.
+	procList := make(ProcessInfoList, 0, len(w.name_to_pid))
+	for name, pid := range w.name_to_pid {
+		procList = append(procList, ProcessInfo{
+			Name: name,
+			PID:  pid,
+			Node: node.Name(),
+		})
+	}
+
+	// Atomically update the process cache with the new list.
+	w.processCache.Store(procList)
+	return nil
 }
 
 func (w *whereis) fetchAvailableBookNodes() ([]gen.Atom, error) {

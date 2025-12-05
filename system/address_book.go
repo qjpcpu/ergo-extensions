@@ -8,7 +8,6 @@ import (
 
 	"ergo.services/ergo/gen"
 
-	builtin "ergo.services/ergo/app/system"
 	"github.com/buraksezer/consistent"
 	"github.com/cespare/xxhash"
 )
@@ -239,51 +238,6 @@ func interactNodes(nodes1, nodes2 []gen.Atom) (ret []gen.Atom) {
 		}
 	}
 	return
-}
-
-// mapGenProcessList converts a list of gen.ProcessShortInfo to a list of ProcessInfo.
-func mapGenProcessList(node gen.Atom, ps []gen.ProcessShortInfo) (ret []ProcessInfo) {
-	for _, item := range ps {
-		ret = append(ret, mapGenProcess(node, item))
-	}
-	return
-}
-
-// filterProcessList removes local processes from the given list of processes.
-func filterProcessList(ps []ProcessInfo) []ProcessInfo {
-	var del int
-	for i, item := range ps {
-		if isLocalProc(item) {
-			del++
-		} else if del > 0 {
-			ps[i-del] = item
-		}
-	}
-	return ps[:len(ps)-del]
-}
-
-// isLocalProc checks if the given process is a local process.
-func isLocalProc(p ProcessInfo) bool {
-	if p.Application == builtin.Name || p.Name == "" {
-		return true
-	}
-	switch p.Name {
-	case WhereIsProcess, WhereIsSupervisor, DaemonMonitorProcess:
-		return true
-	}
-	return false
-}
-
-// mapGenProcess converts a gen.ProcessShortInfo to a ProcessInfo.
-func mapGenProcess(node gen.Atom, p gen.ProcessShortInfo) ProcessInfo {
-	return ProcessInfo{
-		Node:        node,
-		PID:         p.PID,
-		Name:        p.Name,
-		Application: p.Application,
-		State:       p.State,
-		Uptime:      p.Uptime,
-	}
 }
 
 // hasher is a wrapper for xxhash.Sum64

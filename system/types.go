@@ -6,9 +6,10 @@ import (
 )
 
 type (
-	start_init    struct{}
-	rebroadcast   struct{}
-	MessageLocate struct {
+	start_init           struct{}
+	inspect_process_list struct{}
+	rebroadcast          struct{}
+	MessageLocate        struct {
 		Name gen.Atom
 	}
 	MessageProcessChanged struct {
@@ -26,12 +27,6 @@ type (
 		PID gen.PID
 		// Name registered associated name with this process
 		Name gen.Atom
-		// Application application name if this process started under application umbrella
-		Application gen.Atom
-		// State shows current state of the process
-		State gen.ProcessState
-		// Uptime of the process in seconds
-		Uptime int64
 	}
 	ProcessInfoList    []ProcessInfo
 	MessageProcessList struct {
