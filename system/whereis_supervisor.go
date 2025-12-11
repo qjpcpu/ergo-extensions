@@ -1,9 +1,19 @@
 package system
 
 import (
+	"sync/atomic"
+
 	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
 )
+
+var global_address_book atomic.Value
+
+func init() { global_address_book.Store(NewAddressBook()) }
+
+func GetAddressBook() IAddressBook {
+	return global_address_book.Load().(*AddressBook)
+}
 
 const WhereIsSupervisor = gen.Atom("whereissup")
 
@@ -29,6 +39,7 @@ func (sup *WhereisSup) Init(args ...any) (act.SupervisorSpec, error) {
 	spec.Type = act.SupervisorTypeOneForOne
 
 	book := NewAddressBook()
+	global_address_book.Store(book)
 
 	// add children
 	spec.Children = []act.SupervisorChildSpec{
