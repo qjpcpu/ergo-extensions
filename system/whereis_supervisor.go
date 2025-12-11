@@ -1,35 +1,38 @@
 package system
 
 import (
-	"sync/atomic"
-
 	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
 )
 
-var global_address_book atomic.Value
-
-func init() { global_address_book.Store(NewAddressBook()) }
-
-func GetAddressBook() IAddressBook {
-	return global_address_book.Load().(*AddressBook)
-}
-
 const WhereIsSupervisor = gen.Atom("whereissup")
 
-func ApplicationMemberSepc() gen.ApplicationMemberSpec {
+type ApplicationMemberSepcOptions struct {
+	AddressBook *AddressBook
+}
+
+func ApplicationMemberSepc(opts ApplicationMemberSepcOptions) gen.ApplicationMemberSpec {
 	return gen.ApplicationMemberSpec{
 		Name:    WhereIsSupervisor,
-		Factory: FactoryWhereisSup(),
+		Factory: FactoryWhereisSup(opts),
 	}
 }
 
-func FactoryWhereisSup() gen.ProcessFactory {
-	return func() gen.ProcessBehavior { return &WhereisSup{} }
+func FactoryWhereisSup(opts ApplicationMemberSepcOptions) gen.ProcessFactory {
+	return func() gen.ProcessBehavior {
+		sup := &WhereisSup{}
+		if opts.AddressBook != nil {
+			sup.book = opts.AddressBook
+		} else {
+			sup.book = NewAddressBook()
+		}
+		return sup
+	}
 }
 
 type WhereisSup struct {
 	act.Supervisor
+	book *AddressBook
 }
 
 func (sup *WhereisSup) Init(args ...any) (act.SupervisorSpec, error) {
@@ -38,8 +41,7 @@ func (sup *WhereisSup) Init(args ...any) (act.SupervisorSpec, error) {
 	// set supervisor type
 	spec.Type = act.SupervisorTypeOneForOne
 
-	book := NewAddressBook()
-	global_address_book.Store(book)
+	book := sup.book
 
 	// add children
 	spec.Children = []act.SupervisorChildSpec{
