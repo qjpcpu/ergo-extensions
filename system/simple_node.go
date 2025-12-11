@@ -2,6 +2,7 @@ package system
 
 import (
 	"ergo.services/ergo"
+	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
 	"ergo.services/registrar/zk"
 )
@@ -10,11 +11,17 @@ type SimpleNodeOptions struct {
 	zk.Options
 	NodeName string
 	// Optional
-	Cookie      string
-	MemberSpecs []gen.ApplicationMemberSpec
+	Cookie            string
+	MemberSpecs       []gen.ApplicationMemberSpec
+	NodeForwardWorker int64
 }
 
-func StartSimpleNode(opts SimpleNodeOptions) (gen.Node, error) {
+type Node struct {
+	gen.Node
+	forwardPID gen.PID
+}
+
+func StartSimpleNode(opts SimpleNodeOptions) (*Node, error) {
 	book := NewAddressBook()
 	var options gen.NodeOptions
 	registrar, err := zk.Create(opts.Options)
@@ -34,7 +41,14 @@ func StartSimpleNode(opts SimpleNodeOptions) (gen.Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	return node, nil
+
+	forwardPID, err := node.Spawn(func() gen.ProcessBehavior {
+		return &myPool{size: opts.NodeForwardWorker}
+	}, gen.ProcessOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return &Node{Node: node, forwardPID: forwardPID}, nil
 }
 
 type simpleApp struct {
@@ -62,4 +76,107 @@ func str(list ...string) string {
 		}
 	}
 	return ""
+}
+
+type myPool struct {
+	act.Pool
+	size int64
+}
+
+func (p *myPool) Init(args ...any) (act.PoolOptions, error) {
+	if p.size == 0 {
+		p.size = 3
+	}
+	opts := act.PoolOptions{
+		WorkerFactory: func() gen.ProcessBehavior {
+			return &myworker{}
+		},
+		PoolSize: p.size,
+	}
+
+	return opts, nil
+}
+
+type myworker struct {
+	act.Actor
+}
+
+func (w *myworker) Init(args ...any) error {
+	return nil
+}
+
+type nodeResult struct {
+	response any
+	err      error
+}
+
+type messageNodeSend struct {
+	to  string
+	msg any
+	ch  chan nodeResult
+}
+
+type messageNodeCall struct {
+	to  string
+	msg any
+	ch  chan nodeResult
+}
+
+func (w *myworker) HandleMessage(from gen.PID, message any) error {
+	switch e := message.(type) {
+	case messageNodeSend:
+		if p, ok := GetAddressBook().Locate(gen.Atom(e.to)); !ok || w.Node().Name() == p.Node {
+			e.ch <- nodeResult{err: w.Send(gen.Atom(e.to), e.msg)}
+		} else {
+			e.ch <- nodeResult{err: w.Send(gen.ProcessID{Node: p.Node, Name: gen.Atom(e.to)}, e.msg)}
+		}
+	case messageNodeCall:
+		if p, ok := GetAddressBook().Locate(gen.Atom(e.to)); !ok || w.Node().Name() == p.Node {
+			res, err := w.Call(gen.Atom(e.to), e.msg)
+			e.ch <- nodeResult{response: res, err: err}
+		} else {
+			res, err := w.Call(gen.ProcessID{Node: p.Node, Name: gen.Atom(e.to)}, e.msg)
+			e.ch <- nodeResult{response: res, err: err}
+		}
+	}
+	return nil
+}
+
+func (n *Node) ForwardSend(to string, msg any) error {
+	ch := make(chan nodeResult, 1)
+	err := n.Send(n.forwardPID, messageNodeSend{
+		to:  to,
+		msg: msg,
+		ch:  ch,
+	})
+	if err != nil {
+		return err
+	}
+	res := <-ch
+	if res.err != nil {
+		return res.err
+	}
+	return nil
+}
+
+func (n *Node) ForwardCall(to string, msg any) (any, error) {
+	ch := make(chan nodeResult, 1)
+	err := n.Send(n.forwardPID, messageNodeCall{
+		to:  to,
+		msg: msg,
+		ch:  ch,
+	})
+	if err != nil {
+		return nil, err
+	}
+	res := <-ch
+	if res.err != nil {
+		return nil, res.err
+	}
+	return res.response, nil
+}
+
+func (n *Node) LocateProcess(process gen.Atom) gen.Atom {
+	p, _ := GetAddressBook().Locate(process)
+	return p.Node
 }
