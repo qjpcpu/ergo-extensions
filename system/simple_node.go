@@ -23,7 +23,7 @@ func (node *Node) GetAddressBook() IAddressBook {
 	return node.book
 }
 
-func StartSimpleNode(opts SimpleNodeOptions) (gen.Node, error) {
+func StartSimpleNode(opts SimpleNodeOptions) (*Node, error) {
 	book := NewAddressBook()
 	var options gen.NodeOptions
 	registrar, err := zk.Create(opts.Options)
