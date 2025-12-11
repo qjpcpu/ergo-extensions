@@ -14,16 +14,7 @@ type SimpleNodeOptions struct {
 	MemberSpecs []gen.ApplicationMemberSpec
 }
 
-type Node struct {
-	gen.Node
-	book *AddressBook
-}
-
-func (node *Node) GetAddressBook() IAddressBook {
-	return node.book
-}
-
-func StartSimpleNode(opts SimpleNodeOptions) (*Node, error) {
+func StartSimpleNode(opts SimpleNodeOptions) (gen.Node, error) {
 	book := NewAddressBook()
 	var options gen.NodeOptions
 	registrar, err := zk.Create(opts.Options)
@@ -43,7 +34,7 @@ func StartSimpleNode(opts SimpleNodeOptions) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Node{Node: node, book: book}, nil
+	return node, nil
 }
 
 type simpleApp struct {
