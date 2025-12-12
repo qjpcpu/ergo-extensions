@@ -42,9 +42,7 @@ func StartSimpleNode(opts SimpleNodeOptions) (*Node, error) {
 		return nil, err
 	}
 
-	forwardPID, err := node.Spawn(func() gen.ProcessBehavior {
-		return &myPool{size: opts.NodeForwardWorker}
-	}, gen.ProcessOptions{})
+	forwardPID, err := node.Spawn(CreatePool(func() gen.ProcessBehavior { return &myworker{} }, opts.NodeForwardWorker), gen.ProcessOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -78,9 +76,14 @@ func str(list ...string) string {
 	return ""
 }
 
+func CreatePool(workerFactory gen.ProcessFactory, size int64) gen.ProcessFactory {
+	return func() gen.ProcessBehavior { return &myPool{size: size, fac: workerFactory} }
+}
+
 type myPool struct {
 	act.Pool
 	size int64
+	fac  gen.ProcessFactory
 }
 
 func (p *myPool) Init(args ...any) (act.PoolOptions, error) {
@@ -88,10 +91,8 @@ func (p *myPool) Init(args ...any) (act.PoolOptions, error) {
 		p.size = 3
 	}
 	opts := act.PoolOptions{
-		WorkerFactory: func() gen.ProcessBehavior {
-			return &myworker{}
-		},
-		PoolSize: p.size,
+		WorkerFactory: p.fac,
+		PoolSize:      p.size,
 	}
 
 	return opts, nil
