@@ -96,6 +96,8 @@ func (book *AddressBook) SetProcess(node gen.Atom, ps ...ProcessInfo) {
 	newProcesses := make(map[gen.Atom]ProcessInfo, len(ps))
 	for _, process := range ps {
 		if name := process.Name; name != "" {
+			// enforce node consistency
+			process.Node = node
 			newProcesses[name] = process
 			book.processToNodes[name] = unifyNodes(append(book.processToNodes[name], node))
 		}
@@ -103,7 +105,13 @@ func (book *AddressBook) SetProcess(node gen.Atom, ps ...ProcessInfo) {
 
 	for name := range oldProcesses {
 		if _, ok := newProcesses[name]; !ok {
-			book.processToNodes[name] = removeNode(book.processToNodes[name], node)
+			// remove node and cleanup empty keys
+			arr := removeNode(book.processToNodes[name], node)
+			if len(arr) == 0 {
+				delete(book.processToNodes, name)
+			} else {
+				book.processToNodes[name] = arr
+			}
 		}
 	}
 
@@ -124,6 +132,8 @@ func (book *AddressBook) AddProcess(node gen.Atom, ps ...ProcessInfo) {
 
 	for _, process := range ps {
 		if name := process.Name; name != "" {
+			// enforce node consistency
+			process.Node = node
 			processes[name] = process
 			book.processToNodes[name] = unifyNodes(append(book.processToNodes[name], node))
 		}
@@ -145,7 +155,12 @@ func (book *AddressBook) RemoveProcess(node gen.Atom, ps ...ProcessInfo) {
 	for _, process := range ps {
 		if name := process.Name; name != "" {
 			if old, ok := processes[name]; ok && old.Node == node {
-				book.processToNodes[name] = removeNode(book.processToNodes[name], node)
+				arr := removeNode(book.processToNodes[name], node)
+				if len(arr) == 0 {
+					delete(book.processToNodes, name)
+				} else {
+					book.processToNodes[name] = arr
+				}
 				delete(processes, name)
 			}
 		}
@@ -168,6 +183,23 @@ func (book *AddressBook) SetAvailableNodes(nodes []gen.Atom) error {
 		if _, ok := newNodes[item]; !ok {
 			book.ring.Remove(string(item))
 			delete(book.nodes, item)
+			// Clean up process indices for the node that has been removed.
+			// Scenario: when a node goes offline, actors (named processes) may migrate to other nodes.
+			// If the old node comes back, stale mappings could make Locate() return the old node,
+			// causing abnormal re-location or misrouting.
+			// Action: for each process previously recorded on this node, remove the node from
+			// the reverse index (processToNodes) and delete the node's process table entry.
+			// Effect: AddressBook remains consistent with the current membership; Locate/PickNode
+			// won't point to offline or outdated nodes, preventing incorrect actor placement on rejoin.
+			for proc := range book.nodeProcesses[item] {
+				arr := removeNode(book.processToNodes[proc], item)
+				if len(arr) == 0 {
+					delete(book.processToNodes, proc)
+				} else {
+					book.processToNodes[proc] = arr
+				}
+			}
+			delete(book.nodeProcesses, item)
 		}
 	}
 	book.nodesCache.Store(nodes)
