@@ -103,6 +103,18 @@ func (w *whereis) HandleCall(from gen.PID, ref gen.Ref, request any) (any, error
 	return w.PID(), nil
 }
 
+// Rationale for event handling:
+//   - This process only reacts to node joins to speed up convergence on new nodes
+//     by immediately pushing the local process snapshot.
+//   - Node leaves/offline are not explicitly handled here. The periodic inspector
+//     (`inspect_process_list`) invokes `fetchAvailableBookNodes` and then
+//     `book.SetAvailableNodes(nodes)`, which computes a diff, removes absent nodes,
+//     and cleans their process indices. This keeps `Locate`/`PickNode` from pointing
+//     to offline or outdated nodes without requiring leave-event broadcasts.
+//   - Recovery/launch logic upon membership changes is handled by `daemon_monitor`.
+//   - If stricter real-time reaction to leaves is desired, a `zk.EventNodeLeft`
+//     branch can be added to trigger an immediate refresh; however, the snapshot-based
+//     cleanup is simpler and resilient to churn and transient registrar events.
 func (w *whereis) HandleEvent(event gen.MessageEvent) error {
 	switch e := event.Message.(type) {
 	case zk.EventNodeJoined:
