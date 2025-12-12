@@ -12,8 +12,10 @@ type SimpleNodeOptions struct {
 	NodeName string
 	// Optional
 	Cookie            string
+	MoreApps          []gen.ApplicationBehavior
 	MemberSpecs       []gen.ApplicationMemberSpec
 	NodeForwardWorker int64
+	ObserverAddress   string
 }
 
 type Node struct {
@@ -33,7 +35,7 @@ func StartSimpleNode(opts SimpleNodeOptions) (*Node, error) {
 	options.Network.Cookie = str("simple-app-cookie-123")
 	options.Network.InsecureSkipVerify = true
 	apps := []gen.ApplicationBehavior{&simpleApp{book: book, MemberSpecs: opts.MemberSpecs}}
-	options.Applications = apps
+	options.Applications = append(apps, opts.MoreApps...)
 	options.Log.DefaultLogger.Disable = true
 
 	// Start the node
