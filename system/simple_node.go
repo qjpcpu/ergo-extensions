@@ -1,6 +1,8 @@
 package system
 
 import (
+	"time"
+
 	"ergo.services/ergo"
 	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
@@ -16,6 +18,9 @@ type SimpleNodeOptions struct {
 	MemberSpecs       []gen.ApplicationMemberSpec
 	NodeForwardWorker int64
 	ObserverAddress   string
+
+	LogLevel   gen.LogLevel
+	LogOptions *gen.DefaultLoggerOptions
 }
 
 type Node struct {
@@ -36,7 +41,12 @@ func StartSimpleNode(opts SimpleNodeOptions) (*Node, error) {
 	options.Network.InsecureSkipVerify = true
 	apps := []gen.ApplicationBehavior{&simpleApp{book: book, MemberSpecs: opts.MemberSpecs}}
 	options.Applications = append(apps, opts.MoreApps...)
-	options.Log.DefaultLogger.Disable = true
+
+	options.Log.Level = opts.LogLevel
+	options.Log.DefaultLogger.TimeFormat = time.DateTime
+	if lo := opts.LogOptions; lo != nil {
+		options.Log.DefaultLogger = *lo
+	}
 
 	// Start the node
 	node, err := ergo.StartNode(gen.Atom(opts.NodeName), options)

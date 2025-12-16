@@ -235,7 +235,9 @@ func (w *whereis) collectProcessList() error {
 			return err
 		} else {
 			w.pid_to_name[pid] = info.Name
-			w.name_to_pid[info.Name] = pid
+			if info.Name != "" {
+				w.name_to_pid[info.Name] = pid
+			}
 		}
 	}
 
