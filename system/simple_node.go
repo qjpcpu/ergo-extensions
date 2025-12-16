@@ -18,9 +18,8 @@ type SimpleNodeOptions struct {
 	MemberSpecs       []gen.ApplicationMemberSpec
 	NodeForwardWorker int64
 	ObserverAddress   string
-
-	LogLevel   gen.LogLevel
-	LogOptions *gen.DefaultLoggerOptions
+	LogLevel          gen.LogLevel
+	DefaultLogOptions gen.DefaultLoggerOptions
 }
 
 type Node struct {
@@ -43,9 +42,9 @@ func StartSimpleNode(opts SimpleNodeOptions) (*Node, error) {
 	options.Applications = append(apps, opts.MoreApps...)
 
 	options.Log.Level = opts.LogLevel
-	options.Log.DefaultLogger.TimeFormat = time.DateTime
-	if lo := opts.LogOptions; lo != nil {
-		options.Log.DefaultLogger = *lo
+	options.Log.DefaultLogger = opts.DefaultLogOptions
+	if options.Log.DefaultLogger.TimeFormat == "" {
+		options.Log.DefaultLogger.TimeFormat = time.DateTime
 	}
 
 	// Start the node
