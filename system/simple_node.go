@@ -7,6 +7,7 @@ import (
 	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
 	"ergo.services/registrar/zk"
+	"github.com/qjpcpu/ergo-extensions/registrar/mem"
 )
 
 type SimpleNodeOptions struct {
@@ -30,11 +31,15 @@ type Node struct {
 func StartSimpleNode(opts SimpleNodeOptions) (*Node, error) {
 	book := NewAddressBook()
 	var options gen.NodeOptions
-	registrar, err := zk.Create(opts.Options)
-	if err != nil {
-		return nil, err
+	if len(opts.Options.Endpoints) != 0 {
+		registrar, err := zk.Create(opts.Options)
+		if err != nil {
+			return nil, err
+		}
+		options.Network.Registrar = registrar
+	} else {
+		options.Network.Registrar = mem.Create()
 	}
-	options.Network.Registrar = registrar
 	options.Network.Acceptors = []gen.AcceptorOptions{{Host: "0.0.0.0", TCP: "tcp"}}
 	options.Network.Cookie = str("simple-app-cookie-123")
 	options.Network.InsecureSkipVerify = true
