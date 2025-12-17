@@ -53,7 +53,7 @@ func StartSimpleNode(opts SimpleNodeOptions) (*Node, error) {
 		return nil, err
 	}
 
-	forwardPID, err := node.Spawn(CreatePool(func() gen.ProcessBehavior { return &myworker{} }, opts.NodeForwardWorker), gen.ProcessOptions{})
+	forwardPID, err := node.Spawn(CreatePool(func() gen.ProcessBehavior { return &myworker{monitorPID: make(map[gen.PID]chan error)} }, opts.NodeForwardWorker), gen.ProcessOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -111,6 +111,7 @@ func (p *myPool) Init(args ...any) (act.PoolOptions, error) {
 
 type myworker struct {
 	act.Actor
+	monitorPID map[gen.PID]chan error
 }
 
 func (w *myworker) Init(args ...any) error {
@@ -134,6 +135,11 @@ type messageNodeCall struct {
 	ch  chan nodeResult
 }
 
+type messageWaitProcess struct {
+	PID gen.PID
+	Ch  chan error
+}
+
 func (w *myworker) HandleMessage(from gen.PID, message any) error {
 	switch e := message.(type) {
 	case messageNodeSend:
@@ -150,8 +156,38 @@ func (w *myworker) HandleMessage(from gen.PID, message any) error {
 			res, err := w.Call(gen.ProcessID{Node: p.Node, Name: gen.Atom(e.to)}, e.msg)
 			e.ch <- nodeResult{response: res, err: err}
 		}
+	case messageWaitProcess:
+		if err := w.MonitorPID(e.PID); err != nil {
+			e.Ch <- err
+			return nil
+		} else {
+			w.monitorPID[e.PID] = e.Ch
+		}
+	case gen.MessageDownPID:
+		if ch, ok := w.monitorPID[e.PID]; ok {
+			delete(w.monitorPID, e.PID)
+			if e.Reason == gen.TerminateReasonNormal {
+				ch <- nil
+			} else {
+				ch <- e.Reason
+			}
+			w.Log().Info("PID:%s exit with reason %v", e.PID, e.Reason)
+			w.DemonitorPID(e.PID)
+		}
 	}
 	return nil
+}
+
+func (n *Node) WaitPID(pid gen.PID) error {
+	ch := make(chan error, 1)
+	err := n.Send(n.forwardPID, messageWaitProcess{
+		PID: pid,
+		Ch:  ch,
+	})
+	if err != nil {
+		return err
+	}
+	return <-ch
 }
 
 func (n *Node) ForwardSend(to string, msg any) error {
