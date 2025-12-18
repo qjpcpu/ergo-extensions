@@ -54,7 +54,7 @@ type DaemonProcess struct {
 	// ProcessName is the name of the process.
 	ProcessName gen.Atom
 	// Args are the arguments to start the process.
-	Args        []any
+	Args []any
 }
 
 type Launcher struct {
@@ -78,7 +78,7 @@ type daemon struct {
 	book            *AddressBook
 	registrar       gen.Registrar
 	isLeader        bool
-	planLaunchAllAt int64
+	cancelLaunchAll gen.CancelFunc
 }
 
 func factory_daemon(book *AddressBook) gen.ProcessFactory {
@@ -99,9 +99,6 @@ func (w *daemon) HandleMessage(from gen.PID, message any) error {
 			w.launchAllAfter(time.Second * 10)
 		}
 	case MessageLaunchAllDaemon:
-		if now := time.Now().Unix(); w.planLaunchAllAt > now {
-			return nil
-		}
 		if err := w.leaderShouldRecoverDaemon(); err != nil {
 			w.launchAllAfter(time.Second * 10)
 		}
@@ -136,11 +133,16 @@ func (w *daemon) HandleEvent(event gen.MessageEvent) error {
 }
 
 func (w *daemon) launchAllAfter(duration time.Duration) {
+	if cancel := w.cancelLaunchAll; cancel != nil {
+		cancel()
+		w.cancelLaunchAll = nil
+	}
 	if duration <= 0 {
 		w.Send(w.PID(), MessageLaunchAllDaemon{})
 	} else {
-		w.planLaunchAllAt = max(w.planLaunchAllAt, time.Now().Add(duration).Unix())
-		w.SendAfter(w.PID(), MessageLaunchAllDaemon{}, duration)
+		if c, err := w.SendAfter(w.PID(), MessageLaunchAllDaemon{}, duration); err == nil {
+			w.cancelLaunchAll = c
+		}
 	}
 }
 

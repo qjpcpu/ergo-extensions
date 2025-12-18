@@ -21,10 +21,11 @@ const all_nodes = gen.Atom("*")
 
 type whereis struct {
 	act.Actor
-	book             *AddressBook
-	broadcastNodeSet map[gen.Atom]struct{}
-	nextBroadcastAt  int64
-	registrar        gen.Registrar
+	book              *AddressBook
+	broadcastNodeSet  map[gen.Atom]struct{}
+	broadcastSeq      uint64
+	cancelRebroadcast gen.CancelFunc
+	registrar         gen.Registrar
 
 	pid_to_name  map[gen.PID]gen.Atom
 	name_to_pid  map[gen.Atom]gen.PID
@@ -60,13 +61,13 @@ func (w *whereis) HandleMessage(from gen.PID, message any) error {
 		w.inspectProcessList()
 		w.SendAfter(w.PID(), inspect_process_list{}, time.Second*1)
 	case rebroadcast:
-		if w.nextBroadcastAt > time.Now().Unix() || len(w.broadcastNodeSet) == 0 {
+		if e.seq != w.broadcastSeq || len(w.broadcastNodeSet) == 0 {
 			return nil
 		}
 		nodes, err := w.fetchAvailableBookNodes()
 		if err != nil {
 			w.Log().Error("fetch nodes fail %v", err)
-			w.SendAfter(w.PID(), e, time.Second*3)
+			w.broadcastLater(time.Second*3, w.getBroadcastNodeList()...)
 			return nil
 		}
 		if _, ok := w.broadcastNodeSet[all_nodes]; ok {
@@ -294,7 +295,10 @@ func (w *whereis) broadcastProcesses(nodes []gen.Atom, node gen.Atom, ps []Proce
 	}
 
 	clear(w.broadcastNodeSet)
-	w.nextBroadcastAt = 0
+	if cancel := w.cancelRebroadcast; cancel != nil {
+		cancel()
+		w.cancelRebroadcast = nil
+	}
 	if len(failedNodes) > 0 {
 		w.broadcastLater(time.Second*3, failedNodes...)
 	}
@@ -325,9 +329,15 @@ func (w *whereis) getBroadcastNodeList() (ret []gen.Atom) {
 }
 
 func (w *whereis) broadcastLater(dur time.Duration, nodes ...gen.Atom) {
-	w.nextBroadcastAt = max(w.nextBroadcastAt, time.Now().Add(dur).Unix())
+	if cancel := w.cancelRebroadcast; cancel != nil {
+		cancel()
+		w.cancelRebroadcast = nil
+	}
 	for _, node := range nodes {
 		w.broadcastNodeSet[node] = struct{}{}
 	}
-	w.SendAfter(w.PID(), rebroadcast{}, dur)
+	w.broadcastSeq++
+	if c, err := w.SendAfter(w.PID(), rebroadcast{seq: w.broadcastSeq}, dur); err == nil {
+		w.cancelRebroadcast = c
+	}
 }

@@ -8,7 +8,7 @@ import (
 type (
 	start_init           struct{}
 	inspect_process_list struct{}
-	rebroadcast          struct{}
+	rebroadcast          struct{ seq uint64 }
 	MessageLocate        struct {
 		Name gen.Atom
 	}
