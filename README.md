@@ -6,7 +6,7 @@ This repository provides a small set of building blocks to add distributed proce
 - `daemon_monitor` — a process that (on the elected leader) recovers and launches daemon processes across nodes using consistent hashing.
 - `AddressBook` — a thread-safe, eventually-consistent cache of nodes and their registered processes, with node picking via consistent hashing.
 
-All components live under the `system` package and are designed to integrate with `ergo.services/ergo` and a registrar (Zookeeper by default).
+Core components live under the `system` package and are designed to integrate with `ergo.services/ergo` and a registrar (Zookeeper by default). The `app` package provides a small helper to start a node with these components wired in.
 
 ## Features
 
@@ -52,6 +52,9 @@ import "github.com/qjpcpu/ergo-extensions/system"
 - `AddressBook`:
   - Tracks available nodes and per-node registered processes
   - Picks a node for a process name using a consistent hashing ring (PartitionCount: 10240, ReplicationFactor: 40)
+- `app.StartSimpleNode`:
+  - Starts an Ergo node and loads the `system.WhereIsSupervisor` with a shared `AddressBook`
+  - Provides helper methods for locating named processes and forwarding sends/calls
 
 ## Quick Start
 
@@ -60,7 +63,7 @@ import "github.com/qjpcpu/ergo-extensions/system"
 ```go
 app := gen.ApplicationSpec{
     Members: []gen.ApplicationMemberSpec{
-        system.ApplicationMemberSepc(),
+        system.ApplicationMemberSepc(system.ApplicationMemberSepcOptions{}),
     },
 }
 // Wire this application spec into your Ergo node environment/startup as usual.
@@ -124,7 +127,7 @@ list := book.GetProcessList(picked)
 - Constants:
   - `system.WhereIsSupervisor`, `system.WhereIsProcess`, `system.DaemonMonitorProcess`
 - Supervisor helpers:
-  - `system.ApplicationMemberSepc() gen.ApplicationMemberSpec`
+  - `system.ApplicationMemberSepc(opts system.ApplicationMemberSepcOptions) gen.ApplicationMemberSpec`
   - `system.FactoryWhereisSup() gen.ProcessFactory`
 - Daemon orchestration:
   - `system.RegisterLauncher(name gen.Atom, launcher system.Launcher) error`
@@ -161,11 +164,10 @@ The code expects a working registrar from the Ergo network. With Zookeeper (`erg
 
 ## Development
 
-- Code lives in `system/`
+- Code lives in `system/` and `app/`
 - No external binaries; integrate directly with your Ergo application
 - Linting/formatting follow your project’s standards
 
 ## License
 
 MIT License. See `LICENSE` for details.
-

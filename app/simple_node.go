@@ -1,4 +1,4 @@
-package system
+package app
 
 import (
 	"time"
@@ -8,7 +8,21 @@ import (
 	"ergo.services/ergo/gen"
 	"ergo.services/registrar/zk"
 	"github.com/qjpcpu/ergo-extensions/registrar/mem"
+	"github.com/qjpcpu/ergo-extensions/system"
 )
+
+// Node is the minimal interface returned by StartSimpleNode.
+//
+// It wraps an Ergo gen.Node and provides helper methods to locate a named
+// process via the shared address book, and to forward sends/calls to the node
+// currently hosting that process.
+type Node interface {
+	gen.Node
+	LocateProcess(process gen.Atom) gen.Atom
+	ForwardCall(to string, msg any) (any, error)
+	ForwardSend(to string, msg any) error
+	WaitPID(pid gen.PID) error
+}
 
 type SimpleNodeOptions struct {
 	zk.Options
@@ -23,13 +37,13 @@ type SimpleNodeOptions struct {
 	DefaultLogOptions gen.DefaultLoggerOptions
 }
 
-type Node struct {
+type nodeImpl struct {
 	gen.Node
 	forwardPID gen.PID
 }
 
-func StartSimpleNode(opts SimpleNodeOptions) (*Node, error) {
-	book := NewAddressBook()
+func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
+	book := system.NewAddressBook()
 	var options gen.NodeOptions
 	if len(opts.Options.Endpoints) != 0 {
 		registrar, err := zk.Create(opts.Options)
@@ -62,16 +76,16 @@ func StartSimpleNode(opts SimpleNodeOptions) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Node{Node: node, forwardPID: forwardPID}, nil
+	return &nodeImpl{Node: node, forwardPID: forwardPID}, nil
 }
 
 type simpleApp struct {
-	book        *AddressBook
+	book        *system.AddressBook
 	MemberSpecs []gen.ApplicationMemberSpec
 }
 
 func (app *simpleApp) Load(node gen.Node, args ...any) (gen.ApplicationSpec, error) {
-	members := append([]gen.ApplicationMemberSpec{ApplicationMemberSepc(ApplicationMemberSepcOptions{AddressBook: app.book})}, app.MemberSpecs...)
+	members := append([]gen.ApplicationMemberSpec{system.ApplicationMemberSepc(system.ApplicationMemberSepcOptions{AddressBook: app.book})}, app.MemberSpecs...)
 	return gen.ApplicationSpec{
 		Name:        "simpleapp",
 		Description: "Simple application",
@@ -148,13 +162,13 @@ type messageWaitProcess struct {
 func (w *myworker) HandleMessage(from gen.PID, message any) error {
 	switch e := message.(type) {
 	case messageNodeSend:
-		if p, ok := GetAddressBook().Locate(gen.Atom(e.to)); !ok || w.Node().Name() == p.Node {
+		if p, ok := system.GetAddressBook().Locate(gen.Atom(e.to)); !ok || w.Node().Name() == p.Node {
 			e.ch <- nodeResult{err: w.Send(gen.Atom(e.to), e.msg)}
 		} else {
 			e.ch <- nodeResult{err: w.Send(gen.ProcessID{Node: p.Node, Name: gen.Atom(e.to)}, e.msg)}
 		}
 	case messageNodeCall:
-		if p, ok := GetAddressBook().Locate(gen.Atom(e.to)); !ok || w.Node().Name() == p.Node {
+		if p, ok := system.GetAddressBook().Locate(gen.Atom(e.to)); !ok || w.Node().Name() == p.Node {
 			res, err := w.Call(gen.Atom(e.to), e.msg)
 			e.ch <- nodeResult{response: res, err: err}
 		} else {
@@ -183,7 +197,7 @@ func (w *myworker) HandleMessage(from gen.PID, message any) error {
 	return nil
 }
 
-func (n *Node) WaitPID(pid gen.PID) error {
+func (n *nodeImpl) WaitPID(pid gen.PID) error {
 	ch := make(chan error, 1)
 	err := n.Send(n.forwardPID, messageWaitProcess{
 		PID: pid,
@@ -195,7 +209,7 @@ func (n *Node) WaitPID(pid gen.PID) error {
 	return <-ch
 }
 
-func (n *Node) ForwardSend(to string, msg any) error {
+func (n *nodeImpl) ForwardSend(to string, msg any) error {
 	ch := make(chan nodeResult, 1)
 	err := n.Send(n.forwardPID, messageNodeSend{
 		to:  to,
@@ -212,7 +226,7 @@ func (n *Node) ForwardSend(to string, msg any) error {
 	return nil
 }
 
-func (n *Node) ForwardCall(to string, msg any) (any, error) {
+func (n *nodeImpl) ForwardCall(to string, msg any) (any, error) {
 	ch := make(chan nodeResult, 1)
 	err := n.Send(n.forwardPID, messageNodeCall{
 		to:  to,
@@ -229,7 +243,7 @@ func (n *Node) ForwardCall(to string, msg any) (any, error) {
 	return res.response, nil
 }
 
-func (n *Node) LocateProcess(process gen.Atom) gen.Atom {
-	p, _ := GetAddressBook().Locate(process)
+func (n *nodeImpl) LocateProcess(process gen.Atom) gen.Atom {
+	p, _ := system.GetAddressBook().Locate(process)
 	return p.Node
 }
