@@ -9,12 +9,6 @@ import (
 	"ergo.services/registrar/zk"
 )
 
-var global_address_book atomic.Value
-
-func init() { global_address_book.Store(NewAddressBook()) }
-
-func GetAddressBook() IAddressBook { return global_address_book.Load().(*AddressBook) }
-
 const WhereIsProcess = gen.Atom("whereis")
 
 const all_nodes = gen.Atom("*")
@@ -33,9 +27,6 @@ type whereis struct {
 }
 
 func factory_whereis(book *AddressBook) gen.ProcessFactory {
-	/* replace global address book */
-	global_address_book.Store(book)
-
 	var v atomic.Value
 	v.Store(ProcessInfoList{})
 	return func() gen.ProcessBehavior {

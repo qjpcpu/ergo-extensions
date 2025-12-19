@@ -22,6 +22,7 @@ type Node interface {
 	ForwardCall(to string, msg any) (any, error)
 	ForwardSend(to string, msg any) error
 	WaitPID(pid gen.PID) error
+	AddressBook() system.IAddressBook
 }
 
 type SimpleNodeOptions struct {
@@ -40,6 +41,7 @@ type SimpleNodeOptions struct {
 type nodeImpl struct {
 	gen.Node
 	forwardPID gen.PID
+	book       *system.AddressBook
 }
 
 func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
@@ -72,11 +74,13 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 		return nil, err
 	}
 
-	forwardPID, err := node.Spawn(CreatePool(func() gen.ProcessBehavior { return &myworker{monitorPID: make(map[gen.PID]chan error)} }, opts.NodeForwardWorker), gen.ProcessOptions{})
+	forwardPID, err := node.Spawn(CreatePool(func() gen.ProcessBehavior {
+		return &myworker{monitorPID: make(map[gen.PID]chan error), book: book}
+	}, opts.NodeForwardWorker), gen.ProcessOptions{})
 	if err != nil {
 		return nil, err
 	}
-	return &nodeImpl{Node: node, forwardPID: forwardPID}, nil
+	return &nodeImpl{Node: node, forwardPID: forwardPID, book: book}, nil
 }
 
 type simpleApp struct {
@@ -131,6 +135,7 @@ func (p *myPool) Init(args ...any) (act.PoolOptions, error) {
 type myworker struct {
 	act.Actor
 	monitorPID map[gen.PID]chan error
+	book       system.IAddressBook
 }
 
 func (w *myworker) Init(args ...any) error {
@@ -162,13 +167,13 @@ type messageWaitProcess struct {
 func (w *myworker) HandleMessage(from gen.PID, message any) error {
 	switch e := message.(type) {
 	case messageNodeSend:
-		if p, ok := system.GetAddressBook().Locate(gen.Atom(e.to)); !ok || w.Node().Name() == p.Node {
+		if p, ok := w.book.Locate(gen.Atom(e.to)); !ok || w.Node().Name() == p.Node {
 			e.ch <- nodeResult{err: w.Send(gen.Atom(e.to), e.msg)}
 		} else {
 			e.ch <- nodeResult{err: w.Send(gen.ProcessID{Node: p.Node, Name: gen.Atom(e.to)}, e.msg)}
 		}
 	case messageNodeCall:
-		if p, ok := system.GetAddressBook().Locate(gen.Atom(e.to)); !ok || w.Node().Name() == p.Node {
+		if p, ok := w.book.Locate(gen.Atom(e.to)); !ok || w.Node().Name() == p.Node {
 			res, err := w.Call(gen.Atom(e.to), e.msg)
 			e.ch <- nodeResult{response: res, err: err}
 		} else {
@@ -244,6 +249,10 @@ func (n *nodeImpl) ForwardCall(to string, msg any) (any, error) {
 }
 
 func (n *nodeImpl) LocateProcess(process gen.Atom) gen.Atom {
-	p, _ := system.GetAddressBook().Locate(process)
+	p, _ := n.book.Locate(process)
 	return p.Node
+}
+
+func (n *nodeImpl) AddressBook() system.IAddressBook {
+	return n.book
 }
