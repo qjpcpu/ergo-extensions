@@ -126,6 +126,17 @@ func (w *daemon) HandleEvent(event gen.MessageEvent) error {
 			w.isLeader = false
 			return nil
 		}
+	case zk.EventNodeRoleHeartbeat:
+		if e.Name == w.Node().Name() {
+			isLeader := e.Role == "LEADER"
+			if w.isLeader != isLeader {
+				w.isLeader = isLeader
+				if isLeader {
+					w.launchAllAfter(time.Second * 1)
+					return nil
+				}
+			}
+		}
 	case zk.EventNodeLeft:
 		w.launchAllAfter(time.Second * 5)
 	}
