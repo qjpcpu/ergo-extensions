@@ -128,7 +128,7 @@ func (w *daemon) HandleEvent(event gen.MessageEvent) error {
 		}
 	case zk.EventNodeRoleHeartbeat:
 		if e.Name == w.Node().Name() {
-			isLeader := e.Role == "LEADER"
+			isLeader := e.Role == zk.Leader
 			if w.isLeader != isLeader {
 				w.isLeader = isLeader
 				if isLeader {
@@ -218,29 +218,34 @@ func (w *daemon) recoverDaemon(launcher Launcher) error {
 	return retErr
 }
 
-func (w *daemon) launchDaemonOnNode(node gen.Atom, launcher Launcher, proc DaemonProcess) error {
+func (w *daemon) launchDaemonOnNode(node gen.Atom, launcher Launcher, proc DaemonProcess) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic when launch daemon %s: %v", launcher.name, r)
+		}
+	}()
 	if _, ok := w.book.Locate(proc.ProcessName); ok {
-		return nil
+		return
 	}
 	if node == w.Node().Name() {
-		_, err := w.SpawnRegister(proc.ProcessName, launcher.Factory, launcher.Option, proc.Args...)
+		_, err = w.SpawnRegister(proc.ProcessName, launcher.Factory, launcher.Option, proc.Args...)
 		if err != nil {
 			if err == gen.ErrTaken {
 				w.Log().Info("launch daemon process %s on %s OK", proc.ProcessName, node)
 				return nil
 			}
 			w.Log().Error("launch daemon process %s on %s fail %v", proc.ProcessName, node, err)
-			return err
+			return
 		} else {
 			w.Log().Info("launch daemon process %s on %s OK", proc.ProcessName, node)
 		}
 	} else {
-		if err := w.SendImportant(gen.ProcessID{Name: DaemonMonitorProcess, Node: node}, MessageLaunchOneDaemon{Launcher: launcher.name, Process: proc}); err != nil {
+		if err = w.SendImportant(gen.ProcessID{Name: DaemonMonitorProcess, Node: node}, MessageLaunchOneDaemon{Launcher: launcher.name, Process: proc}); err != nil {
 			w.Log().Error("spawn remote daemon process %s on %s fail %v", proc.ProcessName, node, err)
-			return err
+			return
 		} else {
 			w.Log().Info("spawn remote daemon process %s on %s OK", proc.ProcessName, node)
 		}
 	}
-	return nil
+	return
 }
