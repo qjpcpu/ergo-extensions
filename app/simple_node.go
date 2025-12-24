@@ -25,6 +25,8 @@ type Node interface {
 	AddressBook() system.IAddressBook
 }
 
+type CronJob = system.CronJob
+
 type SimpleNodeOptions struct {
 	zk.Options
 	NodeName string
@@ -33,9 +35,9 @@ type SimpleNodeOptions struct {
 	MoreApps          []gen.ApplicationBehavior
 	MemberSpecs       []gen.ApplicationMemberSpec
 	NodeForwardWorker int64
-	ObserverAddress   string
 	LogLevel          gen.LogLevel
 	DefaultLogOptions gen.DefaultLoggerOptions
+	CronJobs          []CronJob
 }
 
 type nodeImpl struct {
@@ -59,7 +61,7 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 	options.Network.Acceptors = []gen.AcceptorOptions{{Host: "0.0.0.0", TCP: "tcp"}}
 	options.Network.Cookie = str("simple-app-cookie-123")
 	options.Network.InsecureSkipVerify = true
-	apps := []gen.ApplicationBehavior{&simpleApp{book: book, MemberSpecs: opts.MemberSpecs}}
+	apps := []gen.ApplicationBehavior{&simpleApp{book: book, cron: opts.CronJobs, MemberSpecs: opts.MemberSpecs}}
 	options.Applications = append(apps, opts.MoreApps...)
 
 	options.Log.Level = opts.LogLevel
@@ -85,16 +87,21 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 
 type simpleApp struct {
 	book        *system.AddressBook
+	cron        []CronJob
 	MemberSpecs []gen.ApplicationMemberSpec
 }
 
 func (app *simpleApp) Load(node gen.Node, args ...any) (gen.ApplicationSpec, error) {
-	members := append([]gen.ApplicationMemberSpec{system.ApplicationMemberSepc(system.ApplicationMemberSepcOptions{AddressBook: app.book})}, app.MemberSpecs...)
+	members := append([]gen.ApplicationMemberSpec{
+		system.ApplicationMemberSepc(system.ApplicationMemberSepcOptions{AddressBook: app.book, CronJobs: app.cron})},
+		app.MemberSpecs...,
+	)
 	return gen.ApplicationSpec{
-		Name:        "simpleapp",
+		Name:        "simple_app",
 		Description: "Simple application",
 		Mode:        gen.ApplicationModePermanent,
 		Group:       members,
+		Depends:     gen.ApplicationDepends{Network: true},
 	}, nil
 }
 

@@ -21,8 +21,9 @@ type whereis struct {
 	cancelRebroadcast gen.CancelFunc
 	registrar         gen.Registrar
 
-	pid_to_name  map[gen.PID]gen.Atom
-	name_to_pid  map[gen.Atom]gen.PID
+	pid_to_name map[gen.PID]gen.Atom
+	name_to_pid map[gen.Atom]gen.PID
+	// Only includes named processes
 	processCache atomic.Value
 }
 
@@ -41,7 +42,6 @@ func factory_whereis(book *AddressBook) gen.ProcessFactory {
 }
 
 func (w *whereis) Init(args ...any) error {
-	w.Log().Info("whereis process start up")
 	w.SendAfter(w.PID(), inspect_process_list{}, time.Second*1)
 	return nil
 }

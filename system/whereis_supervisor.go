@@ -9,6 +9,7 @@ const WhereIsSupervisor = gen.Atom("whereissup")
 
 type ApplicationMemberSepcOptions struct {
 	AddressBook *AddressBook
+	CronJobs    []CronJob
 }
 
 func ApplicationMemberSepc(opts ApplicationMemberSepcOptions) gen.ApplicationMemberSpec {
@@ -20,7 +21,7 @@ func ApplicationMemberSepc(opts ApplicationMemberSepcOptions) gen.ApplicationMem
 
 func FactoryWhereisSup(opts ApplicationMemberSepcOptions) gen.ProcessFactory {
 	return func() gen.ProcessBehavior {
-		sup := &WhereisSup{}
+		sup := &WhereisSup{cron: opts.CronJobs}
 		if opts.AddressBook != nil {
 			sup.book = opts.AddressBook
 		} else {
@@ -33,6 +34,7 @@ func FactoryWhereisSup(opts ApplicationMemberSepcOptions) gen.ProcessFactory {
 type WhereisSup struct {
 	act.Supervisor
 	book *AddressBook
+	cron []CronJob
 }
 
 func (sup *WhereisSup) Init(args ...any) (act.SupervisorSpec, error) {
@@ -52,7 +54,10 @@ func (sup *WhereisSup) Init(args ...any) (act.SupervisorSpec, error) {
 		{
 			Name:    DaemonMonitorProcess,
 			Factory: factory_daemon(book),
-			Args:    []any{},
+		},
+		{
+			Name:    CronJobProcess,
+			Factory: factory_cron(sup.cron),
 		},
 	}
 
