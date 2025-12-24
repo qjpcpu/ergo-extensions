@@ -18,14 +18,27 @@ const (
 	CronJobLocationUTC
 )
 
+type CronJobScope int
+
+const (
+	CronJobScopeCluster CronJobScope = iota
+	CronJobScopeNode
+)
+
 const CronJobProcess = gen.Atom("cronjob_scheduler")
 
+// CronJob defines a cron job configuration.
 type CronJob struct {
-	Name           gen.Atom
-	Spec           string
-	Location       CronJobLocation
+	// Name is the unique name of the cron job.
+	Name gen.Atom
+	// Spec is the cron expression (e.g., "* * * * *").
+	Spec string
+	// Location specifies the timezone for the schedule.
+	Location CronJobLocation
+	// TriggerProcess is the name of the process to receive the trigger message.
 	TriggerProcess gen.Atom
-	IsLocal        bool
+	// Scope defines whether the job runs on a single node or across the cluster.
+	Scope CronJobScope
 }
 
 type cron struct {
@@ -50,7 +63,7 @@ func factory_cron(jobs []CronJob) gen.ProcessFactory {
 
 func splitJobs(jobs []CronJob) (local []CronJob, cluster []CronJob) {
 	for _, item := range jobs {
-		if item.IsLocal {
+		if item.Scope == CronJobScopeNode {
 			local = append(local, item)
 		} else {
 			cluster = append(cluster, item)
