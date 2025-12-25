@@ -84,6 +84,9 @@ func (c *client) Nodes() ([]gen.Atom, error) {
 }
 
 func (c *client) ConfigItem(item string) (any, error) {
+	if node := c.node; node != nil {
+		return node.Name(), nil
+	}
 	return nil, gen.ErrUnsupported
 }
 

@@ -8,87 +8,97 @@ import (
 
 	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
-	"ergo.services/registrar/zk"
 )
 
-const WhereIsProcess = gen.Atom("whereis")
-
-const all_nodes = gen.Atom("*")
+const (
+	WhereIsProcess = gen.Atom("whereis")
+)
 
 type whereis struct {
 	act.Actor
-	book              *AddressBook
-	broadcastNodeSet  map[gen.Atom]struct{}
-	broadcastSeq      uint64
-	cancelRebroadcast gen.CancelFunc
-	registrar         gen.Registrar
+	book      *AddressBook
+	registrar gen.Registrar
+
+	changeBufferCap  int
+	procChangeBuffer []MessageProcessChanged
+	procChangeStart  int
+	procChangeCount  int
+
+	selfVersion  ProcessVersion
+	nodeVersions map[gen.Atom]ProcessVersion
 
 	pid_to_name map[gen.PID]gen.Atom
 	name_to_pid map[gen.Atom]gen.PID
 	// only includes named processes
-	processCache atomic.Value
+	processCache     atomic.Value
+	inspect_interval time.Duration
 
 	// stats
-	receive_snapshot_times     int
-	receive_increase_times     int
-	send_snapshot_times        int
-	send_increase_times        int
-	inspect_self_process_times int
+	inspect_self_times          uint64
+	send_fetch_proc_times       uint64
+	respond_fetch_proc_times    uint64
+	receive_proc_snapshot_times uint64
+	receive_incr_proc_times     uint64
 }
 
-func factory_whereis(book *AddressBook) gen.ProcessFactory {
+func factory_whereis(book *AddressBook, inspect_interval time.Duration, changeBuffer int) gen.ProcessFactory {
 	var v atomic.Value
 	v.Store(ProcessInfoList{})
+	if inspect_interval == 0 {
+		inspect_interval = time.Second * 3
+	}
+	if changeBuffer <= 0 {
+		changeBuffer = 16
+	}
 	return func() gen.ProcessBehavior {
 		return &whereis{
 			book:             book,
-			broadcastNodeSet: make(map[gen.Atom]struct{}),
 			pid_to_name:      make(map[gen.PID]gen.Atom),
 			name_to_pid:      make(map[gen.Atom]gen.PID),
 			processCache:     v,
+			selfVersion:      NewVersion(),
+			nodeVersions:     make(map[gen.Atom]ProcessVersion),
+			inspect_interval: inspect_interval,
+			changeBufferCap:  changeBuffer,
 		}
 	}
 }
 
 func (w *whereis) Init(args ...any) error {
-	w.SendAfter(w.PID(), inspect_process_list{}, time.Second*1)
+	w.SendAfter(w.PID(), inspect_process_list{}, w.inspect_interval)
 	return nil
 }
 
 func (w *whereis) HandleMessage(from gen.PID, message any) error {
 	switch e := message.(type) {
 	case inspect_process_list:
-		w.inspect_self_process_times++
 		w.inspectProcessList()
-		w.SendAfter(w.PID(), inspect_process_list{}, time.Second*1)
-	case rebroadcast:
-		if e.seq != w.broadcastSeq || len(w.broadcastNodeSet) == 0 {
-			return nil
-		}
-		nodes, err := w.fetchAvailableBookNodes()
-		if err != nil {
-			w.Log().Error("fetch nodes fail %v", err)
-			w.broadcastLater(time.Second*3, w.getBroadcastNodeList()...)
-			return nil
-		}
-		if _, ok := w.broadcastNodeSet[all_nodes]; ok {
-			w.broadcastProcesses(nodes, w.Node().Name(), w.book.GetProcessList(w.Node().Name()))
-		} else if len(w.broadcastNodeSet) > 0 {
-			w.broadcastProcesses(interactNodes(nodes, w.getBroadcastNodeList()), w.Node().Name(), w.book.GetProcessList(w.Node().Name()))
-		}
+		w.SendAfter(w.PID(), inspect_process_list{}, w.inspect_interval)
+	case MessageFetchProcessList:
+		w.respondMessageFetchProcessList(from, e.Version)
 	case MessageProcesses:
-		w.receive_snapshot_times++
+		w.receive_proc_snapshot_times++
+		if version, ok := w.nodeVersions[e.Node]; ok && version.GreaterThan(e.Version) {
+			w.Log().Warning("received a process version %v from %s, abandon", e.Version, e.Node)
+			return nil
+		}
 		if _, err := w.fetchAvailableBookNodes(); err != nil {
 			w.Log().Error("fetch nodes fail %v", err)
 			return err
 		}
 		w.book.SetProcess(e.Node, e.ProcessList...)
-		w.Log().Info("received %d process snapshot on %s %s", len(e.ProcessList), e.Node, shortInfo(e.ProcessList))
+		w.Log().Debug("received %d process snapshot on %s %s", len(e.ProcessList), e.Node, shortInfo(e.ProcessList))
+		w.nodeVersions[e.Node] = e.Version
 	case MessageProcessChanged:
-		w.receive_increase_times++
+		w.receive_incr_proc_times++
+		if version, ok := w.nodeVersions[e.Node]; ok && version.GreaterThan(e.Version) {
+			w.Log().Warning("received a process version %v from %s, abandon", e.Version, e.Node)
+			return nil
+		}
 		w.book.AddProcess(e.Node, e.UpProcess...)
 		w.book.RemoveProcess(e.Node, e.DownProcess...)
-		w.Log().Info("received +%d%s/-%d%s process on %s", len(e.UpProcess), shortInfo(e.UpProcess), len(e.DownProcess), shortInfo(e.DownProcess), e.Node)
+		w.Log().Debug("received +%d%s/-%d%s process on %s", len(e.UpProcess), shortInfo(e.UpProcess), len(e.DownProcess), shortInfo(e.DownProcess), e.Node)
+		w.nodeVersions[e.Node] = e.Version
 	}
 	return nil
 }
@@ -107,42 +117,13 @@ func (w *whereis) HandleCall(from gen.PID, ref gen.Ref, request any) (any, error
 	return w.PID(), nil
 }
 
-// Rationale for event handling:
-//   - This process only reacts to node joins to speed up convergence on new nodes
-//     by immediately pushing the local process snapshot.
-//   - Node leaves/offline are not explicitly handled here. The periodic inspector
-//     (`inspect_process_list`) invokes `fetchAvailableBookNodes` and then
-//     `book.SetAvailableNodes(nodes)`, which computes a diff, removes absent nodes,
-//     and cleans their process indices. This keeps `Locate`/`PickNode` from pointing
-//     to offline or outdated nodes without requiring leave-event broadcasts.
-//   - Recovery/launch logic upon membership changes is handled by `daemon_monitor`.
-//   - If stricter real-time reaction to leaves is desired, a `zk.EventNodeLeft`
-//     branch can be added to trigger an immediate refresh; however, the snapshot-based
-//     cleanup is simpler and resilient to churn and transient registrar events.
-func (w *whereis) HandleEvent(event gen.MessageEvent) error {
-	switch e := event.Message.(type) {
-	case zk.EventNodeJoined:
-		node := w.Node().Name()
-		list := w.book.GetProcessList(node)
-		if err := w.SendImportant(gen.ProcessID{Node: e.Name, Name: WhereIsProcess}, MessageProcesses{Node: node, ProcessList: list}); err != nil {
-			if err != gen.ErrProcessUnknown {
-				w.Log().Info("broadcast %d process to new node %s fail %v", len(list), e.Name, err)
-			}
-			w.broadcastLater(time.Second*3, e.Name)
-		} else {
-			w.Log().Info("broadcast %d process to new node %s OK", len(list), e.Name)
-		}
-		w.send_snapshot_times++
-	}
-	return nil
-}
-
 // Terminate invoked on a termination process
 func (w *whereis) Terminate(reason error) {
 	w.Log().Info("whereis process terminated with reason: %s", reason)
 }
 
-func (w *whereis) diffAndBroadcast(nodes []gen.Atom, selfNode gen.Atom, newList []ProcessInfo) {
+func (w *whereis) diff(newList []ProcessInfo) error {
+	selfNode := w.Node().Name()
 	oldList := w.book.GetProcessList(selfNode)
 
 	newMap := make(map[gen.Atom]ProcessInfo)
@@ -173,9 +154,12 @@ func (w *whereis) diffAndBroadcast(nodes []gen.Atom, selfNode gen.Atom, newList 
 		w.book.RemoveProcess(selfNode, msg.DownProcess...)
 	}
 	if len(msg.UpProcess) > 0 || len(msg.DownProcess) > 0 {
-		w.broadcastProcessChanged(nodes, msg)
-		w.send_increase_times++
+		ver := w.selfVersion.Incr()
+		msg.Version = ver
+		w.selfVersion = ver
+		w.appendBuffer(msg)
 	}
+	return nil
 }
 
 func (w *whereis) inspectProcessList() error {
@@ -187,8 +171,9 @@ func (w *whereis) inspectProcessList() error {
 		w.Log().Error("fetch nodes fail %v", err)
 		return err
 	}
-	w.diffAndBroadcast(nodes, w.Node().Name(), w.processCache.Load().(ProcessInfoList))
-	return nil
+	w.diff(w.processCache.Load().(ProcessInfoList))
+	w.inspect_self_times++
+	return w.fetchOtherNodeProcess(nodes)
 }
 
 // collectProcessList gets all processes from the current node,
@@ -270,13 +255,6 @@ func (w *whereis) fetchAvailableBookNodes() ([]gen.Atom, error) {
 		} else {
 			w.registrar = registrar
 		}
-		event, err := registrar.Event()
-		if err != nil {
-			return nil, err
-		}
-		if _, err = w.MonitorEvent(event); err != nil {
-			return nil, err
-		}
 	}
 	nodes, err := w.registrar.Nodes()
 	if err != nil {
@@ -287,80 +265,128 @@ func (w *whereis) fetchAvailableBookNodes() ([]gen.Atom, error) {
 	return nodes, nil
 }
 
-func (w *whereis) broadcastProcesses(nodes []gen.Atom, node gen.Atom, ps []ProcessInfo) (err error) {
-	var failedNodes []gen.Atom
-	for _, tnode := range nodes {
-		if tnode != w.Node().Name() {
-			if err0 := w.SendImportant(gen.ProcessID{Node: tnode, Name: WhereIsProcess}, MessageProcesses{Node: node, ProcessList: ps}); err0 != nil {
-				failedNodes = append(failedNodes, tnode)
-				w.Log().Warning("push process list to %s fail %v", tnode, err0)
-				err = err0
-			}
-			w.send_snapshot_times++
-		}
-	}
-
-	clear(w.broadcastNodeSet)
-	if cancel := w.cancelRebroadcast; cancel != nil {
-		cancel()
-		w.cancelRebroadcast = nil
-	}
-	if len(failedNodes) > 0 {
-		w.broadcastLater(time.Second*3, failedNodes...)
-	}
-	return err
-}
-
-func (w *whereis) broadcastProcessChanged(nodes []gen.Atom, msg MessageProcessChanged) {
-	var failedNodes []gen.Atom
-	for _, tnode := range nodes {
-		if tnode != w.Node().Name() {
-			t := tnode
-			if err := w.SendImportant(gen.ProcessID{Node: t, Name: WhereIsProcess}, msg); err != nil {
-				failedNodes = append(failedNodes, t)
-				w.Log().Warning("push process changed to %s fail %v", t, err)
-			}
-		}
-	}
-	if len(failedNodes) > 0 {
-		w.broadcastLater(time.Second*3, failedNodes...)
-	}
-}
-
-func (w *whereis) getBroadcastNodeList() (ret []gen.Atom) {
-	for k := range w.broadcastNodeSet {
-		ret = append(ret, k)
-	}
-	return
-}
-
-func (w *whereis) broadcastLater(dur time.Duration, nodes ...gen.Atom) {
-	if cancel := w.cancelRebroadcast; cancel != nil {
-		cancel()
-		w.cancelRebroadcast = nil
-	}
-	for _, node := range nodes {
-		w.broadcastNodeSet[node] = struct{}{}
-	}
-	w.broadcastSeq++
-	if c, err := w.SendAfter(w.PID(), rebroadcast{seq: w.broadcastSeq}, dur); err == nil {
-		w.cancelRebroadcast = c
-	}
-}
-
 func (w *whereis) HandleInspect(from gen.PID, item ...string) map[string]string {
+	tostr := func(i uint64) string {
+		return strconv.FormatUint(i, 10)
+	}
 	nodes := w.book.GetAvailableNodes()
 	stats := map[string]string{
-		"receive_snapshot_times":     strconv.FormatInt(int64(w.receive_snapshot_times), 10),
-		"receive_increase_times":     strconv.FormatInt(int64(w.receive_increase_times), 10),
-		"send_snapshot_times":        strconv.FormatInt(int64(w.send_snapshot_times), 10),
-		"send_increase_times":        strconv.FormatInt(int64(w.send_increase_times), 10),
-		"inspect_self_process_times": strconv.FormatInt(int64(w.inspect_self_process_times), 10),
-		"nodes":                      strconv.FormatInt(int64(len(nodes)), 10),
+		"nodes":                       strconv.FormatInt(int64(len(nodes)), 10),
+		"inspect_self_times":          tostr(w.inspect_self_times),
+		"send_fetch_proc_times":       tostr(w.send_fetch_proc_times),
+		"respond_fetch_proc_times":    tostr(w.respond_fetch_proc_times),
+		"receive_proc_snapshot_times": tostr(w.receive_proc_snapshot_times),
+		"receive_incr_proc_times":     tostr(w.receive_incr_proc_times),
 	}
 	for _, node := range nodes {
 		procs := w.book.GetProcessList(node)
 		stats[fmt.Sprintf("%s.process", string(node))] = strconv.FormatInt(int64(len(procs)), 10)
 	}
 	return stats
+}
+
+func (w *whereis) appendBuffer(msg MessageProcessChanged) {
+	if w.changeBufferCap <= 0 {
+		return
+	}
+	if w.procChangeBuffer == nil {
+		w.procChangeBuffer = make([]MessageProcessChanged, w.changeBufferCap)
+		w.procChangeStart = 0
+		w.procChangeCount = 0
+	}
+	if w.procChangeCount < w.changeBufferCap {
+		idx := (w.procChangeStart + w.procChangeCount) % w.changeBufferCap
+		w.procChangeBuffer[idx] = msg
+		w.procChangeCount++
+		return
+	}
+	w.procChangeBuffer[w.procChangeStart] = msg
+	w.procChangeStart = (w.procChangeStart + 1) % w.changeBufferCap
+}
+
+func (w *whereis) fetchOtherNodeProcess(nodes []gen.Atom) error {
+	nodeSet := make(map[gen.Atom]ProcessVersion)
+	for _, node := range nodes {
+		if node != w.Node().Name() {
+			if version, ok := w.nodeVersions[node]; ok {
+				nodeSet[node] = version
+			} else {
+				nodeSet[node] = NewEmptyVersion()
+			}
+		}
+	}
+
+	for node, version := range nodeSet {
+		if err := w.Send(gen.ProcessID{Node: node, Name: WhereIsProcess}, MessageFetchProcessList{Version: version}); err != nil {
+			w.Log().Warning("send fetch  request to node:%s process failure %v", node, err)
+		}
+		w.send_fetch_proc_times++
+	}
+
+	w.nodeVersions = nodeSet
+	return nil
+}
+
+func (w *whereis) respondMessageFetchProcessList(from gen.PID, version ProcessVersion) error {
+	if version == w.selfVersion {
+		return nil
+	}
+	size := w.procChangeCount
+	for i := 0; i < size; i++ {
+		idx := (w.procChangeStart + i) % w.changeBufferCap
+		ver := w.procChangeBuffer[idx]
+		if ver.Version == version {
+			if i < size-1 {
+				err := w.Send(from, w.compactProcessChangeRing(i+1, size))
+				if err != nil {
+					w.Log().Warning("send process info to node:%s failure %v", from.Node, err)
+				}
+				w.respond_fetch_proc_times++
+			}
+			return nil
+		}
+	}
+	err := w.Send(from, MessageProcesses{
+		Node:        w.Node().Name(),
+		ProcessList: w.book.GetProcessList(w.Node().Name()),
+		Version:     w.selfVersion,
+	})
+	if err != nil {
+		w.Log().Warning("send process info to node:%s failure %v", from.Node, err)
+	}
+	w.respond_fetch_proc_times++
+	return err
+}
+
+func (w *whereis) compactProcessChangeRing(start, end int) MessageProcessChanged {
+	if start >= end || w.procChangeCount == 0 {
+		return MessageProcessChanged{}
+	}
+	add, del := make(map[gen.Atom]ProcessInfo), make(map[gen.Atom]ProcessInfo)
+	for j := start; j < end; j++ {
+		idx := (w.procChangeStart + j) % w.changeBufferCap
+		item := w.procChangeBuffer[idx]
+		for _, val := range item.UpProcess {
+			add[val.Name] = val
+			delete(del, val.Name)
+		}
+		for _, val := range item.DownProcess {
+			del[val.Name] = val
+			delete(add, val.Name)
+		}
+	}
+	toList := func(v map[gen.Atom]ProcessInfo) []ProcessInfo {
+		var arr []ProcessInfo
+		for _, item := range v {
+			arr = append(arr, item)
+		}
+		return arr
+	}
+	lastIdx := (w.procChangeStart + end - 1) % w.changeBufferCap
+	return MessageProcessChanged{
+		Node:        w.Node().Name(),
+		UpProcess:   toList(add),
+		DownProcess: toList(del),
+		Version:     w.procChangeBuffer[lastIdx].Version,
+	}
 }

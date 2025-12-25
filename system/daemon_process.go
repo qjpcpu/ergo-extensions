@@ -127,17 +127,6 @@ func (w *daemon) HandleEvent(event gen.MessageEvent) error {
 			w.isLeader = false
 			return nil
 		}
-	case zk.EventNodeRoleHeartbeat:
-		if e.Name == w.Node().Name() {
-			isLeader := e.Role == zk.Leader
-			if w.isLeader != isLeader {
-				w.isLeader = isLeader
-				if isLeader {
-					w.launchAllAfter(time.Second * 1)
-					return nil
-				}
-			}
-		}
 	case zk.EventNodeLeft:
 		w.launchAllAfter(time.Second * 5)
 	}
@@ -170,11 +159,13 @@ func (w *daemon) setupRegistrarMonitoring() error {
 		if err != nil {
 			return err
 		}
-		if events, err := w.MonitorEvent(event); err != nil {
+		if _, err := w.MonitorEvent(event); err != nil {
 			return err
 		} else {
-			for _, evt := range events {
-				w.HandleEvent(evt)
+			if n, err := registrar.ConfigItem(zk.LeaderNodeConfigItem); err != nil {
+				return err
+			} else if node, ok := n.(gen.Atom); ok {
+				w.isLeader = node == w.Node().Name()
 			}
 		}
 	}

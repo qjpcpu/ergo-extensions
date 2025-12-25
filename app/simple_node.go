@@ -28,16 +28,19 @@ type Node interface {
 type CronJob = system.CronJob
 
 type SimpleNodeOptions struct {
-	zk.Options
-	NodeName string
+	zk.Options        // ZooKeeper registrar options.
+	NodeName   string // Node name.
 	// Optional
-	Cookie            string
-	MoreApps          []gen.ApplicationBehavior
-	MemberSpecs       []gen.ApplicationMemberSpec
-	NodeForwardWorker int64
-	LogLevel          gen.LogLevel
-	DefaultLogOptions gen.DefaultLoggerOptions
-	CronJobs          []CronJob
+	Cookie                string                      // Cluster cookie (must match across nodes).
+	MoreApps              []gen.ApplicationBehavior   // Extra applications to start on the node.
+	MemberSpecs           []gen.ApplicationMemberSpec // Additional application members to start.
+	NodeForwardWorker     int64                       // Worker count for forwarding calls/sends.
+	LogLevel              gen.LogLevel                // Node log level.
+	DefaultLogOptions     gen.DefaultLoggerOptions    // Default logger configuration.
+	CronJobs              []CronJob                   // Cron jobs for `system.CronJobProcess`.
+	DefaultRequestTimeout int                         // Default request timeout (seconds).
+	SyncProcessInterval   time.Duration               // Whereis sync interval for pulling remote changes.
+	ProcessChangeBuffer   int                         // Whereis change buffer size for compacting deltas.
 }
 
 type nodeImpl struct {
@@ -58,10 +61,21 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 	} else {
 		options.Network.Registrar = mem.Create()
 	}
+	if opts.DefaultRequestTimeout == 0 {
+		gen.DefaultRequestTimeout = 30
+	} else {
+		gen.DefaultRequestTimeout = opts.DefaultRequestTimeout
+	}
 	options.Network.Acceptors = []gen.AcceptorOptions{{Host: "0.0.0.0", TCP: "tcp"}}
 	options.Network.Cookie = str("simple-app-cookie-123")
 	options.Network.InsecureSkipVerify = true
-	apps := []gen.ApplicationBehavior{&simpleApp{book: book, cron: opts.CronJobs, MemberSpecs: opts.MemberSpecs}}
+	apps := []gen.ApplicationBehavior{&simpleApp{
+		book:                    book,
+		cron:                    opts.CronJobs,
+		MemberSpecs:             opts.MemberSpecs,
+		SyncAddressBookInterval: opts.SyncProcessInterval,
+		AddressBookBuffer:       opts.ProcessChangeBuffer,
+	}}
 	options.Applications = append(apps, opts.MoreApps...)
 
 	options.Log.Level = opts.LogLevel
@@ -86,14 +100,21 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 }
 
 type simpleApp struct {
-	book        *system.AddressBook
-	cron        []CronJob
-	MemberSpecs []gen.ApplicationMemberSpec
+	book                    *system.AddressBook
+	cron                    []CronJob
+	MemberSpecs             []gen.ApplicationMemberSpec
+	SyncAddressBookInterval time.Duration
+	AddressBookBuffer       int
 }
 
 func (app *simpleApp) Load(node gen.Node, args ...any) (gen.ApplicationSpec, error) {
 	members := append([]gen.ApplicationMemberSpec{
-		system.ApplicationMemberSepc(system.ApplicationMemberSepcOptions{AddressBook: app.book, CronJobs: app.cron})},
+		system.ApplicationMemberSepc(system.ApplicationMemberSepcOptions{
+			AddressBook:             app.book,
+			CronJobs:                app.cron,
+			SyncAddressBookInterval: app.SyncAddressBookInterval,
+			AddressBookBuffer:       app.AddressBookBuffer,
+		})},
 		app.MemberSpecs...,
 	)
 	return gen.ApplicationSpec{

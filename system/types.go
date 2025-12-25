@@ -1,6 +1,8 @@
 package system
 
 import (
+	"time"
+
 	"ergo.services/ergo/gen"
 	"ergo.services/ergo/net/edf"
 )
@@ -16,10 +18,16 @@ type (
 		Node        gen.Atom
 		UpProcess   []ProcessInfo
 		DownProcess []ProcessInfo
+		Version     ProcessVersion
+	}
+	ProcessVersion          [2]int64
+	MessageFetchProcessList struct {
+		Version ProcessVersion
 	}
 	MessageProcesses struct {
 		Node        gen.Atom
 		ProcessList []ProcessInfo
+		Version     ProcessVersion
 	}
 	ProcessInfo struct {
 		Node gen.Atom
@@ -32,6 +40,7 @@ type (
 	MessageProcessList struct {
 		Node        gen.Atom
 		ProcessList ProcessInfoList
+		Version     ProcessVersion
 	}
 	MessageGetAddressBook struct{}
 	MessageAddressBook    struct{ Book IAddressBook }
@@ -45,6 +54,8 @@ type (
 
 func init() {
 	types := []any{
+		ProcessVersion{},
+		MessageFetchProcessList{},
 		ProcessInfo{},
 		ProcessInfoList{},
 		MessageProcessList{},
@@ -63,4 +74,19 @@ func init() {
 		}
 		panic(err)
 	}
+}
+
+func (v ProcessVersion) GreaterThan(v2 ProcessVersion) bool {
+	return v[0] > v2[0] || v[0] == v2[0] && v[1] > v2[1]
+}
+
+func (v ProcessVersion) Incr() ProcessVersion {
+	return [2]int64{v[0], v[1] + 1}
+}
+
+func NewVersion() ProcessVersion {
+	return [2]int64{time.Now().UnixNano(), 0}
+}
+func NewEmptyVersion() ProcessVersion {
+	return [2]int64{0, 0}
 }

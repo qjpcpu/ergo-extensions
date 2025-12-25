@@ -1,6 +1,8 @@
 package system
 
 import (
+	"time"
+
 	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
 )
@@ -8,8 +10,10 @@ import (
 const WhereIsSupervisor = gen.Atom("whereissup")
 
 type ApplicationMemberSepcOptions struct {
-	AddressBook *AddressBook
-	CronJobs    []CronJob
+	AddressBook             *AddressBook
+	CronJobs                []CronJob
+	SyncAddressBookInterval time.Duration
+	AddressBookBuffer       int
 }
 
 func ApplicationMemberSepc(opts ApplicationMemberSepcOptions) gen.ApplicationMemberSpec {
@@ -21,7 +25,7 @@ func ApplicationMemberSepc(opts ApplicationMemberSepcOptions) gen.ApplicationMem
 
 func FactoryWhereisSup(opts ApplicationMemberSepcOptions) gen.ProcessFactory {
 	return func() gen.ProcessBehavior {
-		sup := &WhereisSup{cron: opts.CronJobs}
+		sup := &WhereisSup{cron: opts.CronJobs, syncProcessInterval: opts.SyncAddressBookInterval, changeBufferCap: opts.AddressBookBuffer}
 		if opts.AddressBook != nil {
 			sup.book = opts.AddressBook
 		} else {
@@ -33,8 +37,10 @@ func FactoryWhereisSup(opts ApplicationMemberSepcOptions) gen.ProcessFactory {
 
 type WhereisSup struct {
 	act.Supervisor
-	book *AddressBook
-	cron []CronJob
+	book                *AddressBook
+	cron                []CronJob
+	syncProcessInterval time.Duration
+	changeBufferCap    int
 }
 
 func (sup *WhereisSup) Init(args ...any) (act.SupervisorSpec, error) {
@@ -49,7 +55,7 @@ func (sup *WhereisSup) Init(args ...any) (act.SupervisorSpec, error) {
 	spec.Children = []act.SupervisorChildSpec{
 		{
 			Name:    WhereIsProcess,
-			Factory: factory_whereis(book),
+			Factory: factory_whereis(book, sup.syncProcessInterval, sup.changeBufferCap),
 		},
 		{
 			Name:    DaemonMonitorProcess,
