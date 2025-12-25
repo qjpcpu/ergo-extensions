@@ -1,6 +1,7 @@
 package system
 
 import (
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -43,20 +44,22 @@ type CronJob struct {
 
 type cron struct {
 	act.Actor
-	registrar      gen.Registrar
-	prevNodes      map[gen.Atom]struct{}
-	ring           *consistent.Consistent // consistent hashing ring
-	local, cluster []CronJob
+	registrar       gen.Registrar
+	prevNodes       map[gen.Atom]struct{}
+	ring            *consistent.Consistent // consistent hashing ring
+	local, cluster  []CronJob
+	startOnSelfJobs map[gen.Atom]struct{}
 }
 
 func factory_cron(jobs []CronJob) gen.ProcessFactory {
 	local, cluster := splitJobs(jobs)
 	return func() gen.ProcessBehavior {
 		return &cron{
-			ring:      makeRing(),
-			local:     local,
-			cluster:   cluster,
-			prevNodes: make(map[gen.Atom]struct{}),
+			ring:            makeRing(),
+			local:           local,
+			cluster:         cluster,
+			prevNodes:       make(map[gen.Atom]struct{}),
+			startOnSelfJobs: make(map[gen.Atom]struct{}),
 		}
 	}
 }
@@ -124,7 +127,8 @@ func (w *cron) turnOnLocalCronJobs() error {
 			Action:   gen.CreateCronActionMessage(job.TriggerProcess, gen.MessagePriorityHigh),
 		}
 		if err := c.AddJob(genjob); err == nil {
-			w.Log().Info("turn on cron job %s", job.Name)
+			w.Log().Debug("turn on cron job %s", job.Name)
+			w.startOnSelfJobs[job.Name] = struct{}{}
 		}
 	}
 	return nil
@@ -166,11 +170,13 @@ func (w *cron) turnOnClusterCronJobs() error {
 				Action:   gen.CreateCronActionMessage(job.TriggerProcess, gen.MessagePriorityHigh),
 			}
 			if err = c.AddJob(genjob); err == nil {
-				w.Log().Info("turn on cron job %s", job.Name)
+				w.Log().Debug("turn on cron job %s", job.Name)
+				w.startOnSelfJobs[job.Name] = struct{}{}
 			}
 		} else {
 			if err = c.RemoveJob(job.Name); err == nil {
-				w.Log().Info("turn off cron job %s", job.Name)
+				w.Log().Debug("turn off cron job %s", job.Name)
+				delete(w.startOnSelfJobs, job.Name)
 			}
 		}
 	}
@@ -198,4 +204,18 @@ func (w *cron) HandleEvent(event gen.MessageEvent) error {
 // Terminate invoked on a termination process
 func (w *cron) Terminate(reason error) {
 	w.Log().Info("cron process terminated with reason: %s", reason)
+}
+
+func (w *cron) HandleInspect(from gen.PID, item ...string) map[string]string {
+	var jobs []string
+	for name := range w.startOnSelfJobs {
+		jobs = append(jobs, string(name))
+	}
+	toStr := func(v any) string {
+		bs, _ := json.Marshal(v)
+		return string(bs)
+	}
+	return map[string]string{
+		"jobs": toStr(jobs),
+	}
 }

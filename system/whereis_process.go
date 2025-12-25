@@ -1,6 +1,8 @@
 package system
 
 import (
+	"fmt"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -23,8 +25,15 @@ type whereis struct {
 
 	pid_to_name map[gen.PID]gen.Atom
 	name_to_pid map[gen.Atom]gen.PID
-	// Only includes named processes
+	// only includes named processes
 	processCache atomic.Value
+
+	// stats
+	receive_snapshot_times     int
+	receive_increase_times     int
+	send_snapshot_times        int
+	send_increase_times        int
+	inspect_self_process_times int
 }
 
 func factory_whereis(book *AddressBook) gen.ProcessFactory {
@@ -49,6 +58,7 @@ func (w *whereis) Init(args ...any) error {
 func (w *whereis) HandleMessage(from gen.PID, message any) error {
 	switch e := message.(type) {
 	case inspect_process_list:
+		w.inspect_self_process_times++
 		w.inspectProcessList()
 		w.SendAfter(w.PID(), inspect_process_list{}, time.Second*1)
 	case rebroadcast:
@@ -67,6 +77,7 @@ func (w *whereis) HandleMessage(from gen.PID, message any) error {
 			w.broadcastProcesses(interactNodes(nodes, w.getBroadcastNodeList()), w.Node().Name(), w.book.GetProcessList(w.Node().Name()))
 		}
 	case MessageProcesses:
+		w.receive_snapshot_times++
 		if _, err := w.fetchAvailableBookNodes(); err != nil {
 			w.Log().Error("fetch nodes fail %v", err)
 			return err
@@ -74,6 +85,7 @@ func (w *whereis) HandleMessage(from gen.PID, message any) error {
 		w.book.SetProcess(e.Node, e.ProcessList...)
 		w.Log().Info("received %d process snapshot on %s %s", len(e.ProcessList), e.Node, shortInfo(e.ProcessList))
 	case MessageProcessChanged:
+		w.receive_increase_times++
 		w.book.AddProcess(e.Node, e.UpProcess...)
 		w.book.RemoveProcess(e.Node, e.DownProcess...)
 		w.Log().Info("received +%d%s/-%d%s process on %s", len(e.UpProcess), shortInfo(e.UpProcess), len(e.DownProcess), shortInfo(e.DownProcess), e.Node)
@@ -120,6 +132,7 @@ func (w *whereis) HandleEvent(event gen.MessageEvent) error {
 		} else {
 			w.Log().Info("broadcast %d process to new node %s OK", len(list), e.Name)
 		}
+		w.send_snapshot_times++
 	}
 	return nil
 }
@@ -161,6 +174,7 @@ func (w *whereis) diffAndBroadcast(nodes []gen.Atom, selfNode gen.Atom, newList 
 	}
 	if len(msg.UpProcess) > 0 || len(msg.DownProcess) > 0 {
 		w.broadcastProcessChanged(nodes, msg)
+		w.send_increase_times++
 	}
 }
 
@@ -282,6 +296,7 @@ func (w *whereis) broadcastProcesses(nodes []gen.Atom, node gen.Atom, ps []Proce
 				w.Log().Warning("push process list to %s fail %v", tnode, err0)
 				err = err0
 			}
+			w.send_snapshot_times++
 		}
 	}
 
@@ -331,4 +346,21 @@ func (w *whereis) broadcastLater(dur time.Duration, nodes ...gen.Atom) {
 	if c, err := w.SendAfter(w.PID(), rebroadcast{seq: w.broadcastSeq}, dur); err == nil {
 		w.cancelRebroadcast = c
 	}
+}
+
+func (w *whereis) HandleInspect(from gen.PID, item ...string) map[string]string {
+	nodes := w.book.GetAvailableNodes()
+	stats := map[string]string{
+		"receive_snapshot_times":     strconv.FormatInt(int64(w.receive_snapshot_times), 10),
+		"receive_increase_times":     strconv.FormatInt(int64(w.receive_increase_times), 10),
+		"send_snapshot_times":        strconv.FormatInt(int64(w.send_snapshot_times), 10),
+		"send_increase_times":        strconv.FormatInt(int64(w.send_increase_times), 10),
+		"inspect_self_process_times": strconv.FormatInt(int64(w.inspect_self_process_times), 10),
+		"nodes":                      strconv.FormatInt(int64(len(nodes)), 10),
+	}
+	for _, node := range nodes {
+		procs := w.book.GetProcessList(node)
+		stats[fmt.Sprintf("%s.process", string(node))] = strconv.FormatInt(int64(len(procs)), 10)
+	}
+	return stats
 }

@@ -2,6 +2,7 @@ package system
 
 import (
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -248,4 +249,10 @@ func (w *daemon) launchDaemonOnNode(node gen.Atom, launcher Launcher, proc Daemo
 		}
 	}
 	return
+}
+
+func (w *daemon) HandleInspect(from gen.PID, item ...string) map[string]string {
+	return map[string]string{
+		"is_leader": strconv.FormatBool(w.isLeader),
+	}
 }
