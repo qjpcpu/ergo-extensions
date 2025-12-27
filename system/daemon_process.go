@@ -11,7 +11,7 @@ import (
 	"ergo.services/registrar/zk"
 )
 
-const DaemonMonitorProcess = gen.Atom("daemon_monitor")
+const DaemonMonitorProcess = gen.Atom("sysext_daemon")
 
 var launchers sync.Map
 

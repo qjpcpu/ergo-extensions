@@ -26,7 +26,7 @@ const (
 	CronJobScopeNode
 )
 
-const CronJobProcess = gen.Atom("cronjob_scheduler")
+const CronJobProcess = gen.Atom("sysext_cron")
 
 // CronJob defines a cron job configuration.
 type CronJob struct {

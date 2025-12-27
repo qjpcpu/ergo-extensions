@@ -2,30 +2,32 @@ package mem
 
 import (
 	"ergo.services/ergo/gen"
-	"ergo.services/registrar/zk"
 )
 
 type client struct {
-	routes   gen.RegisterRoutes
+	cluster  *Cluster
 	node     gen.NodeRegistrar
 	eventRef gen.Ref
 	event    gen.Event
 }
 
+func CreateWithCluster(c *Cluster) gen.Registrar {
+	return &client{cluster: c}
+}
+
 func Create() gen.Registrar {
-	return &client{}
+	return CreateWithCluster(NewCluster())
 }
 
 func (c *client) Shutdown() (err error) {
+	if node := c.node; node != nil {
+		c.cluster.RemoveNode(node.Name())
+	}
 	return
 }
 
-//
-// gen.Resolver interface implementation
-//
-
 func (c *client) Resolve(name gen.Atom) ([]gen.Route, error) {
-	return c.routes.Routes, nil
+	return c.cluster.GetRoutes(name), nil
 }
 
 // ResolveApplication returns all known routes for a given application name, excluding the routes on the node itself.
@@ -46,7 +48,6 @@ const (
 // gen.Registrar interface implementation
 func (c *client) Register(node gen.NodeRegistrar, routes gen.RegisterRoutes) (gen.StaticRoutes, error) {
 	c.node = node
-	c.routes = routes
 	eventName := gen.Atom("memory-node-event")
 	eventRef, err := node.RegisterEvent(eventName, gen.EventOptions{Buffer: 64})
 	if err != nil {
@@ -54,9 +55,14 @@ func (c *client) Register(node gen.NodeRegistrar, routes gen.RegisterRoutes) (ge
 	}
 	c.eventRef = eventRef
 	c.event = gen.Event{Name: eventName, Node: node.Name()}
-	node.SendEvent(eventName, eventRef, gen.MessageOptions{}, zk.EventNodeJoined{Name: node.Name()})
-	node.SendEvent(eventName, eventRef, gen.MessageOptions{}, zk.EventNodeSwitchedToLeader{Name: node.Name()})
+	c.cluster.AddRoutes(node.Name(), routes.Routes, c.sendEvent)
 	return gen.StaticRoutes{}, nil
+}
+
+func (c *client) sendEvent(evt any) {
+	if node := c.node; node != nil {
+		node.SendEvent(c.event.Name, c.eventRef, gen.MessageOptions{}, evt)
+	}
 }
 
 func (c *client) Resolver() gen.Resolver {
@@ -80,12 +86,18 @@ func (c *client) UnregisterApplicationRoute(name gen.Atom) error {
 
 // Nodes returns a list of all discovered nodes exclude self in the cluster
 func (c *client) Nodes() ([]gen.Atom, error) {
-	return []gen.Atom{}, nil
+	var list []gen.Atom
+	for _, item := range c.cluster.GetNodes() {
+		if c.node == nil || item != c.node.Name() {
+			list = append(list, item)
+		}
+	}
+	return list, nil
 }
 
 func (c *client) ConfigItem(item string) (any, error) {
 	if node := c.node; node != nil {
-		return node.Name(), nil
+		return c.cluster.GetLeader(), nil
 	}
 	return nil, gen.ErrUnsupported
 }
@@ -105,7 +117,7 @@ func (c *client) Info() gen.RegistrarInfo {
 		SupportConfig:              false,
 		SupportEvent:               true,
 		SupportRegisterProxy:       false,
-		SupportRegisterApplication: true,
+		SupportRegisterApplication: false,
 	}
 }
 

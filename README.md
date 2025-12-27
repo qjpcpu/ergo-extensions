@@ -2,8 +2,9 @@
 
 This repository provides a small set of building blocks to add distributed process discovery and daemon orchestration to an Ergo-based cluster. It ships a supervisor that wires together:
 
-- `whereis` — a process that continuously inspects local processes, maintains an address book, and broadcasts snapshots/changes to the cluster.
-- `daemon_monitor` — a process that (on the elected leader) recovers and launches daemon processes across nodes using consistent hashing.
+- `sysext_whereis` — a process that continuously inspects local processes, maintains an address book, and broadcasts snapshots/changes to the cluster.
+- `sysext_daemon` — a process that (on the elected leader) recovers and launches daemon processes across nodes using consistent hashing.
+- `sysext_cron` — a cron-like scheduler that triggers messages on a node or across the cluster.
 - `AddressBook` — a thread-safe, eventually-consistent cache of nodes and their registered processes, with node picking via consistent hashing.
 
 Core components live under the `system` package and are designed to integrate with `ergo.services/ergo` and a registrar (Zookeeper by default). The `app` package provides a small helper to start a node with these components wired in.
@@ -13,6 +14,7 @@ Core components live under the `system` package and are designed to integrate wi
 - Distributed process discovery and naming via a shared address book
 - Periodic local inspection and cluster-wide broadcast of process snapshots
 - Leader-driven daemon recovery and remote spawn requests
+- Node- or cluster-scoped cron jobs (`sysext_cron`) with stable placement
 - Consistent hashing (`xxhash` + `buraksezer/consistent`) for stable node selection
 - Simple APIs to register daemon launchers and spawn named processes
 
@@ -38,22 +40,24 @@ import "github.com/qjpcpu/ergo-extensions/system"
 
 ## Architecture
 
-- `WhereIsSupervisor` (`whereissup`) starts two children:
-  - `WhereIsProcess` (`whereis`):
-    - Inspects local processes every second
+- `Supervisor` (`sysext_sup`) starts three children:
+  - `WhereIsProcess` (`sysext_whereis`):
+    - Inspects local processes periodically (default: every 3 seconds)
     - Maintains PID→Name and Name→PID maps
     - Stores a snapshot (`ProcessInfoList`) in-memory and updates the `AddressBook`
     - Broadcasts process snapshots or deltas to other nodes
     - Answers calls: `MessageLocate{Name}` → node, `MessageGetAddressBook{}` → `AddressBook`
-  - `DaemonMonitorProcess` (`daemon_monitor`):
+  - `DaemonMonitorProcess` (`sysext_daemon`):
     - Subscribes to registrar events for leader election and membership changes
     - On leader, scans registered `Launcher` recovery iterators and launches daemons to selected nodes
     - Sends remote spawn requests when target node is not local
+  - `CronJobProcess` (`sysext_cron`):
+    - Triggers cron jobs either on a single node or cluster-wide
 - `AddressBook`:
   - Tracks available nodes and per-node registered processes
   - Picks a node for a process name using a consistent hashing ring (PartitionCount: 10240, ReplicationFactor: 40)
 - `app.StartSimpleNode`:
-  - Starts an Ergo node and loads the `system.WhereIsSupervisor` with a shared `AddressBook`
+  - Starts an Ergo node and loads the `system.Supervisor` with a shared `AddressBook`
   - Provides helper methods for locating named processes and forwarding sends/calls
 
 ## Quick Start
@@ -61,12 +65,37 @@ import "github.com/qjpcpu/ergo-extensions/system"
 1) Add the supervisor to your application members:
 
 ```go
-app := gen.ApplicationSpec{
+spec := gen.ApplicationSpec{
     Members: []gen.ApplicationMemberSpec{
         system.ApplicationMemberSepc(system.ApplicationMemberSepcOptions{}),
     },
 }
 // Wire this application spec into your Ergo node environment/startup as usual.
+```
+
+Or start a node with everything wired in (uses Zookeeper registrar when `Endpoints` is set, otherwise falls back to an in-memory single-node registrar):
+
+```go
+n, err := app.StartSimpleNode(app.SimpleNodeOptions{
+    NodeName: "node-1",
+    Options: zk.Options{
+        Endpoints: []string{"127.0.0.1:2181"},
+    },
+    CronJobs: []app.CronJob{
+        {
+            Name:          gen.Atom("job.ping"),
+            Spec:          "* * * * *",
+            Location:      system.CronJobLocationUTC,
+            TriggerProcess: gen.Atom("ping"),
+            Scope:         system.CronJobScopeCluster,
+        },
+    },
+    NodeForwardWorker: 8,
+    SyncProcessInterval: time.Second * 3,
+    ProcessChangeBuffer: 16,
+})
+_ = n
+_ = err
 ```
 
 2) Register a launcher for your daemon processes (during init or startup):
@@ -125,19 +154,19 @@ list := book.GetProcessList(picked)
 ## Public API (selected)
 
 - Constants:
-  - `system.WhereIsSupervisor`, `system.WhereIsProcess`, `system.DaemonMonitorProcess`
+  - `system.Supervisor`, `system.WhereIsProcess`, `system.DaemonMonitorProcess`, `system.CronJobProcess`
 - Supervisor helpers:
   - `system.ApplicationMemberSepc(opts system.ApplicationMemberSepcOptions) gen.ApplicationMemberSpec`
-  - `system.FactoryWhereisSup() gen.ProcessFactory`
+  - `system.FactorySystemSup(opts system.ApplicationMemberSepcOptions) gen.ProcessFactory`
 - Daemon orchestration:
   - `system.RegisterLauncher(name gen.Atom, launcher system.Launcher) error`
-  - `system.NewSpawner(parent gen.Process, launcherName gen.Atom) system.Spawner`
+  - `system.NewSpawner(parent gen.Process, launcher gen.Atom) system.Spawner`
   - `Spawner.SpawnRegister(processName gen.Atom, args ...any) (gen.PID, error)`
   - `Launcher{ Factory, Option, RecoveryScanner }`
   - `DaemonProcess{ ProcessName gen.Atom, Args []any }`
 - Discovery & address book:
-  - Call `whereis` with `MessageLocate{Name gen.Atom}` → `gen.Atom` (node)
-  - Call `whereis` with `MessageGetAddressBook{}` → `MessageAddressBook{Book IAddressBook}`
+  - Call `sysext_whereis` with `MessageLocate{Name gen.Atom}` → `gen.Atom` (node)
+  - Call `sysext_whereis` with `MessageGetAddressBook{}` → `MessageAddressBook{Book IAddressBook}`
   - `IAddressBook` provides: `Locate`, `GetProcessList`, `PickNode`, `GetAvailableNodes`
 
 ## Registrar & Events
@@ -147,13 +176,13 @@ The code expects a working registrar from the Ergo network. With Zookeeper (`erg
 - Leadership changes: `EventNodeSwitchedToLeader`, `EventNodeSwitchedToFollower`
 - Membership changes: `EventNodeJoined`, `EventNodeLeft`
 
-`whereis` will broadcast on joins; `daemon_monitor` will re-plan launches on left/failover and trigger recovery when this node becomes leader.
+`whereis` will broadcast on joins; `sysext_daemon` will re-plan launches on left/failover and trigger recovery when this node becomes leader.
 
 ## Design Notes
 
 - Consistency: the `AddressBook` is eventually consistent; broadcasts retry on failures.
 - Hashing: consistent hashing ring uses `xxhash` and `buraksezer/consistent` to spread process names across nodes.
-- Scheduling: `whereis` inspects every second; `daemon_monitor` schedules recovery with small delays to absorb churn.
+- Scheduling: `whereis` inspects periodically (default: 3s); `sysext_daemon` schedules recovery with small delays to absorb churn.
 - Safety: remote spawns are issued via `SendImportant` to target nodes.
 
 ## Limitations

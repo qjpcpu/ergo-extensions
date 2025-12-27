@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	WhereIsProcess = gen.Atom("whereis")
+	WhereIsProcess = gen.Atom("sysext_whereis")
 )
 
 type whereis struct {

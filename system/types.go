@@ -10,8 +10,15 @@ import (
 type (
 	start_init           struct{}
 	inspect_process_list struct{}
-	rebroadcast          struct{ seq uint64 }
 	MessageLocate        struct {
+		Name gen.Atom
+	}
+	ProcessVersion [2]int64
+	ProcessInfo    struct {
+		Node gen.Atom
+		// PID process ID
+		PID gen.PID
+		// Name registered associated name with this process
 		Name gen.Atom
 	}
 	MessageProcessChanged struct {
@@ -20,7 +27,6 @@ type (
 		DownProcess []ProcessInfo
 		Version     ProcessVersion
 	}
-	ProcessVersion          [2]int64
 	MessageFetchProcessList struct {
 		Version ProcessVersion
 	}
@@ -29,22 +35,14 @@ type (
 		ProcessList []ProcessInfo
 		Version     ProcessVersion
 	}
-	ProcessInfo struct {
-		Node gen.Atom
-		// PID process ID
-		PID gen.PID
-		// Name registered associated name with this process
-		Name gen.Atom
-	}
 	ProcessInfoList    []ProcessInfo
 	MessageProcessList struct {
 		Node        gen.Atom
 		ProcessList ProcessInfoList
 		Version     ProcessVersion
 	}
-	MessageGetAddressBook struct{}
-	MessageAddressBook    struct{ Book IAddressBook }
-
+	MessageGetAddressBook  struct{}
+	MessageAddressBook     struct{ Book IAddressBook }
 	MessageLaunchAllDaemon struct{}
 	MessageLaunchOneDaemon struct {
 		Launcher gen.Atom

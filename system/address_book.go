@@ -258,20 +258,6 @@ func removeNode(nodes []gen.Atom, node gen.Atom) []gen.Atom {
 	return nodes
 }
 
-// interactNodes returns a list of nodes that exist in both given lists.
-func interactNodes(nodes1, nodes2 []gen.Atom) (ret []gen.Atom) {
-	m := make(map[gen.Atom]struct{})
-	for _, n := range nodes2 {
-		m[n] = struct{}{}
-	}
-	for _, v := range nodes1 {
-		if _, ok := m[v]; ok {
-			ret = append(ret, v)
-		}
-	}
-	return
-}
-
 // hasher is a wrapper for xxhash.Sum64
 type hasher struct{}
 
