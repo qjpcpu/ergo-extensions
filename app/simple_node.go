@@ -14,8 +14,8 @@ import (
 
 type nodeImpl struct {
 	gen.Node
-	forwardPID gen.PID
-	book       *system.AddressBook
+	route gen.Atom
+	book  *system.AddressBook
 }
 
 func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
@@ -40,6 +40,11 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 	options.Network.Acceptors = []gen.AcceptorOptions{{Host: "0.0.0.0", TCP: "tcp"}}
 	options.Network.Cookie = str("simple-app-cookie-123")
 	options.Network.InsecureSkipVerify = true
+	router := gen.Atom("node_router")
+	opts.MemberSpecs = append(opts.MemberSpecs, gen.ApplicationMemberSpec{
+		Name:    router,
+		Factory: CreatePool(func() gen.ProcessBehavior { return &myworker{monitorPID: make(map[gen.PID]chan error), book: book} }, opts.NodeForwardWorker),
+	})
 	apps := []gen.ApplicationBehavior{&simpleApp{
 		book:                    book,
 		cron:                    opts.CronJobs,
@@ -60,14 +65,7 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	forwardPID, err := node.Spawn(CreatePool(func() gen.ProcessBehavior {
-		return &myworker{monitorPID: make(map[gen.PID]chan error), book: book}
-	}, opts.NodeForwardWorker), gen.ProcessOptions{})
-	if err != nil {
-		return nil, err
-	}
-	return &nodeImpl{Node: node, forwardPID: forwardPID, book: book}, nil
+	return &nodeImpl{Node: node, route: router, book: book}, nil
 }
 
 // GetAdvertiseAddressByENV creates a RoutesMapper that determines the advertise address/port
@@ -103,7 +101,7 @@ func str(list ...string) string {
 
 func (n *nodeImpl) WaitPID(pid gen.PID) error {
 	ch := make(chan error, 1)
-	err := n.Send(n.forwardPID, messageWaitProcess{
+	err := n.Send(n.route, messageWaitProcess{
 		PID: pid,
 		Ch:  ch,
 	})
@@ -115,7 +113,7 @@ func (n *nodeImpl) WaitPID(pid gen.PID) error {
 
 func (n *nodeImpl) ForwardSend(to string, msg any) error {
 	ch := make(chan nodeResult, 1)
-	err := n.Send(n.forwardPID, messageNodeSend{
+	err := n.Send(n.route, messageNodeSend{
 		to:  to,
 		msg: msg,
 		ch:  ch,
@@ -132,7 +130,7 @@ func (n *nodeImpl) ForwardSend(to string, msg any) error {
 
 func (n *nodeImpl) ForwardCall(to string, msg any) (any, error) {
 	ch := make(chan nodeResult, 1)
-	err := n.Send(n.forwardPID, messageNodeCall{
+	err := n.Send(n.route, messageNodeCall{
 		to:  to,
 		msg: msg,
 		ch:  ch,
@@ -145,6 +143,26 @@ func (n *nodeImpl) ForwardCall(to string, msg any) (any, error) {
 		return nil, res.err
 	}
 	return res.response, nil
+}
+
+func (n *nodeImpl) ForwardSpawnAndWait(fac gen.ProcessFactory, args ...any) error {
+	ch := make(chan error, 1)
+	err := n.Send(n.route, messageSpawnProcess{
+		Factory: fac,
+		Args:    args,
+		Ch:      ch,
+	})
+	if err != nil {
+		return err
+	}
+	return <-ch
+}
+
+func (n *nodeImpl) ForwardSpawn(fac gen.ProcessFactory, args ...any) error {
+	return n.Send(n.route, messageSpawnProcess{
+		Factory: fac,
+		Args:    args,
+	})
 }
 
 func (n *nodeImpl) LocateProcess(process gen.Atom) gen.Atom {

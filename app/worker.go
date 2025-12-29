@@ -61,6 +61,14 @@ type messageWaitProcess struct {
 	Ch  chan error
 }
 
+type messageSpawnProcess struct {
+	Name    gen.Atom // Optional
+	Factory gen.ProcessFactory
+	Options gen.ProcessOptions // Optional
+	Args    []any              // Optional
+	Ch      chan error         // Optional
+}
+
 func (w *myworker) HandleMessage(from gen.PID, message any) error {
 	switch e := message.(type) {
 	case messageNodeSend:
@@ -76,6 +84,32 @@ func (w *myworker) HandleMessage(from gen.PID, message any) error {
 		} else {
 			res, err := w.Call(gen.ProcessID{Node: p.Node, Name: gen.Atom(e.to)}, e.msg)
 			e.ch <- nodeResult{response: res, err: err}
+		}
+	case messageSpawnProcess:
+		sendResp := func(err error) {
+			if e.Ch != nil {
+				e.Ch <- err
+			}
+		}
+		var pid gen.PID
+		var err error
+		if e.Name != "" {
+			pid, err = w.SpawnRegister(e.Name, e.Factory, e.Options, e.Args...)
+		} else {
+			pid, err = w.Spawn(e.Factory, e.Options, e.Args...)
+		}
+		if err != nil {
+			sendResp(err)
+			return nil
+		}
+		if e.Ch != nil {
+			err = w.MonitorPID(pid)
+			if err != nil {
+				w.Node().Kill(pid)
+				sendResp(err)
+				return nil
+			}
+			w.monitorPID[pid] = e.Ch
 		}
 	case messageWaitProcess:
 		if err := w.MonitorPID(e.PID); err != nil {

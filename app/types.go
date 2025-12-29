@@ -18,6 +18,8 @@ type Node interface {
 	LocateProcess(process gen.Atom) gen.Atom
 	ForwardCall(to string, msg any) (any, error)
 	ForwardSend(to string, msg any) error
+	ForwardSpawn(fac gen.ProcessFactory, args ...any) error
+	ForwardSpawnAndWait(fac gen.ProcessFactory, args ...any) error
 	WaitPID(pid gen.PID) error
 	AddressBook() system.IAddressBook
 }
