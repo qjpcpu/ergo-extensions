@@ -38,7 +38,7 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 		gen.DefaultRequestTimeout = opts.DefaultRequestTimeout
 	}
 	options.Network.Acceptors = []gen.AcceptorOptions{{Host: "0.0.0.0", TCP: "tcp"}}
-	options.Network.Cookie = str("simple-app-cookie-123")
+	options.Network.Cookie = str(opts.Cookie, "simple-app-cookie")
 	options.Network.InsecureSkipVerify = true
 	router := gen.Atom("node_router")
 	opts.MemberSpecs = append(opts.MemberSpecs, gen.ApplicationMemberSpec{
