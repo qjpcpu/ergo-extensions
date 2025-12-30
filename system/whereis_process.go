@@ -117,11 +117,6 @@ func (w *whereis) HandleCall(from gen.PID, ref gen.Ref, request any) (any, error
 	return w.PID(), nil
 }
 
-// Terminate invoked on a termination process
-func (w *whereis) Terminate(reason error) {
-	w.Log().Info("whereis process terminated with reason: %s", reason)
-}
-
 func (w *whereis) diff(newList []ProcessInfo) error {
 	selfNode := w.Node().Name()
 	oldList := w.book.GetProcessList(selfNode)

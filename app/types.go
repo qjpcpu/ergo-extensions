@@ -30,6 +30,7 @@ type SimpleNodeOptions struct {
 	zk.Options        // ZooKeeper registrar options.
 	NodeName   string // Node name.
 	// Optional
+	Port                  uint16                      // Listen port, default to 11144
 	Cookie                string                      // Cluster cookie (must match across nodes).
 	MoreApps              []gen.ApplicationBehavior   // Extra applications to start on the node.
 	MemberSpecs           []gen.ApplicationMemberSpec // Additional application members to start.

@@ -37,7 +37,7 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 	} else {
 		gen.DefaultRequestTimeout = opts.DefaultRequestTimeout
 	}
-	options.Network.Acceptors = []gen.AcceptorOptions{{Host: "0.0.0.0", TCP: "tcp"}}
+	options.Network.Acceptors = []gen.AcceptorOptions{{Host: "0.0.0.0", Port: opts.Port, TCP: "tcp"}}
 	options.Network.Cookie = str(opts.Cookie, "simple-app-cookie")
 	options.Network.InsecureSkipVerify = true
 	router := gen.Atom("node_router")
@@ -149,6 +149,7 @@ func (n *nodeImpl) ForwardSpawnAndWait(fac gen.ProcessFactory, args ...any) erro
 	ch := make(chan error, 1)
 	err := n.Send(n.route, messageSpawnProcess{
 		Factory: fac,
+		Options: gen.ProcessOptions{LinkParent: true},
 		Args:    args,
 		Ch:      ch,
 	})
@@ -161,6 +162,7 @@ func (n *nodeImpl) ForwardSpawnAndWait(fac gen.ProcessFactory, args ...any) erro
 func (n *nodeImpl) ForwardSpawn(fac gen.ProcessFactory, args ...any) error {
 	return n.Send(n.route, messageSpawnProcess{
 		Factory: fac,
+		Options: gen.ProcessOptions{LinkParent: true},
 		Args:    args,
 	})
 }

@@ -201,11 +201,6 @@ func (w *cron) HandleEvent(event gen.MessageEvent) error {
 	return nil
 }
 
-// Terminate invoked on a termination process
-func (w *cron) Terminate(reason error) {
-	w.Log().Info("cron process terminated with reason: %s", reason)
-}
-
 func (w *cron) HandleInspect(from gen.PID, item ...string) map[string]string {
 	var jobs []string
 	for name := range w.startOnSelfJobs {
