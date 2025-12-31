@@ -64,6 +64,11 @@ func (book *AddressBook) GetProcessList(node gen.Atom) (list ProcessInfoList) {
 // locate is an internal method to find a process by its registered name.
 // This method is not thread-safe.
 func (book *AddressBook) locate(process gen.Atom) (ProcessInfo, bool) {
+	// Read-view convergence: processToNodes may temporarily contain multiple nodes
+	// for the same process name (during concurrent updates or membership churn).
+	// The slice is kept sorted and de-duplicated, so iterating it front-to-back
+	// always yields a deterministic "winner" (the first online node that still
+	// reports this process), giving callers a stable single-owner view.
 	nodes, ok := book.processToNodes[process]
 	if !ok {
 		return ProcessInfo{}, false
