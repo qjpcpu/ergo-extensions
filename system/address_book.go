@@ -66,13 +66,14 @@ func (book *AddressBook) GetProcessList(node gen.Atom) (list ProcessInfoList) {
 func (book *AddressBook) locate(process gen.Atom) (ProcessInfo, bool) {
 	// Read-view convergence: processToNodes may temporarily contain multiple nodes
 	// for the same process name (during concurrent updates or membership churn).
-	// The slice is kept sorted and de-duplicated, so iterating it front-to-back
-	// always yields a deterministic "winner" (the first online node that still
-	// reports this process), giving callers a stable single-owner view.
+	// The slice is kept sorted and de-duplicated. Among online nodes that still
+	// report this process, Locate selects the oldest instance (smallest BirthAt).
+	// If BirthAt is equal, the sorted node order provides a deterministic winner.
 	nodes, ok := book.processToNodes[process]
 	if !ok {
 		return ProcessInfo{}, false
 	}
+	var olderp ProcessInfo
 	for _, node := range nodes {
 		_, ok = book.nodes[node]
 		if !ok {
@@ -83,11 +84,11 @@ func (book *AddressBook) locate(process gen.Atom) (ProcessInfo, bool) {
 			continue
 		}
 		p, ok := processes[process]
-		if ok {
-			return p, ok
+		if ok && (olderp.BirthAt == 0 || p.BirthAt < olderp.BirthAt) {
+			olderp = p
 		}
 	}
-	return ProcessInfo{}, false
+	return olderp, olderp.Node != ""
 }
 
 // SetProcess sets a list of processes for the given node.

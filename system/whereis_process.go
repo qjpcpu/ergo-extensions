@@ -27,8 +27,9 @@ type whereis struct {
 	selfVersion  ProcessVersion
 	nodeVersions map[gen.Atom]ProcessVersion
 
-	pid_to_name map[gen.PID]gen.Atom
-	name_to_pid map[gen.Atom]gen.PID
+	pid_to_name      map[gen.PID]gen.Atom
+	name_to_birth_at map[gen.Atom]int64
+	name_to_pid      map[gen.Atom]gen.PID
 	// only includes named processes
 	processCache     atomic.Value
 	inspect_interval time.Duration
@@ -55,6 +56,7 @@ func factory_whereis(book *AddressBook, inspect_interval time.Duration, changeBu
 			book:             book,
 			pid_to_name:      make(map[gen.PID]gen.Atom),
 			name_to_pid:      make(map[gen.Atom]gen.PID),
+			name_to_birth_at: make(map[gen.Atom]int64),
 			processCache:     v,
 			selfVersion:      NewVersion(),
 			nodeVersions:     make(map[gen.Atom]ProcessVersion),
@@ -211,6 +213,7 @@ func (w *whereis) collectProcessList() error {
 		// avoiding issues with stale/reused process names.
 		if w.name_to_pid[name] == pid {
 			delete(w.name_to_pid, name)
+			delete(w.name_to_birth_at, name)
 		}
 		delete(w.pid_to_name, pid)
 	}
@@ -223,6 +226,7 @@ func (w *whereis) collectProcessList() error {
 			w.pid_to_name[pid] = info.Name
 			if info.Name != "" {
 				w.name_to_pid[info.Name] = pid
+				w.name_to_birth_at[info.Name] = time.Now().Unix() - info.Uptime
 			}
 		}
 	}
@@ -231,9 +235,10 @@ func (w *whereis) collectProcessList() error {
 	procList := make(ProcessInfoList, 0, len(w.name_to_pid))
 	for name, pid := range w.name_to_pid {
 		procList = append(procList, ProcessInfo{
-			Name: name,
-			PID:  pid,
-			Node: node.Name(),
+			Name:    name,
+			PID:     pid,
+			Node:    node.Name(),
+			BirthAt: w.name_to_birth_at[name],
 		})
 	}
 

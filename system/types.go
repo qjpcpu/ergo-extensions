@@ -15,11 +15,14 @@ type (
 	}
 	ProcessVersion [2]int64
 	ProcessInfo    struct {
+		// Node is the node name hosting this process.
 		Node gen.Atom
-		// PID process ID
+		// PID is the process identifier.
 		PID gen.PID
-		// Name registered associated name with this process
+		// Name is the registered name associated with this process.
 		Name gen.Atom
+		// BirthAt is the Unix timestamp (seconds) when the process was started.
+		BirthAt int64
 	}
 	MessageProcessChanged struct {
 		Node        gen.Atom
