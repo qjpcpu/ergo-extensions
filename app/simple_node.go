@@ -77,7 +77,7 @@ func GetAdvertiseAddressByENV(hostEnv []string, portEnv []string) zk.RoutesMappe
 	var port int
 	for _, e := range hostEnv {
 		if val := os.Getenv(e); val != "" {
-			host = e
+			host = val
 			break
 		}
 	}
