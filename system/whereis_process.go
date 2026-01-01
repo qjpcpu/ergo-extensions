@@ -316,6 +316,11 @@ func (w *whereis) appendBuffer(msg MessageProcessChanged) {
 
 func (w *whereis) fetchOtherNodeProcess(nodes []gen.Atom) error {
 	setSize := 128
+	if nsize := len(nodes); nsize <= 64 {
+		setSize = 8
+	} else if nsize <= 128 {
+		setSize = 16
+	}
 	var sets []VersionSet
 	nodeSet := make(map[gen.Atom]ProcessVersion)
 	set := make(VersionSet)
