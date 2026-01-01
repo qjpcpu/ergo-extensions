@@ -49,6 +49,7 @@ type cron struct {
 	ring            *consistent.Consistent // consistent hashing ring
 	local, cluster  []CronJob
 	startOnSelfJobs map[gen.Atom]struct{}
+	cancelSchedule  gen.CancelFunc
 }
 
 func factory_cron(jobs []CronJob) gen.ProcessFactory {
@@ -92,6 +93,8 @@ func (w *cron) HandleMessage(from gen.PID, message any) error {
 			w.turnOnLocalCronJobs()
 			w.turnOnClusterCronJobs()
 		}
+	case schedule_cronjob:
+		w.turnOnClusterCronJobs()
 	}
 	return nil
 }
@@ -130,6 +133,17 @@ func (w *cron) turnOnLocalCronJobs() error {
 			w.Log().Debug("turn on cron job %s", job.Name)
 			w.startOnSelfJobs[job.Name] = struct{}{}
 		}
+	}
+	return nil
+}
+
+func (w *cron) scheduleClusterCronJobs() error {
+	if w.cancelSchedule != nil {
+		w.cancelSchedule()
+		w.cancelSchedule = nil
+	}
+	if cancel, err := w.SendAfter(w.PID(), schedule_cronjob{}, time.Second*5); err == nil {
+		w.cancelSchedule = cancel
 	}
 	return nil
 }
@@ -196,7 +210,7 @@ func (w *cron) getLoc(loc CronJobLocation) *time.Location {
 func (w *cron) HandleEvent(event gen.MessageEvent) error {
 	switch event.Message.(type) {
 	case zk.EventNodeJoined, zk.EventNodeLeft:
-		w.turnOnClusterCronJobs()
+		w.scheduleClusterCronJobs()
 	}
 	return nil
 }

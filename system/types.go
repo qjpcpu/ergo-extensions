@@ -11,6 +11,7 @@ import (
 type (
 	start_init           struct{}
 	inspect_process_list struct{}
+	schedule_cronjob     struct{}
 	MessageLocate        struct {
 		Name gen.Atom
 	}
