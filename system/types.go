@@ -1,6 +1,7 @@
 package system
 
 import (
+	"fmt"
 	"time"
 
 	"ergo.services/ergo/gen"
@@ -14,6 +15,7 @@ type (
 		Name gen.Atom
 	}
 	ProcessVersion [2]int64
+	VersionSet     map[gen.Atom]ProcessVersion
 	ProcessInfo    struct {
 		// Node is the node name hosting this process.
 		Node gen.Atom
@@ -31,7 +33,8 @@ type (
 		Version     ProcessVersion
 	}
 	MessageFetchProcessList struct {
-		Version ProcessVersion
+		Node       gen.Atom
+		VersionSet VersionSet
 	}
 	MessageProcesses struct {
 		Node        gen.Atom
@@ -44,8 +47,11 @@ type (
 		ProcessList ProcessInfoList
 		Version     ProcessVersion
 	}
-	MessageGetAddressBook  struct{}
-	MessageAddressBook     struct{ Book IAddressBook }
+	MessageGetAddressBook struct{}
+	MessageAddressBook    struct {
+		Owner gen.PID
+		Book  IAddressBook
+	}
 	MessageLaunchAllDaemon struct{}
 	MessageLaunchOneDaemon struct {
 		Launcher gen.Atom
@@ -56,6 +62,7 @@ type (
 func init() {
 	types := []any{
 		ProcessVersion{},
+		VersionSet{},
 		MessageFetchProcessList{},
 		ProcessInfo{},
 		ProcessInfoList{},
@@ -77,12 +84,24 @@ func init() {
 	}
 }
 
+func (v ProcessVersion) GreaterThanOrEq(v2 ProcessVersion) bool {
+	return v.GreaterThan(v2) || v.Equal(v2)
+}
+
 func (v ProcessVersion) GreaterThan(v2 ProcessVersion) bool {
 	return v[0] > v2[0] || v[0] == v2[0] && v[1] > v2[1]
 }
 
+func (v ProcessVersion) Equal(v2 ProcessVersion) bool {
+	return v[0] == v2[0] && v[1] == v2[1]
+}
+
 func (v ProcessVersion) Incr() ProcessVersion {
 	return [2]int64{v[0], v[1] + 1}
+}
+
+func (v ProcessVersion) String() string {
+	return fmt.Sprintf("%d.%d", v[0], v[1])
 }
 
 func NewVersion() ProcessVersion {
@@ -90,4 +109,12 @@ func NewVersion() ProcessVersion {
 }
 func NewEmptyVersion() ProcessVersion {
 	return [2]int64{0, 0}
+}
+
+func (vs VersionSet) PickNode() (node gen.Atom) {
+	for k := range vs {
+		node = k
+		break
+	}
+	return
 }

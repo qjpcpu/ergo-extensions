@@ -6,8 +6,8 @@ github.com/buraksezer/consistent v0.10.0 h1:hqBgz1PvNLC5rkWcEBVAL9dFMBWz6I0VgUCW
 github.com/buraksezer/consistent v0.10.0/go.mod h1:6BrVajWq7wbKZlTOUPs/XVfR8c0maujuPowduSpZqmw=
 github.com/cespare/xxhash v1.1.0 h1:a6HrQnmkObjyL+Gs60czilIUGqrzKutQD6XZog3p+ko=
 github.com/cespare/xxhash v1.1.0/go.mod h1:XrSqR1VqqWfGrhpAt58auRo0WTKS1nRRg3ghfAqPWnc=
-github.com/qjpcpu/registrar/zk v0.0.0-20251231052225-a25e0fbbfcf2 h1:pWRML0Q8YUtE7KQ2J+mQHIF56K4Y8Ke0b/NR5eNkcGk=
-github.com/qjpcpu/registrar/zk v0.0.0-20251231052225-a25e0fbbfcf2/go.mod h1:PpQLkeAB72SO04ChGuIIroMVSwoU3waOVYRKhHqyiMc=
+github.com/qjpcpu/registrar/zk v0.0.0-20260101022250-5038cfc17adf h1:nxhAgFhaFLwJrvJ7rzmQXGMYWUDMFmR6hfn/eCDN9qo=
+github.com/qjpcpu/registrar/zk v0.0.0-20260101022250-5038cfc17adf/go.mod h1:PpQLkeAB72SO04ChGuIIroMVSwoU3waOVYRKhHqyiMc=
 github.com/qjpcpu/zk v0.0.0-20251119061628-055c093a17d5 h1:QmTRwea63Z4jjuTK8HiBKWa8fNqLPJT6rZMZQkibmx0=
 github.com/qjpcpu/zk v0.0.0-20251119061628-055c093a17d5/go.mod h1:yEy5PQ4C8sYZiLuIH259wnlvDq1V5PN7gN8gdUepl1c=
 github.com/spaolacci/murmur3 v0.0.0-20180118202830-f09979ecbc72 h1:qLC7fQah7D6K1B0ujays3HV9gkFtllcxhzImRR7ArPQ=
