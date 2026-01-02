@@ -19,6 +19,9 @@ type whereis struct {
 	book      *AddressBook
 	registrar gen.Registrar
 
+	fetchSeq    uint64
+	fetchRoutes map[fetchRouteKey]fetchRoute
+
 	changeBufferCap  int
 	procChangeBuffer []MessageProcessChanged
 	procChangeStart  int
@@ -41,6 +44,21 @@ type whereis struct {
 	receive_proc_snapshot_times uint64
 	receive_incr_proc_times     uint64
 }
+
+type fetchRouteKey struct {
+	Origin  gen.Atom
+	FetchID uint64
+}
+
+type fetchRoute struct {
+	Upstream gen.PID
+	ExpireAt time.Time
+}
+
+const (
+	fetchReplyKindFull    uint8 = 1
+	fetchReplyKindChanged uint8 = 2
+)
 
 func factory_whereis(book *AddressBook, inspect_interval time.Duration, changeBuffer int) gen.ProcessFactory {
 	var v atomic.Value
@@ -78,39 +96,35 @@ func (w *whereis) HandleMessage(from gen.PID, message any) error {
 		w.SendAfter(w.PID(), inspect_process_list{}, w.inspect_interval)
 	case MessageFetchProcessList:
 		self := w.Node().Name()
-		if e.Node == "" || e.Node == self || e.VersionSet == nil {
+		if e.Node == "" || e.Node == self || e.VersionSet.Size() == 0 {
 			return nil
 		}
-		if remote, ok := e.VersionSet[self]; !ok {
+		if remote := e.VersionSet.Next(); remote.Node != self {
 			return nil
 		} else {
-			delete(e.VersionSet, self)
-			if w.sendFetchProcessList(e.VersionSet) {
+			w.keepFetchRoute(fetchRouteKey{Origin: e.Node, FetchID: e.FetchID}, from)
+			e.VersionSet = e.VersionSet.Drop()
+			if w.sendFetchProcessList(e.Node, e.FetchID, e.VersionSet) {
 				w.send_fetch_proc_times++
 			}
-			w.respondMessageFetchProcessList(gen.ProcessID{Node: e.Node, Name: WhereIsProcess}, remote)
+			if reply, ok := w.makeFetchReply(remote.Version); ok {
+				reply.Origin = e.Node
+				reply.FetchID = e.FetchID
+				reply.Base = remote.Version
+				if err := w.Send(from, reply); err != nil {
+					w.Log().Warning("send process info to node:%s failure %v", from.Node, err)
+				}
+				w.respond_fetch_proc_times++
+			}
 		}
-	case MessageProcesses:
-		w.receive_proc_snapshot_times++
-		if version, ok := w.nodeVersions[e.Node]; ok && version.GreaterThanOrEq(e.Version) {
-			return nil
-		}
-		if _, err := w.fetchAvailableBookNodes(); err != nil {
-			w.Log().Error("fetch nodes fail %v", err)
+	case MessageFetchProcessReply:
+		if err := w.handleFetchReply(e); err != nil {
 			return err
 		}
-		w.book.SetProcess(e.Node, e.ProcessList...)
-		w.Log().Debug("received %d process snapshot on %s %s", len(e.ProcessList), e.Node, shortInfo(e.ProcessList))
-		w.nodeVersions[e.Node] = e.Version
+	case MessageProcesses:
+		return w.handleProcesses(e)
 	case MessageProcessChanged:
-		w.receive_incr_proc_times++
-		if version, ok := w.nodeVersions[e.Node]; ok && version.GreaterThanOrEq(e.Version) {
-			return nil
-		}
-		w.book.AddProcess(e.Node, e.UpProcess...)
-		w.book.RemoveProcess(e.Node, e.DownProcess...)
-		w.Log().Debug("received +%d%s/-%d%s process on %s", len(e.UpProcess), shortInfo(e.UpProcess), len(e.DownProcess), shortInfo(e.DownProcess), e.Node)
-		w.nodeVersions[e.Node] = e.Version
+		return w.handleProcessChanged(e)
 	}
 	return nil
 }
@@ -119,7 +133,7 @@ func (w *whereis) HandleCall(from gen.PID, ref gen.Ref, request any) (any, error
 	switch e := request.(type) {
 	case MessageLocate:
 		if p, ok := w.book.Locate(e.Name); ok {
-			return p.Node, nil
+			return p, nil
 		} else {
 			return gen.Atom(""), nil
 		}
@@ -170,6 +184,7 @@ func (w *whereis) diff(newList []ProcessInfo) error {
 }
 
 func (w *whereis) inspectProcessList() error {
+	w.cleanupFetchRoutes(time.Now())
 	if err := w.collectProcessList(); err != nil {
 		return err
 	}
@@ -315,36 +330,47 @@ func (w *whereis) appendBuffer(msg MessageProcessChanged) {
 }
 
 func (w *whereis) fetchOtherNodeProcess(nodes []gen.Atom) error {
-	setSize := 128
+	nodes = sortNodes(nodes)
+	setSize := 64
 	if nsize := len(nodes); nsize <= 64 {
 		setSize = 8
-	} else if nsize <= 128 {
+	} else if nsize <= 256 {
 		setSize = 16
+	} else if nsize <= 1024 {
+		setSize = 32
 	}
+	self := w.Node().Name()
 	var sets []VersionSet
 	nodeSet := make(map[gen.Atom]ProcessVersion)
-	set := make(VersionSet)
+	var set VersionSet
+	selfGroupId := -1
 	for _, node := range nodes {
-		if node != w.Node().Name() {
-			if len(set) > setSize {
-				sets = append(sets, set)
-				set = make(VersionSet)
-			}
-			if version, ok := w.nodeVersions[node]; ok {
-				nodeSet[node] = version
-				set[node] = version
-			} else {
-				nodeSet[node] = NewEmptyVersion()
-				set[node] = NewEmptyVersion()
-			}
+		if len(set) > setSize {
+			sets = append(sets, set)
+			set = nil
+		}
+		if node == self {
+			selfGroupId = len(sets)
+		}
+		if version, ok := w.nodeVersions[node]; ok {
+			nodeSet[node] = version
+			set = append(set, NodeProcessVersion{Node: node, Version: version})
+		} else {
+			nodeSet[node] = NewEmptyVersion()
+			set = append(set, NodeProcessVersion{Node: node, Version: NewEmptyVersion()})
 		}
 	}
 	if len(set) > 0 {
 		sets = append(sets, set)
 	}
+	if selfGroupId != -1 {
+		sets[selfGroupId] = sets[selfGroupId].MoveNodeToNext(self).Drop()
+	}
+	delete(nodeSet, self)
 
 	for _, group := range sets {
-		if w.sendFetchProcessList(group) {
+		fetchID := w.nextFetchID()
+		if w.sendFetchProcessList(self, fetchID, group) {
 			w.send_fetch_proc_times++
 		}
 	}
@@ -353,17 +379,18 @@ func (w *whereis) fetchOtherNodeProcess(nodes []gen.Atom) error {
 	return nil
 }
 
-func (w *whereis) sendFetchProcessList(versionSet VersionSet) bool {
-	msg := MessageFetchProcessList{
-		Node:       w.Node().Name(),
-		VersionSet: versionSet,
-	}
+func (w *whereis) sendFetchProcessList(source gen.Atom, fetchID uint64, versionSet VersionSet) bool {
 	// Robust forwarding: retry until success or no nodes left
 	for len(versionSet) > 0 {
-		node := versionSet.PickNode()
+		msg := MessageFetchProcessList{
+			Node:       source,
+			FetchID:    fetchID,
+			VersionSet: versionSet,
+		}
+		node := versionSet.NextNode()
 		if err := w.Send(gen.ProcessID{Node: node, Name: WhereIsProcess}, msg); err != nil {
 			w.Log().Warning("send fetch request to node:%s process failure %v, trying next...", node, err)
-			delete(versionSet, node)
+			versionSet = versionSet.Drop()
 			continue
 		}
 		return true
@@ -371,9 +398,9 @@ func (w *whereis) sendFetchProcessList(versionSet VersionSet) bool {
 	return false
 }
 
-func (w *whereis) respondMessageFetchProcessList(from gen.ProcessID, version ProcessVersion) error {
+func (w *whereis) makeFetchReply(version ProcessVersion) (MessageFetchProcessReply, bool) {
 	if version == w.selfVersion {
-		return nil
+		return MessageFetchProcessReply{}, false
 	}
 	size := w.procChangeCount
 	for i := 0; i < size; i++ {
@@ -381,30 +408,115 @@ func (w *whereis) respondMessageFetchProcessList(from gen.ProcessID, version Pro
 		ver := w.procChangeBuffer[idx]
 		if ver.Version == version {
 			if i < size-1 {
-				err := w.Send(from, w.compactProcessChangeRing(i+1, size))
-				if err != nil {
-					w.Log().Warning("send process info to node:%s failure %v", from.Node, err)
+				if msg, ok := w.compactProcessChangeRing(i+1, size); ok {
+					return MessageFetchProcessReply{Kind: fetchReplyKindChanged, Changed: msg}, true
 				}
-				w.respond_fetch_proc_times++
 			}
-			return nil
+			return MessageFetchProcessReply{}, false
 		}
 	}
-	err := w.Send(from, MessageProcesses{
+	return MessageFetchProcessReply{Kind: fetchReplyKindFull, Full: MessageProcesses{
 		Node:        w.Node().Name(),
 		ProcessList: w.book.GetProcessList(w.Node().Name()),
 		Version:     w.selfVersion,
-	})
-	if err != nil {
-		w.Log().Warning("send process info to node:%s failure %v", from.Node, err)
-	}
-	w.respond_fetch_proc_times++
-	return err
+	}}, true
 }
 
-func (w *whereis) compactProcessChangeRing(start, end int) MessageProcessChanged {
+func (w *whereis) handleFetchReply(e MessageFetchProcessReply) error {
+	now := time.Now()
+	w.cleanupFetchRoutes(now)
+	if e.Kind != fetchReplyKindFull && e.Kind != fetchReplyKindChanged {
+		return nil
+	}
+	isOrigin := w.Node().Name() == e.Origin
+	if !isOrigin {
+		key := fetchRouteKey{Origin: e.Origin, FetchID: e.FetchID}
+		if route, ok := w.fetchRoutes[key]; ok && now.Before(route.ExpireAt) {
+			if err := w.Send(route.Upstream, e); err != nil {
+				w.Log().Warning("forward process info to node:%s failure %v", route.Upstream.Node, err)
+			}
+		}
+	}
+	switch e.Kind {
+	case fetchReplyKindFull:
+		return w.handleProcesses(e.Full)
+	case fetchReplyKindChanged:
+		if !isOrigin {
+			return nil
+		}
+		return w.handleProcessChanged(e.Changed)
+	default:
+		return nil
+	}
+}
+
+func (w *whereis) handleProcesses(e MessageProcesses) error {
+	w.receive_proc_snapshot_times++
+	if version, ok := w.nodeVersions[e.Node]; ok && version.GreaterThanOrEq(e.Version) {
+		return nil
+	}
+	if _, err := w.fetchAvailableBookNodes(); err != nil {
+		w.Log().Error("fetch nodes fail %v", err)
+		return err
+	}
+	w.book.SetProcess(e.Node, e.ProcessList...)
+	w.Log().Debug("received %d process snapshot on %s %s", len(e.ProcessList), e.Node, shortInfo(e.ProcessList))
+	w.nodeVersions[e.Node] = e.Version
+	return nil
+}
+
+func (w *whereis) handleProcessChanged(e MessageProcessChanged) error {
+	w.receive_incr_proc_times++
+	if version, ok := w.nodeVersions[e.Node]; ok && version.GreaterThanOrEq(e.Version) {
+		return nil
+	}
+	w.book.AddProcess(e.Node, e.UpProcess...)
+	w.book.RemoveProcess(e.Node, e.DownProcess...)
+	w.Log().Debug("received +%d%s/-%d%s process on %s", len(e.UpProcess), shortInfo(e.UpProcess), len(e.DownProcess), shortInfo(e.DownProcess), e.Node)
+	w.nodeVersions[e.Node] = e.Version
+	return nil
+}
+
+func (w *whereis) keepFetchRoute(key fetchRouteKey, upstream gen.PID) {
+	if w.fetchRoutes == nil {
+		w.fetchRoutes = make(map[fetchRouteKey]fetchRoute)
+	}
+	w.fetchRoutes[key] = fetchRoute{Upstream: upstream, ExpireAt: time.Now().Add(w.fetchRouteTTL())}
+}
+
+func (w *whereis) cleanupFetchRoutes(now time.Time) {
+	if len(w.fetchRoutes) == 0 {
+		return
+	}
+	for k, v := range w.fetchRoutes {
+		if now.After(v.ExpireAt) {
+			delete(w.fetchRoutes, k)
+		}
+	}
+}
+
+func (w *whereis) nextFetchID() uint64 {
+	w.fetchSeq++
+	if w.fetchSeq == 0 {
+		w.fetchSeq = 1
+	}
+	return w.fetchSeq
+}
+
+func (w *whereis) fetchRouteTTL() time.Duration {
+	ttl := w.inspect_interval * 4
+	if ttl < 2*time.Second {
+		ttl = 2 * time.Second
+	}
+	if ttl > time.Minute {
+		ttl = time.Minute
+	}
+	return ttl
+}
+
+func (w *whereis) compactProcessChangeRing(start, end int) (MessageProcessChanged, bool) {
 	if start >= end || w.procChangeCount == 0 {
-		return MessageProcessChanged{}
+		return MessageProcessChanged{}, false
 	}
 	add, del := make(map[gen.Atom]ProcessInfo), make(map[gen.Atom]ProcessInfo)
 	for j := start; j < end; j++ {
@@ -432,5 +544,5 @@ func (w *whereis) compactProcessChangeRing(start, end int) MessageProcessChanged
 		UpProcess:   toList(add),
 		DownProcess: toList(del),
 		Version:     w.procChangeBuffer[lastIdx].Version,
-	}
+	}, true
 }

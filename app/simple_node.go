@@ -169,7 +169,7 @@ func (n *nodeImpl) ForwardSpawn(fac gen.ProcessFactory, args ...any) error {
 
 func (n *nodeImpl) LocateProcess(process gen.Atom) gen.Atom {
 	p, _ := n.book.Locate(process)
-	return p.Node
+	return p
 }
 
 func (n *nodeImpl) AddressBook() system.IAddressBook {

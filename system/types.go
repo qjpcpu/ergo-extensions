@@ -15,9 +15,21 @@ type (
 	MessageLocate        struct {
 		Name gen.Atom
 	}
-	ProcessVersion [2]int64
-	VersionSet     map[gen.Atom]ProcessVersion
-	ProcessInfo    struct {
+	MessageFetchProcessReply struct {
+		Origin  gen.Atom
+		FetchID uint64
+		Kind    uint8
+		Base    ProcessVersion
+		Changed MessageProcessChanged
+		Full    MessageProcesses
+	}
+	ProcessVersion     [2]int64
+	NodeProcessVersion struct {
+		Node    gen.Atom
+		Version ProcessVersion
+	}
+	VersionSet  []NodeProcessVersion
+	ProcessInfo struct {
 		// Node is the node name hosting this process.
 		Node gen.Atom
 		// PID is the process identifier.
@@ -35,6 +47,7 @@ type (
 	}
 	MessageFetchProcessList struct {
 		Node       gen.Atom
+		FetchID    uint64
 		VersionSet VersionSet
 	}
 	MessageProcesses struct {
@@ -63,14 +76,16 @@ type (
 func init() {
 	types := []any{
 		ProcessVersion{},
+		NodeProcessVersion{},
 		VersionSet{},
-		MessageFetchProcessList{},
 		ProcessInfo{},
 		ProcessInfoList{},
-		MessageProcessList{},
-		MessageLocate{},
 		MessageProcessChanged{},
 		MessageProcesses{},
+		MessageFetchProcessList{},
+		MessageFetchProcessReply{},
+		MessageProcessList{},
+		MessageLocate{},
 		MessageLaunchAllDaemon{},
 		DaemonProcess{},
 		MessageLaunchOneDaemon{},
@@ -112,10 +127,35 @@ func NewEmptyVersion() ProcessVersion {
 	return [2]int64{0, 0}
 }
 
-func (vs VersionSet) PickNode() (node gen.Atom) {
-	for k := range vs {
-		node = k
-		break
+func (vs VersionSet) Size() int {
+	return len(vs)
+}
+
+func (vs VersionSet) NextNode() (node gen.Atom) {
+	return vs[len(vs)-1].Node
+}
+
+func (vs VersionSet) Next() NodeProcessVersion {
+	return vs[len(vs)-1]
+}
+
+func (vs VersionSet) Drop() VersionSet {
+	ret := vs[:len(vs)-1]
+	return ret
+}
+
+func (vs VersionSet) MoveNodeToNext(node gen.Atom) VersionSet {
+	for i, item := range vs {
+		if item.Node == node && i < len(vs)-1 {
+			set := make(VersionSet, 0, len(vs))
+			for j := i + 1; j < len(vs); j++ {
+				set = append(set, vs[j])
+			}
+			for j := 0; j <= i; j++ {
+				set = append(set, vs[j])
+			}
+			return set
+		}
 	}
-	return
+	return vs
 }

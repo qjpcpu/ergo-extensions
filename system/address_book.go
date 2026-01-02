@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"ergo.services/ergo/gen"
 
@@ -14,10 +15,10 @@ import (
 
 // IAddressBook defines address book interface
 type IAddressBook interface {
-	Locate(process gen.Atom) (ProcessInfo, bool)
-	GetProcessList(node gen.Atom) ProcessInfoList
+	Locate(process gen.Atom) (gen.Atom, bool)
 	PickNode(process gen.Atom) gen.Atom
 	GetAvailableNodes() []gen.Atom
+	LastModified() int64
 }
 
 // AddressBook is a registry for all processes running on all nodes
@@ -29,26 +30,34 @@ type AddressBook struct {
 	processToNodes map[gen.Atom][]gen.Atom
 	nodeProcesses  map[gen.Atom]map[gen.Atom]ProcessInfo
 	ring           *consistent.Consistent // consistent hashing ring
+	lastModified   *atomic.Int64
 }
 
 // NewAddressBook creates a new AddressBook
 func NewAddressBook() *AddressBook {
 	var c atomic.Value
 	c.Store([]gen.Atom{})
+	var lm atomic.Int64
+	lm.Store(time.Now().Unix())
 	return &AddressBook{
 		nodes:          make(map[gen.Atom]struct{}),
 		processToNodes: make(map[gen.Atom][]gen.Atom),
 		nodeProcesses:  make(map[gen.Atom]map[gen.Atom]ProcessInfo),
 		ring:           makeRing(),
 		nodesCache:     c,
+		lastModified:   &lm,
 	}
 }
 
 // Locate returns a process information by its registered name.
-func (book *AddressBook) Locate(process gen.Atom) (ProcessInfo, bool) {
+func (book *AddressBook) Locate(process gen.Atom) (gen.Atom, bool) {
 	book.mu.RLock()
 	defer book.mu.RUnlock()
-	return book.locate(process)
+	v, ok := book.locate(process)
+	if ok {
+		return v.Node, true
+	}
+	return "", false
 }
 
 // GetProcessList returns a list of processes running on the given node.
@@ -122,6 +131,7 @@ func (book *AddressBook) SetProcess(node gen.Atom, ps ...ProcessInfo) {
 	}
 
 	book.nodeProcesses[node] = newProcesses
+	book.lastModified.Store(time.Now().Unix())
 }
 
 // AddProcess adds a list of processes for the given node.
@@ -145,6 +155,7 @@ func (book *AddressBook) AddProcess(node gen.Atom, ps ...ProcessInfo) {
 		}
 	}
 	book.nodeProcesses[node] = processes
+	book.lastModified.Store(time.Now().Unix())
 }
 
 // RemoveProcess removes a list of processes from the given node.
@@ -168,9 +179,15 @@ func (book *AddressBook) RemoveProcess(node gen.Atom, ps ...ProcessInfo) {
 					book.processToNodes[name] = arr
 				}
 				delete(processes, name)
+				book.lastModified.Store(time.Now().Unix())
 			}
 		}
 	}
+
+}
+
+func (book *AddressBook) LastModified() int64 {
+	return book.lastModified.Load()
 }
 
 // SetAvailableNodes sets a list of available nodes.
@@ -233,6 +250,15 @@ func unifyNodes(nodes []gen.Atom) []gen.Atom {
 		return nodes[i] < nodes[j]
 	})
 	return uniqNodes(nodes)
+}
+
+func sortNodes(n []gen.Atom) []gen.Atom {
+	nodes := make([]gen.Atom, len(n))
+	copy(nodes, n)
+	sort.SliceStable(nodes, func(i int, j int) bool {
+		return nodes[i] < nodes[j]
+	})
+	return nodes
 }
 
 func uniqNodes(nodes []gen.Atom) []gen.Atom {
