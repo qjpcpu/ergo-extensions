@@ -2,6 +2,7 @@ package mem
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"ergo.services/ergo/gen"
 	"ergo.services/registrar/zk"
@@ -9,16 +10,19 @@ import (
 
 func NewCluster() *Cluster {
 	return &Cluster{
-		routes: make(map[gen.Atom][]gen.Route),
+		routes:      make(map[gen.Atom][]gen.Route),
+		nodeVersion: make(map[gen.Atom]uint32),
 	}
 }
 
 type Cluster struct {
-	mu      sync.RWMutex
-	routes  map[gen.Atom][]gen.Route
-	nodes   []gen.Atom
-	onEvent sync.Map // gen.Atom -> func(event)
-	leader  gen.Atom
+	mu          sync.RWMutex
+	routes      map[gen.Atom][]gen.Route
+	nodes       []gen.Atom
+	nodeVersion map[gen.Atom]uint32
+	onEvent     sync.Map // gen.Atom -> func(event)
+	leader      gen.Atom
+	version     atomic.Uint32
 }
 
 func (c *Cluster) GetRoutes(node gen.Atom) []gen.Route {
@@ -41,6 +45,15 @@ func (c *Cluster) GetLeader() gen.Atom {
 	return c.leader
 }
 
+func (c *Cluster) GetVersion(node gen.Atom) int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if ver, ok := c.nodeVersion[node]; ok {
+		return int(ver)
+	}
+	return -1
+}
+
 func (c *Cluster) AddRoutes(node gen.Atom, routes []gen.Route, onEvent func(any)) {
 	if node == "" {
 		return
@@ -51,6 +64,7 @@ func (c *Cluster) AddRoutes(node gen.Atom, routes []gen.Route, onEvent func(any)
 		return
 	}
 	c.routes[node] = routes
+	c.nodeVersion[node] = c.version.Add(1)
 	c.nodes = append(c.nodes, node)
 	c.onEvent.Store(node, onEvent)
 	c.onEvent.Range(func(key, value any) bool {
@@ -71,6 +85,7 @@ func (c *Cluster) RemoveNode(node gen.Atom) {
 		return
 	}
 	delete(c.routes, node)
+	delete(c.nodeVersion, node)
 	for i, n := range c.nodes {
 		if n == node {
 			c.nodes = append(c.nodes[:i], c.nodes[i+1:]...)

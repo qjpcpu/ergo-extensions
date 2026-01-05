@@ -25,6 +25,7 @@ type Node interface {
 }
 
 type CronJob = system.CronJob
+type IAddressBookStorage = system.IAddressBookStorage
 
 type SimpleNodeOptions struct {
 	zk.Options        // ZooKeeper registrar options.
@@ -42,4 +43,5 @@ type SimpleNodeOptions struct {
 	SyncProcessInterval   time.Duration               // Whereis sync interval for pulling remote changes.
 	ProcessChangeBuffer   int                         // Whereis change buffer size for compacting deltas.
 	Registrar             gen.Registrar               // Custom registrar implementation (used if Endpoints is empty).
+	AddressBookStorage    IAddressBookStorage         // Optional persistent backend for PersistAddressBook.
 }

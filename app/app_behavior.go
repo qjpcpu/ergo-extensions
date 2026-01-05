@@ -1,6 +1,7 @@
 package app
 
 import (
+	"fmt"
 	"time"
 
 	"ergo.services/ergo/gen"
@@ -8,21 +9,30 @@ import (
 )
 
 type simpleApp struct {
-	book                    *system.AddressBook
+	book                    system.IAddressBook
 	cron                    []CronJob
 	MemberSpecs             []gen.ApplicationMemberSpec
 	SyncAddressBookInterval time.Duration
 	AddressBookBuffer       int
+	err                     error
 }
 
 func (app *simpleApp) Load(node gen.Node, args ...any) (gen.ApplicationSpec, error) {
+	opts := system.ApplicationMemberSepcOptions{
+		CronJobs:                app.cron,
+		SyncAddressBookInterval: app.SyncAddressBookInterval,
+		AddressBookBuffer:       app.AddressBookBuffer,
+	}
+	switch book := app.book.(type) {
+	case *system.AddressBook:
+		opts.AddressBook = book
+	case *system.PersistAddressBook:
+		opts.PersistAddressBook = book
+	default:
+		return gen.ApplicationSpec{}, fmt.Errorf("address book<%T> not supported", app.book)
+	}
 	members := append([]gen.ApplicationMemberSpec{
-		system.ApplicationMemberSepc(system.ApplicationMemberSepcOptions{
-			AddressBook:             app.book,
-			CronJobs:                app.cron,
-			SyncAddressBookInterval: app.SyncAddressBookInterval,
-			AddressBookBuffer:       app.AddressBookBuffer,
-		})},
+		system.ApplicationMemberSepc(opts)},
 		app.MemberSpecs...,
 	)
 	return gen.ApplicationSpec{

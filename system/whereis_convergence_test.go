@@ -2,7 +2,9 @@ package system_test
 
 import (
 	"fmt"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,6 +15,17 @@ import (
 	"github.com/qjpcpu/ergo-extensions/system"
 )
 
+var nodeSeq int64
+
+func uniqueNodeName(base string) string {
+	seq := atomic.AddInt64(&nodeSeq, 1)
+	parts := strings.SplitN(base, "@", 2)
+	if len(parts) != 2 {
+		return fmt.Sprintf("%s-%d", base, seq)
+	}
+	return fmt.Sprintf("%s-%d@%s", parts[0], seq, parts[1])
+}
+
 type testProc struct{ act.Actor }
 
 func (p *testProc) Init(args ...any) error { return nil }
@@ -21,6 +34,7 @@ func (p *testProc) HandleMessage(from gen.PID, message any) error { return nil }
 
 func startNode(t *testing.T, cluster *mem.Cluster, name string) app.Node {
 	t.Helper()
+	name = uniqueNodeName(name)
 	n, err := app.StartSimpleNode(app.SimpleNodeOptions{
 		NodeName:              name,
 		Port:                  0,
@@ -65,10 +79,19 @@ func spawnNamed(t *testing.T, n app.Node, name gen.Atom) gen.PID {
 }
 
 func locateNode(book system.IAddressBook, name gen.Atom) (gen.Atom, bool) {
-	if p, ok := book.Locate(name); ok {
-		return p.Node, true
+	if node, ok := book.Locate(name); ok {
+		return node, true
 	}
 	return "", false
+}
+
+func processList(book system.IAddressBook, node gen.Atom) system.ProcessInfoList {
+	if b, ok := book.(interface {
+		GetProcessList(gen.Atom) system.ProcessInfoList
+	}); ok {
+		return b.GetProcessList(node)
+	}
+	return nil
 }
 
 func nodeMin(a, b gen.Atom) gen.Atom {
@@ -231,8 +254,8 @@ func TestWhereisDuplicateNameTieBreakStable(t *testing.T) {
 		}()
 
 		waitUntil(t, 5*time.Second, func() bool {
-			l2 := n1.AddressBook().GetProcessList(n2.Name())
-			l3 := n1.AddressBook().GetProcessList(n3.Name())
+			l2 := processList(n1.AddressBook(), n2.Name())
+			l3 := processList(n1.AddressBook(), n3.Name())
 			has2 := false
 			has3 := false
 			for _, p := range l2 {
@@ -249,12 +272,12 @@ func TestWhereisDuplicateNameTieBreakStable(t *testing.T) {
 		})
 
 		var b2, b3 int64
-		for _, p := range n1.AddressBook().GetProcessList(n2.Name()) {
+		for _, p := range processList(n1.AddressBook(), n2.Name()) {
 			if p.Name == dup {
 				b2 = p.BirthAt
 			}
 		}
-		for _, p := range n1.AddressBook().GetProcessList(n3.Name()) {
+		for _, p := range processList(n1.AddressBook(), n3.Name()) {
 			if p.Name == dup {
 				b3 = p.BirthAt
 			}

@@ -11,7 +11,7 @@ import (
 	"ergo.services/registrar/zk"
 )
 
-const DaemonMonitorProcess = gen.Atom("sysext_daemon")
+const DaemonMonitorProcess = gen.Atom("extensions_daemon")
 
 type daemon struct {
 	act.Actor

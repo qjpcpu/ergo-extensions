@@ -15,6 +15,9 @@ type (
 	MessageLocate        struct {
 		Name gen.Atom
 	}
+	MessageFlushProcess struct {
+		PID gen.PID
+	}
 	MessageFetchProcessReply struct {
 		Origin  gen.Atom
 		FetchID uint64
@@ -75,6 +78,7 @@ type (
 
 func init() {
 	types := []any{
+		MessageFlushProcess{},
 		ProcessVersion{},
 		NodeProcessVersion{},
 		VersionSet{},

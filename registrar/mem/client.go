@@ -99,7 +99,7 @@ func (c *client) ConfigItem(item string) (any, error) {
 	if node := c.node; node != nil {
 		return c.cluster.GetLeader(), nil
 	}
-	return nil, gen.ErrUnsupported
+	return c.cluster.GetVersion(gen.Atom(item)), nil
 }
 
 func (c *client) Config(items ...string) (map[string]any, error) {

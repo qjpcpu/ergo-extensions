@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"ergo.services/ergo/gen"
+	"github.com/qjpcpu/ergo-extensions/registrar/mem"
 )
 
 func TestAddressBook_Basic(t *testing.T) {
@@ -25,11 +26,11 @@ func TestAddressBook_Basic(t *testing.T) {
 	book.SetProcess(node2, p2)
 
 	// Test Locate
-	if info, ok := book.Locate("p1"); !ok || info.Name != "p1" || info.Node != node1 {
-		t.Errorf("Locate p1 failed: got %v, %v", info, ok)
+	if node, ok := book.Locate("p1"); !ok || node != node1 {
+		t.Errorf("Locate p1 failed: got %v, %v", node, ok)
 	}
-	if info, ok := book.Locate("p2"); !ok || info.Name != "p2" || info.Node != node2 {
-		t.Errorf("Locate p2 failed: got %v, %v", info, ok)
+	if node, ok := book.Locate("p2"); !ok || node != node2 {
+		t.Errorf("Locate p2 failed: got %v, %v", node, ok)
 	}
 	if _, ok := book.Locate("p3"); ok {
 		t.Error("Locate p3 should fail")
@@ -198,7 +199,7 @@ func TestAddressBook_SetProcess_Update(t *testing.T) {
 
 	// Initial set
 	book.SetProcess(node1, p1)
-	if info, _ := book.Locate("p1"); info.PID.ID != 1 {
+	if got := findPID(book.GetProcessList(node1), gen.Atom("p1")); got.ID != 1 {
 		t.Error("p1 ID mismatch")
 	}
 
@@ -206,7 +207,7 @@ func TestAddressBook_SetProcess_Update(t *testing.T) {
 	// If we use same name "p1" but different PID
 	p1New := ProcessInfo{Name: "p1", PID: gen.PID{Node: node1, ID: 3}}
 	book.SetProcess(node1, p1New)
-	if info, _ := book.Locate("p1"); info.PID.ID != 3 {
+	if got := findPID(book.GetProcessList(node1), gen.Atom("p1")); got.ID != 3 {
 		t.Error("p1 ID should be updated")
 	}
 
@@ -250,8 +251,8 @@ func TestAddressBook_Coverage_Boost(t *testing.T) {
 	book.SetProcess(node1)
 
 	// p1 should still exist on node2
-	if info, ok := book.Locate("p1"); !ok || info.Node != node2 {
-		t.Errorf("p1 should still be on node2, got %v", info)
+	if node, ok := book.Locate("p1"); !ok || node != node2 {
+		t.Errorf("p1 should still be on node2, got %v", node)
 	}
 	// processToNodes["p1"] should now be [node2] (not empty)
 	// This exercises the `else` branch of `if len(arr) == 0` in SetProcess/RemoveProcess cleanup.
@@ -319,9 +320,18 @@ func TestAddressBook_Internal_Locate(t *testing.T) {
 		p1: {Name: p1, Node: node2},
 	}
 
-	if info, ok := book.Locate(p1); !ok || info.Node != node2 {
-		t.Errorf("Locate should skip invalid node1 and find on node2, got %v", info)
+	if node, ok := book.Locate(p1); !ok || node != node2 {
+		t.Errorf("Locate should skip invalid node1 and find on node2, got %v", node)
 	}
+}
+
+func findPID(list ProcessInfoList, name gen.Atom) gen.PID {
+	for _, item := range list {
+		if item.Name == name {
+			return item.PID
+		}
+	}
+	return gen.PID{}
 }
 
 func TestAddressBook_SetAvailableNodes_MultiNode(t *testing.T) {
@@ -495,4 +505,93 @@ func TestAddressBook_Concurrency(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	close(stop)
 	wg.Wait()
+}
+
+type mockPersistStorage struct {
+	mu   sync.RWMutex
+	data map[gen.Atom]struct {
+		node gen.Atom
+		ver  int
+	}
+}
+
+type registrarWithVersions struct {
+	gen.Registrar
+	versions map[string]int
+}
+
+func (r registrarWithVersions) ConfigItem(item string) (any, error) {
+	if v, ok := r.versions[item]; ok {
+		return v, nil
+	}
+	return nil, nil
+}
+
+func (m *mockPersistStorage) Get(process gen.Atom) (gen.Atom, int, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	v, ok := m.data[process]
+	if !ok {
+		return "", 0, nil
+	}
+	return v.node, v.ver, nil
+}
+
+func (m *mockPersistStorage) Set(node gen.Atom, process gen.Atom, version int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.data[process] = struct {
+		node gen.Atom
+		ver  int
+	}{node: node, ver: version}
+	return nil
+}
+
+func (m *mockPersistStorage) Remove(node gen.Atom, process gen.Atom, version int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.data[process]
+	if !ok {
+		return nil
+	}
+	if v.node == node && v.ver == version {
+		delete(m.data, process)
+	}
+	return nil
+}
+
+func TestPersistAddressBook_EpochInvalidatesStaleEntries(t *testing.T) {
+	st := &mockPersistStorage{data: make(map[gen.Atom]struct {
+		node gen.Atom
+		ver  int
+	})}
+	book := NewPersistAddressBook(st)
+
+	node := gen.Atom("node1")
+	proc := gen.Atom("p1")
+	reg := registrarWithVersions{
+		Registrar: mem.CreateWithCluster(mem.NewCluster()),
+		versions:  map[string]int{string(node): 1},
+	}
+	book.SetRegistrar(reg)
+
+	_ = book.SetAvailableNodes([]gen.Atom{node})
+	if err := book.SetProcess(node, 1, proc); err != nil {
+		t.Fatalf("SetProcess: %v", err)
+	}
+	if got, ok := book.Locate(proc); !ok || got != node {
+		t.Fatalf("Locate should succeed, got %v %v", got, ok)
+	}
+
+	reg.versions[string(node)] = 2
+	if _, ok := book.Locate(proc); ok {
+		t.Fatalf("Locate should fail after node epoch changes")
+	}
+
+	if err := book.SetProcess(node, 2, proc); err != nil {
+		t.Fatalf("SetProcess: %v", err)
+	}
+	if got, ok := book.Locate(proc); !ok || got != node {
+		t.Fatalf("Locate should succeed after re-set, got %v %v", got, ok)
+	}
 }

@@ -7,6 +7,8 @@ This repository provides a small set of building blocks to add distributed proce
 - `sysext_cron` — a cron-like scheduler that triggers messages on a node or across the cluster.
 - `AddressBook` — a thread-safe, eventually-consistent cache of nodes and their registered processes, with node picking via consistent hashing.
 
+Optionally, `PersistAddressBook` can be enabled via `app.SimpleNodeOptions.AddressBookStorage` to persist named processes into an external storage backend.
+
 Core components live under the `system` package and are designed to integrate with `ergo.services/ergo` and a registrar (Zookeeper by default). The `app` package provides a small helper to start a node with these components wired in.
 
 ## Features
@@ -53,9 +55,12 @@ import "github.com/qjpcpu/ergo-extensions/system"
     - Sends remote spawn requests when target node is not local
   - `CronJobProcess` (`sysext_cron`):
     - Triggers cron jobs either on a single node or cluster-wide
-- `AddressBook`:
-  - Tracks available nodes and per-node registered processes
-  - Picks a node for a process name using a consistent hashing ring (PartitionCount: 10240, ReplicationFactor: 40)
+  - `AddressBook`:
+    - Tracks available nodes and per-node registered processes
+    - Picks a node for a process name using a consistent hashing ring (PartitionCount: 10240, ReplicationFactor: 40)
+  - `PersistAddressBook`:
+    - Persists local named processes into a user-provided storage backend
+    - Validates entries using a per-node version/epoch (via registrar config)
 - `app.StartSimpleNode`:
   - Starts an Ergo node and loads the `system.Supervisor` with a shared `AddressBook`
   - Provides helper methods for locating named processes and forwarding sends/calls
@@ -93,6 +98,18 @@ n, err := app.StartSimpleNode(app.SimpleNodeOptions{
     NodeForwardWorker: 8,
     SyncProcessInterval: time.Second * 3,
     ProcessChangeBuffer: 16,
+})
+_ = n
+_ = err
+```
+
+To enable persistence for process discovery, provide an `AddressBookStorage` implementation:
+
+```go
+n, err := app.StartSimpleNode(app.SimpleNodeOptions{
+    NodeName: "node-1",
+    Options: zk.Options{Endpoints: []string{"127.0.0.1:2181"}},
+    AddressBookStorage: myStorage,
 })
 _ = n
 _ = err
@@ -148,7 +165,10 @@ respAny, err := self.Call(gen.ProcessID{Name: system.WhereIsProcess}, system.Mes
 if err != nil { /* handle */ }
 book := respAny.(system.MessageAddressBook).Book
 picked := book.PickNode(gen.Atom("worker.A"))
-list := book.GetProcessList(picked)
+if b, ok := book.(*system.AddressBook); ok {
+    list := b.GetProcessList(picked)
+    _ = list
+}
 ```
 
 ## Public API (selected)
@@ -167,7 +187,7 @@ list := book.GetProcessList(picked)
 - Discovery & address book:
   - Call `sysext_whereis` with `MessageLocate{Name gen.Atom}` → `gen.Atom` (node)
   - Call `sysext_whereis` with `MessageGetAddressBook{}` → `MessageAddressBook{Book IAddressBook}`
-  - `IAddressBook` provides: `Locate`, `GetProcessList`, `PickNode`, `GetAvailableNodes`
+  - `IAddressBook` provides: `Locate`, `PickNode`, `GetAvailableNodes`, `LastModified`
 
 ## Registrar & Events
 

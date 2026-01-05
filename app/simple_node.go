@@ -15,11 +15,16 @@ import (
 type nodeImpl struct {
 	gen.Node
 	route gen.Atom
-	book  *system.AddressBook
+	book  system.IAddressBook
 }
 
 func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
-	book := system.NewAddressBook()
+	var book system.IAddressBook
+	if opts.AddressBookStorage != nil {
+		book = system.NewPersistAddressBook(opts.AddressBookStorage)
+	} else {
+		book = system.NewAddressBook()
+	}
 	var options gen.NodeOptions
 	if len(opts.Options.Endpoints) != 0 {
 		registrar, err := zk.Create(opts.Options)
@@ -40,7 +45,7 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 	options.Network.Acceptors = []gen.AcceptorOptions{{Host: "0.0.0.0", Port: opts.Port, TCP: "tcp"}}
 	options.Network.Cookie = str(opts.Cookie, "simple-app-cookie")
 	options.Network.InsecureSkipVerify = true
-	router := gen.Atom("node_router")
+	router := gen.Atom("app_routes")
 	opts.MemberSpecs = append(opts.MemberSpecs, gen.ApplicationMemberSpec{
 		Name:    router,
 		Factory: CreatePool(func() gen.ProcessBehavior { return &myworker{monitorPID: make(map[gen.PID]chan error), book: book} }, opts.NodeForwardWorker),

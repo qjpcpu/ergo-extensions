@@ -7,10 +7,11 @@ import (
 	"ergo.services/ergo/gen"
 )
 
-const Supervisor = gen.Atom("sysext_sup")
+const Supervisor = gen.Atom("extensions_sup")
 
 type ApplicationMemberSepcOptions struct {
 	AddressBook             *AddressBook
+	PersistAddressBook      *PersistAddressBook
 	CronJobs                []CronJob
 	SyncAddressBookInterval time.Duration
 	AddressBookBuffer       int
@@ -29,6 +30,7 @@ func FactorySystemSup(opts ApplicationMemberSepcOptions) gen.ProcessFactory {
 			cron:                opts.CronJobs,
 			syncProcessInterval: opts.SyncAddressBookInterval,
 			changeBufferCap:     opts.AddressBookBuffer,
+			persistBook:         opts.PersistAddressBook,
 		}
 		if opts.AddressBook != nil {
 			sup.book = opts.AddressBook
@@ -41,10 +43,23 @@ func FactorySystemSup(opts ApplicationMemberSepcOptions) gen.ProcessFactory {
 
 type systemSup struct {
 	act.Supervisor
+	persistBook         *PersistAddressBook
 	book                *AddressBook
 	cron                []CronJob
 	syncProcessInterval time.Duration
 	changeBufferCap     int
+}
+
+var system_process = map[gen.Atom]struct{}{
+	WhereIsProcess:       struct{}{},
+	DaemonMonitorProcess: struct{}{},
+	CronJobProcess:       struct{}{},
+	Supervisor:           struct{}{},
+}
+
+func isSystemProc(p gen.Atom) bool {
+	_, ok := system_process[p]
+	return ok
 }
 
 func (sup *systemSup) Init(args ...any) (act.SupervisorSpec, error) {
@@ -56,10 +71,16 @@ func (sup *systemSup) Init(args ...any) (act.SupervisorSpec, error) {
 	book := sup.book
 
 	// add children
+	makeWhereIs := func() gen.ProcessFactory {
+		if sup.persistBook != nil {
+			return factory_persist_whereis(sup.persistBook, sup.syncProcessInterval)
+		}
+		return factory_whereis(book, sup.syncProcessInterval, sup.changeBufferCap)
+	}
 	spec.Children = []act.SupervisorChildSpec{
 		{
 			Name:    WhereIsProcess,
-			Factory: factory_whereis(book, sup.syncProcessInterval, sup.changeBufferCap),
+			Factory: makeWhereIs(),
 		},
 		{
 			Name:    DaemonMonitorProcess,
