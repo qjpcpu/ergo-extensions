@@ -2,9 +2,9 @@
 
 This repository provides a small set of building blocks to add distributed process discovery and daemon orchestration to an Ergo-based cluster. It ships a supervisor that wires together:
 
-- `sysext_whereis` — a process that continuously inspects local processes, maintains an address book, and broadcasts snapshots/changes to the cluster.
-- `sysext_daemon` — a process that (on the elected leader) recovers and launches daemon processes across nodes using consistent hashing.
-- `sysext_cron` — a cron-like scheduler that triggers messages on a node or across the cluster.
+- `extensions_whereis` — a process that continuously inspects local processes, maintains an address book, and broadcasts snapshots/changes to the cluster.
+- `extensions_daemon` — a process that (on the elected leader) recovers and launches daemon processes across nodes using consistent hashing.
+- `extensions_cron` — a cron-like scheduler that triggers messages on a node or across the cluster.
 - `AddressBook` — a thread-safe, eventually-consistent cache of nodes and their registered processes, with node picking via consistent hashing.
 
 Optionally, `PersistAddressBook` can be enabled via `app.SimpleNodeOptions.AddressBookStorage` to persist named processes into an external storage backend.
@@ -16,7 +16,7 @@ Core components live under the `system` package and are designed to integrate wi
 - Distributed process discovery and naming via a shared address book
 - Periodic local inspection and cluster-wide broadcast of process snapshots
 - Leader-driven daemon recovery and remote spawn requests
-- Node- or cluster-scoped cron jobs (`sysext_cron`) with stable placement
+- Node- or cluster-scoped cron jobs (`extensions_cron`) with stable placement
 - Consistent hashing (`xxhash` + `buraksezer/consistent`) for stable node selection
 - Simple APIs to register daemon launchers and spawn named processes
 
@@ -42,18 +42,18 @@ import "github.com/qjpcpu/ergo-extensions/system"
 
 ## Architecture
 
-- `Supervisor` (`sysext_sup`) starts three children:
-  - `WhereIsProcess` (`sysext_whereis`):
+- `Supervisor` (`extensions_sup`) starts three children:
+  - `WhereIsProcess` (`extensions_whereis`):
     - Inspects local processes periodically (default: every 3 seconds)
     - Maintains PID→Name and Name→PID maps
     - Stores a snapshot (`ProcessInfoList`) in-memory and updates the `AddressBook`
     - Broadcasts process snapshots or deltas to other nodes
     - Answers calls: `MessageLocate{Name}` → node, `MessageGetAddressBook{}` → `AddressBook`
-  - `DaemonMonitorProcess` (`sysext_daemon`):
+  - `DaemonMonitorProcess` (`extensions_daemon`):
     - Subscribes to registrar events for leader election and membership changes
     - On leader, scans registered `Launcher` recovery iterators and launches daemons to selected nodes
     - Sends remote spawn requests when target node is not local
-  - `CronJobProcess` (`sysext_cron`):
+  - `CronJobProcess` (`extensions_cron`):
     - Triggers cron jobs either on a single node or cluster-wide
   - `AddressBook`:
     - Tracks available nodes and per-node registered processes
@@ -185,8 +185,8 @@ if b, ok := book.(*system.AddressBook); ok {
   - `Launcher{ Factory, Option, RecoveryScanner }`
   - `DaemonProcess{ ProcessName gen.Atom, Args []any }`
 - Discovery & address book:
-  - Call `sysext_whereis` with `MessageLocate{Name gen.Atom}` → `gen.Atom` (node)
-  - Call `sysext_whereis` with `MessageGetAddressBook{}` → `MessageAddressBook{Book IAddressBook}`
+  - Call `extensions_whereis` with `MessageLocate{Name gen.Atom}` → `gen.Atom` (node)
+  - Call `extensions_whereis` with `MessageGetAddressBook{}` → `MessageAddressBook{Book IAddressBook}`
   - `IAddressBook` provides: `Locate`, `PickNode`, `GetAvailableNodes`, `LastModified`
 
 ## Registrar & Events
@@ -196,13 +196,13 @@ The code expects a working registrar from the Ergo network. With Zookeeper (`erg
 - Leadership changes: `EventNodeSwitchedToLeader`, `EventNodeSwitchedToFollower`
 - Membership changes: `EventNodeJoined`, `EventNodeLeft`
 
-`whereis` will broadcast on joins; `sysext_daemon` will re-plan launches on left/failover and trigger recovery when this node becomes leader.
+`whereis` will broadcast on joins; `extensions_daemon` will re-plan launches on left/failover and trigger recovery when this node becomes leader.
 
 ## Design Notes
 
 - Consistency: the `AddressBook` is eventually consistent; broadcasts retry on failures.
 - Hashing: consistent hashing ring uses `xxhash` and `buraksezer/consistent` to spread process names across nodes.
-- Scheduling: `whereis` inspects periodically (default: 3s); `sysext_daemon` schedules recovery with small delays to absorb churn.
+- Scheduling: `whereis` inspects periodically (default: 3s); `extensions_daemon` schedules recovery with small delays to absorb churn.
 - Safety: remote spawns are issued via `SendImportant` to target nodes.
 
 ## Limitations
