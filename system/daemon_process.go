@@ -1,6 +1,7 @@
 package system
 
 import (
+	"errors"
 	"fmt"
 	"runtime"
 	"strconv"
@@ -13,15 +14,17 @@ import (
 
 const DaemonMonitorProcess = gen.Atom("extensions_daemon")
 
+var ErrNoAvailableNodes = errors.New("no available nodes")
+
 type daemon struct {
 	act.Actor
-	book            *AddressBook
+	book            IAddressBook
 	registrar       gen.Registrar
 	isLeader        bool
 	cancelLaunchAll gen.CancelFunc
 }
 
-func factory_daemon(book *AddressBook) gen.ProcessFactory {
+func factory_daemon(book IAddressBook) gen.ProcessFactory {
 	return func() gen.ProcessBehavior { return &daemon{book: book} }
 }
 
@@ -138,6 +141,9 @@ func (w *daemon) recoverDaemon(launcher Launcher) error {
 		}
 		for _, proc := range processList {
 			node := w.book.PickNode(proc.ProcessName)
+			if node == "" {
+				return ErrNoAvailableNodes
+			}
 			if err = w.launchDaemonOnNode(node, launcher, proc); err != nil {
 				retErr = err
 			}

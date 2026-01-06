@@ -44,6 +44,7 @@ func (w *persist_whereis) HandleMessage(from gen.PID, message any) error {
 			w.SendAfter(w.PID(), start_init{}, w.inspect_interval)
 			return nil
 		}
+		w.inspectProcessList()
 		w.SendAfter(w.PID(), inspect_process_list{}, w.inspect_interval)
 	case inspect_process_list:
 		if err := w.inspectProcessList(); err != nil {

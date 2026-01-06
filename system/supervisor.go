@@ -10,8 +10,7 @@ import (
 const Supervisor = gen.Atom("extensions_sup")
 
 type ApplicationMemberSepcOptions struct {
-	AddressBook             *AddressBook
-	PersistAddressBook      *PersistAddressBook
+	AddressBook             IAddressBook
 	CronJobs                []CronJob
 	SyncAddressBookInterval time.Duration
 	AddressBookBuffer       int
@@ -30,7 +29,6 @@ func FactorySystemSup(opts ApplicationMemberSepcOptions) gen.ProcessFactory {
 			cron:                opts.CronJobs,
 			syncProcessInterval: opts.SyncAddressBookInterval,
 			changeBufferCap:     opts.AddressBookBuffer,
-			persistBook:         opts.PersistAddressBook,
 		}
 		if opts.AddressBook != nil {
 			sup.book = opts.AddressBook
@@ -43,8 +41,7 @@ func FactorySystemSup(opts ApplicationMemberSepcOptions) gen.ProcessFactory {
 
 type systemSup struct {
 	act.Supervisor
-	persistBook         *PersistAddressBook
-	book                *AddressBook
+	book                IAddressBook
 	cron                []CronJob
 	syncProcessInterval time.Duration
 	changeBufferCap     int
@@ -75,10 +72,10 @@ func (sup *systemSup) Init(args ...any) (act.SupervisorSpec, error) {
 
 	// add children
 	makeWhereIs := func() gen.ProcessFactory {
-		if sup.persistBook != nil {
-			return factory_persist_whereis(sup.persistBook, sup.syncProcessInterval)
+		if b, ok := book.(*PersistAddressBook); ok {
+			return factory_persist_whereis(b, sup.syncProcessInterval)
 		}
-		return factory_whereis(book, sup.syncProcessInterval, sup.changeBufferCap)
+		return factory_whereis(book.(*AddressBook), sup.syncProcessInterval, sup.changeBufferCap)
 	}
 	spec.Children = []act.SupervisorChildSpec{
 		{

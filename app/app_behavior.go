@@ -27,7 +27,7 @@ func (app *simpleApp) Load(node gen.Node, args ...any) (gen.ApplicationSpec, err
 	case *system.AddressBook:
 		opts.AddressBook = book
 	case *system.PersistAddressBook:
-		opts.PersistAddressBook = book
+		opts.AddressBook = book
 	default:
 		return gen.ApplicationSpec{}, fmt.Errorf("address book<%T> not supported", app.book)
 	}
