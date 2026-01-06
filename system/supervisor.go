@@ -51,10 +51,13 @@ type systemSup struct {
 }
 
 var system_process = map[gen.Atom]struct{}{
-	WhereIsProcess:       struct{}{},
-	DaemonMonitorProcess: struct{}{},
-	CronJobProcess:       struct{}{},
-	Supervisor:           struct{}{},
+	WhereIsProcess:       {},
+	DaemonMonitorProcess: {},
+	CronJobProcess:       {},
+	Supervisor:           {},
+	"system_inspect":     {},
+	"system_metrics":     {},
+	"system_sup":         {},
 }
 
 func isSystemProc(p gen.Atom) bool {
