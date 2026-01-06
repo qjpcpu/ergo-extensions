@@ -2,19 +2,19 @@
 
 This repository provides a small set of building blocks to add distributed process discovery and daemon orchestration to an Ergo-based cluster. It ships a supervisor that wires together:
 
-- `extensions_whereis` — a process that continuously inspects local processes, maintains an address book, and broadcasts snapshots/changes to the cluster.
+- `extensions_whereis` — a process that periodically inspects local processes, maintains an address book, and syncs snapshots/changes with the cluster.
 - `extensions_daemon` — a process that (on the elected leader) recovers and launches daemon processes across nodes using consistent hashing.
 - `extensions_cron` — a cron-like scheduler that triggers messages on a node or across the cluster.
 - `AddressBook` — a thread-safe, eventually-consistent cache of nodes and their registered processes, with node picking via consistent hashing.
 
 Optionally, `PersistAddressBook` can be enabled via `app.SimpleNodeOptions.AddressBookStorage` to persist named processes into an external storage backend.
 
-Core components live under the `system` package and are designed to integrate with `ergo.services/ergo` and a registrar (Zookeeper by default). The `app` package provides a small helper to start a node with these components wired in.
+Core components live under the `system` package and are designed to integrate with `ergo.services/ergo` and a registrar (Zookeeper via `ergo.services/registrar/zk`, or the built-in in-memory registrar used by `app.StartSimpleNode` when no registrar is provided). The `app` package provides a small helper to start a node with these components wired in.
 
 ## Features
 
 - Distributed process discovery and naming via a shared address book
-- Periodic local inspection and cluster-wide broadcast of process snapshots
+- Periodic local inspection and cluster-wide sync of process snapshots
 - Leader-driven daemon recovery and remote spawn requests
 - Node- or cluster-scoped cron jobs (`extensions_cron`) with stable placement
 - Consistent hashing (`xxhash` + `buraksezer/consistent`) for stable node selection
@@ -47,8 +47,9 @@ import "github.com/qjpcpu/ergo-extensions/system"
     - Inspects local processes periodically (default: every 3 seconds)
     - Maintains PID→Name and Name→PID maps
     - Stores a snapshot (`ProcessInfoList`) in-memory and updates the `AddressBook`
-    - Broadcasts process snapshots or deltas to other nodes
-    - Answers calls: `MessageLocate{Name}` → node, `MessageGetAddressBook{}` → `AddressBook`
+    - Syncs process snapshots or deltas with other nodes (request/reply with forwarding)
+    - If `PersistAddressBook` is enabled, persists local named processes into storage instead of keeping per-node snapshots
+    - Answers calls: `MessageLocate{Name}` → node, `MessageGetAddressBook{}` → `MessageAddressBook{Book IAddressBook}`
   - `DaemonMonitorProcess` (`extensions_daemon`):
     - Subscribes to registrar events for leader election and membership changes
     - On leader, scans registered `Launcher` recovery iterators and launches daemons to selected nodes
@@ -62,7 +63,7 @@ import "github.com/qjpcpu/ergo-extensions/system"
     - Persists local named processes into a user-provided storage backend
     - Validates entries using a per-node version/epoch (via registrar config)
 - `app.StartSimpleNode`:
-  - Starts an Ergo node and loads the `system.Supervisor` with a shared `AddressBook`
+  - Starts an Ergo node and loads the `system.Supervisor` with a shared `IAddressBook`
   - Provides helper methods for locating named processes and forwarding sends/calls
 
 ## Quick Start
@@ -196,7 +197,7 @@ The code expects a working registrar from the Ergo network. With Zookeeper (`erg
 - Leadership changes: `EventNodeSwitchedToLeader`, `EventNodeSwitchedToFollower`
 - Membership changes: `EventNodeJoined`, `EventNodeLeft`
 
-`whereis` will broadcast on joins; `extensions_daemon` will re-plan launches on left/failover and trigger recovery when this node becomes leader.
+`extensions_cron` will rebalance on joins/left; `extensions_daemon` will re-plan launches on left/failover and trigger recovery when this node becomes leader. `extensions_whereis` syncs periodically and does not depend on registrar events.
 
 ## Design Notes
 
