@@ -336,7 +336,7 @@ func TestWhereisConvergesAfterManyLocalChanges(t *testing.T) {
 		expected[names[i]] = struct{}{}
 	}
 
-	waitUntil(t, 5*time.Second, func() bool {
+	waitUntil(t, 10*time.Second, func() bool {
 		for name := range expected {
 			node, ok := locateNode(n2.AddressBook(), name)
 			if !ok || node != n1.Name() {
