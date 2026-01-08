@@ -39,11 +39,11 @@ func (w *daemon) HandleMessage(from gen.PID, message any) error {
 		if err := w.setupRegistrarMonitoring(); err != nil {
 			w.SendAfter(w.PID(), start_init{}, time.Second*1)
 		} else {
-			w.launchAllAfter(time.Second * 60)
+			w.launchAllAfter(time.Second * 10)
 		}
 	case MessageLaunchAllDaemon:
 		if err := w.leaderShouldRecoverDaemon(); err != nil {
-			w.launchAllAfter(time.Second * 60)
+			w.launchAllAfter(time.Second * 10)
 		}
 	case MessageLaunchOneDaemon:
 		val, ok := launchers.Load(e.Launcher)
@@ -70,7 +70,7 @@ func (w *daemon) HandleEvent(event gen.MessageEvent) error {
 			return nil
 		}
 	case zk.EventNodeLeft:
-		w.launchAllAfter(time.Second * 5)
+		w.launchAllAfter(time.Second * 30)
 	}
 	return nil
 }
