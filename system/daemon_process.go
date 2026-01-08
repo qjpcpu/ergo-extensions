@@ -70,7 +70,7 @@ func (w *daemon) HandleEvent(event gen.MessageEvent) error {
 			return nil
 		}
 	case zk.EventNodeLeft:
-		w.launchAllAfter(time.Second * 30)
+		w.launchAllAfter(time.Second * 10)
 	}
 	return nil
 }
