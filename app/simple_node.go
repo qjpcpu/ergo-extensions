@@ -50,13 +50,7 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 		Name:    router,
 		Factory: CreatePool(func() gen.ProcessBehavior { return &myworker{monitorPID: make(map[gen.PID]chan error), book: book} }, opts.NodeForwardWorker),
 	})
-	apps := []gen.ApplicationBehavior{&simpleApp{
-		book:                    book,
-		cron:                    opts.CronJobs,
-		MemberSpecs:             opts.MemberSpecs,
-		SyncAddressBookInterval: opts.SyncProcessInterval,
-		AddressBookBuffer:       opts.ProcessChangeBuffer,
-	}}
+	apps := []gen.ApplicationBehavior{newApp(book, opts)}
 	options.Applications = append(apps, opts.MoreApps...)
 
 	options.Log.Level = opts.LogLevel

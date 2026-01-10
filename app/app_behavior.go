@@ -1,31 +1,33 @@
 package app
 
 import (
-	"time"
-
 	"ergo.services/ergo/gen"
 	"github.com/qjpcpu/ergo-extensions/system"
 )
 
 type simpleApp struct {
-	book                    system.RWAddressBook
-	cron                    []CronJob
-	MemberSpecs             []gen.ApplicationMemberSpec
-	SyncAddressBookInterval time.Duration
-	AddressBookBuffer       int
-	err                     error
+	book system.RWAddressBook
+	opts SimpleNodeOptions
+}
+
+func newApp(book system.RWAddressBook, opts SimpleNodeOptions) *simpleApp {
+	return &simpleApp{
+		book: book,
+		opts: opts,
+	}
 }
 
 func (app *simpleApp) Load(node gen.Node, args ...any) (gen.ApplicationSpec, error) {
+	var members []gen.ApplicationMemberSpec
 	opts := system.ApplicationMemberSepcOptions{
-		CronJobs:                app.cron,
-		SyncAddressBookInterval: app.SyncAddressBookInterval,
-		AddressBookBuffer:       app.AddressBookBuffer,
+		CronJobs:                app.opts.CronJobs,
+		SyncAddressBookInterval: app.opts.SyncProcessInterval,
+		AddressBookBuffer:       app.opts.ProcessChangeBuffer,
 		AddressBook:             app.book,
 	}
-	members := append([]gen.ApplicationMemberSpec{
+	members = append([]gen.ApplicationMemberSpec{
 		system.ApplicationMemberSepc(opts)},
-		app.MemberSpecs...,
+		app.opts.MemberSpecs...,
 	)
 	return gen.ApplicationSpec{
 		Name:        "simple_app",
