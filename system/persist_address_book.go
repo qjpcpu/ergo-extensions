@@ -1,6 +1,7 @@
 package system
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,7 +40,22 @@ func NewPersistAddressBook(st IAddressBookStorage) *PersistAddressBook {
 	}
 }
 
-func (book *PersistAddressBook) SetProcess(node gen.Atom, version int, process ...gen.Atom) error {
+func (book *PersistAddressBook) SetProcess(node gen.Atom, process ...ProcessInfo) error {
+	if len(process) == 0 {
+		return nil
+	}
+	version := process[0].Version
+	var names []gen.Atom
+	for _, p := range process {
+		if version != p.Version {
+			return errors.New("bad process version")
+		}
+		names = append(names, p.Name)
+	}
+	return book.StorageSetProcess(node, version, names...)
+}
+
+func (book *PersistAddressBook) StorageSetProcess(node gen.Atom, version int, process ...gen.Atom) error {
 	if len(process) == 0 {
 		return nil
 	}
@@ -55,7 +71,22 @@ func (book *PersistAddressBook) SetProcess(node gen.Atom, version int, process .
 	return nil
 }
 
-func (book *PersistAddressBook) RemoveProcess(node gen.Atom, version int, process ...gen.Atom) error {
+func (book *PersistAddressBook) RemoveProcess(node gen.Atom, process ...ProcessInfo) error {
+	if len(process) == 0 {
+		return nil
+	}
+	version := process[0].Version
+	var names []gen.Atom
+	for _, p := range process {
+		if version != p.Version {
+			return errors.New("bad process version")
+		}
+		names = append(names, p.Name)
+	}
+	return book.StorageRemoveProcess(node, version, names...)
+}
+
+func (book *PersistAddressBook) StorageRemoveProcess(node gen.Atom, version int, process ...gen.Atom) error {
 	if len(process) == 0 {
 		return nil
 	}
@@ -100,6 +131,7 @@ func (book *PersistAddressBook) GetAvailableNodes() []gen.Atom {
 func (book *PersistAddressBook) SetAvailableNodes(nodes []gen.Atom) error {
 	book.mu.Lock()
 	defer book.mu.Unlock()
+	var isChanged bool
 	newNodes := make(map[gen.Atom]struct{})
 	for _, item := range nodes {
 		if _, ok := book.nodes[item]; !ok {
@@ -107,14 +139,18 @@ func (book *PersistAddressBook) SetAvailableNodes(nodes []gen.Atom) error {
 			book.ring.Add(Member(item))
 		}
 		newNodes[item] = struct{}{}
+		isChanged = true
 	}
 	for item := range book.nodes {
 		if _, ok := newNodes[item]; !ok {
 			book.ring.Remove(string(item))
 			delete(book.nodes, item)
+			isChanged = true
 		}
 	}
-	book.nodesCache.Store(nodes)
+	if isChanged {
+		book.nodesCache.Store(uniqNodes(nodes))
+	}
 	return nil
 }
 
@@ -122,8 +158,13 @@ func (book *PersistAddressBook) LastModified() int64 {
 	return book.lastModified.Load()
 }
 
-func (book *PersistAddressBook) SetRegistrar(r gen.Registrar) {
+func (book *PersistAddressBook) SetRegistrar(r gen.Registrar) error {
 	book.registrar = r
+	return nil
+}
+
+func (book *PersistAddressBook) SupportStorage() bool {
+	return true
 }
 
 func (book *PersistAddressBook) nodeVersion(node gen.Atom) (int, error) {
@@ -137,4 +178,13 @@ func (book *PersistAddressBook) nodeVersion(node gen.Atom) (int, error) {
 		}
 	}
 	return -1, nil
+}
+
+func (book *PersistAddressBook) GetProcessList(node gen.Atom) (list ProcessInfoList, err error) {
+	err = gen.ErrUnsupported
+	return
+}
+
+func (book *PersistAddressBook) AddProcess(node gen.Atom, ps ...ProcessInfo) error {
+	return gen.ErrUnsupported
 }

@@ -87,9 +87,10 @@ func locateNode(book system.IAddressBook, name gen.Atom) (gen.Atom, bool) {
 
 func processList(book system.IAddressBook, node gen.Atom) system.ProcessInfoList {
 	if b, ok := book.(interface {
-		GetProcessList(gen.Atom) system.ProcessInfoList
+		GetProcessList(gen.Atom) (system.ProcessInfoList, error)
 	}); ok {
-		return b.GetProcessList(node)
+		list, _ := b.GetProcessList(node)
+		return list
 	}
 	return nil
 }

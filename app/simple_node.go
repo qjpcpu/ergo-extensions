@@ -19,7 +19,7 @@ type nodeImpl struct {
 }
 
 func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
-	var book system.IAddressBook
+	var book system.RWAddressBook
 	if opts.AddressBookStorage != nil {
 		book = system.NewPersistAddressBook(opts.AddressBookStorage)
 	} else {

@@ -21,6 +21,19 @@ type IAddressBook interface {
 	LastModified() int64
 }
 
+type RWAddressBook interface {
+	IAddressBook
+	SetAvailableNodes(nodes []gen.Atom) error
+
+	GetProcessList(node gen.Atom) (ProcessInfoList, error)
+	SetProcess(node gen.Atom, ps ...ProcessInfo) error
+	AddProcess(node gen.Atom, ps ...ProcessInfo) error
+	RemoveProcess(node gen.Atom, ps ...ProcessInfo) error
+	SetRegistrar(r gen.Registrar) error
+
+	SupportStorage() bool
+}
+
 // AddressBook is a registry for all processes running on all nodes
 // in the cluster. It's used to locate processes by their registered names.
 type AddressBook struct {
@@ -61,7 +74,7 @@ func (book *AddressBook) Locate(process gen.Atom) (gen.Atom, bool) {
 }
 
 // GetProcessList returns a list of processes running on the given node.
-func (book *AddressBook) GetProcessList(node gen.Atom) (list ProcessInfoList) {
+func (book *AddressBook) GetProcessList(node gen.Atom) (list ProcessInfoList, err error) {
 	book.mu.RLock()
 	defer book.mu.RUnlock()
 	for _, p := range book.nodeProcesses[node] {
@@ -102,7 +115,7 @@ func (book *AddressBook) locate(process gen.Atom) (ProcessInfo, bool) {
 
 // SetProcess sets a list of processes for the given node.
 // It removes all previously registered processes for this node.
-func (book *AddressBook) SetProcess(node gen.Atom, ps ...ProcessInfo) {
+func (book *AddressBook) SetProcess(node gen.Atom, ps ...ProcessInfo) error {
 	book.mu.Lock()
 	defer book.mu.Unlock()
 
@@ -132,12 +145,13 @@ func (book *AddressBook) SetProcess(node gen.Atom, ps ...ProcessInfo) {
 
 	book.nodeProcesses[node] = newProcesses
 	book.lastModified.Store(time.Now().Unix())
+	return nil
 }
 
 // AddProcess adds a list of processes for the given node.
-func (book *AddressBook) AddProcess(node gen.Atom, ps ...ProcessInfo) {
+func (book *AddressBook) AddProcess(node gen.Atom, ps ...ProcessInfo) error {
 	if len(ps) == 0 {
-		return
+		return nil
 	}
 	book.mu.Lock()
 	defer book.mu.Unlock()
@@ -156,18 +170,19 @@ func (book *AddressBook) AddProcess(node gen.Atom, ps ...ProcessInfo) {
 	}
 	book.nodeProcesses[node] = processes
 	book.lastModified.Store(time.Now().Unix())
+	return nil
 }
 
 // RemoveProcess removes a list of processes from the given node.
-func (book *AddressBook) RemoveProcess(node gen.Atom, ps ...ProcessInfo) {
+func (book *AddressBook) RemoveProcess(node gen.Atom, ps ...ProcessInfo) error {
 	if len(ps) == 0 {
-		return
+		return nil
 	}
 	book.mu.Lock()
 	defer book.mu.Unlock()
 	processes, ok := book.nodeProcesses[node]
 	if !ok {
-		return
+		return nil
 	}
 	for _, process := range ps {
 		if name := process.Name; name != "" {
@@ -183,7 +198,7 @@ func (book *AddressBook) RemoveProcess(node gen.Atom, ps ...ProcessInfo) {
 			}
 		}
 	}
-
+	return nil
 }
 
 func (book *AddressBook) LastModified() int64 {
@@ -194,6 +209,7 @@ func (book *AddressBook) LastModified() int64 {
 func (book *AddressBook) SetAvailableNodes(nodes []gen.Atom) error {
 	book.mu.Lock()
 	defer book.mu.Unlock()
+	var isChanged bool
 	newNodes := make(map[gen.Atom]struct{})
 	for _, item := range nodes {
 		if _, ok := book.nodes[item]; !ok {
@@ -201,11 +217,13 @@ func (book *AddressBook) SetAvailableNodes(nodes []gen.Atom) error {
 			book.ring.Add(Member(item))
 		}
 		newNodes[item] = struct{}{}
+		isChanged = true
 	}
 	for item := range book.nodes {
 		if _, ok := newNodes[item]; !ok {
 			book.ring.Remove(string(item))
 			delete(book.nodes, item)
+			isChanged = true
 			// Clean up process indices for the node that has been removed.
 			// Scenario: when a node goes offline, actors (named processes) may migrate to other nodes.
 			// If the old node comes back, stale mappings could make Locate() return the old node,
@@ -225,7 +243,10 @@ func (book *AddressBook) SetAvailableNodes(nodes []gen.Atom) error {
 			delete(book.nodeProcesses, item)
 		}
 	}
-	book.nodesCache.Store(nodes)
+	if isChanged {
+		book.nodesCache.Store(uniqNodes(nodes))
+	}
+
 	return nil
 }
 
@@ -330,3 +351,9 @@ func shortInfo(ps []ProcessInfo) string {
 	}
 	return "(" + strings.Join(arr, ",") + ")"
 }
+
+func (book *AddressBook) SupportStorage() bool {
+	return false
+}
+
+func (book *AddressBook) SetRegistrar(r gen.Registrar) error { return gen.ErrUnsupported }

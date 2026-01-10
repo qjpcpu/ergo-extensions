@@ -16,7 +16,7 @@ const (
 
 type whereis struct {
 	act.Actor
-	book      *AddressBook
+	book      RWAddressBook
 	registrar gen.Registrar
 
 	fetchSeq    uint64
@@ -60,7 +60,7 @@ const (
 	fetchReplyKindChanged uint8 = 2
 )
 
-func factory_whereis(book *AddressBook, inspect_interval time.Duration, changeBuffer int) gen.ProcessFactory {
+func factory_whereis(book RWAddressBook, inspect_interval time.Duration, changeBuffer int) gen.ProcessFactory {
 	var v atomic.Value
 	v.Store(ProcessInfoList{})
 	if inspect_interval == 0 {
@@ -145,7 +145,10 @@ func (w *whereis) HandleCall(from gen.PID, ref gen.Ref, request any) (any, error
 
 func (w *whereis) diff(newList []ProcessInfo) error {
 	selfNode := w.Node().Name()
-	oldList := w.book.GetProcessList(selfNode)
+	oldList, err := w.book.GetProcessList(selfNode)
+	if err != nil {
+		return err
+	}
 
 	newMap := make(map[gen.Atom]ProcessInfo)
 	for _, p := range newList {
@@ -304,8 +307,10 @@ func (w *whereis) HandleInspect(from gen.PID, item ...string) map[string]string 
 		"receive_incr_proc_times":     tostr(w.receive_incr_proc_times),
 	}
 	for _, node := range nodes {
-		procs := w.book.GetProcessList(node)
-		stats[fmt.Sprintf("%s.process", string(node))] = strconv.FormatInt(int64(len(procs)), 10)
+		procs, err := w.book.GetProcessList(node)
+		if err == nil {
+			stats[fmt.Sprintf("%s.process", string(node))] = strconv.FormatInt(int64(len(procs)), 10)
+		}
 	}
 	return stats
 }
@@ -415,9 +420,13 @@ func (w *whereis) makeFetchReply(version ProcessVersion) (MessageFetchProcessRep
 			return MessageFetchProcessReply{}, false
 		}
 	}
+	list, err := w.book.GetProcessList(w.Node().Name())
+	if err != nil {
+		return MessageFetchProcessReply{}, false
+	}
 	return MessageFetchProcessReply{Kind: fetchReplyKindFull, Full: MessageProcesses{
 		Node:        w.Node().Name(),
-		ProcessList: w.book.GetProcessList(w.Node().Name()),
+		ProcessList: list,
 		Version:     w.selfVersion,
 	}}, true
 }

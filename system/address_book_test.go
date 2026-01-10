@@ -37,7 +37,10 @@ func TestAddressBook_Basic(t *testing.T) {
 	}
 
 	// Test GetProcessList
-	list1 := book.GetProcessList(node1)
+	list1, err := book.GetProcessList(node1)
+	if err != nil {
+		t.Fatalf("GetProcessList node1 failed: %v", err)
+	}
 	if len(list1) != 1 || list1[0].Name != "p1" {
 		t.Errorf("GetProcessList node1 failed: got %v", list1)
 	}
@@ -129,7 +132,7 @@ func TestAddressBook_EdgeCases(t *testing.T) {
 
 	// AddProcess with empty list
 	book.AddProcess(node1)
-	if len(book.GetProcessList(node1)) != 0 {
+	if list, err := book.GetProcessList(node1); err != nil || len(list) != 0 {
 		t.Error("AddProcess empty should do nothing")
 	}
 
@@ -138,7 +141,7 @@ func TestAddressBook_EdgeCases(t *testing.T) {
 
 	// AddProcess with invalid name (empty)
 	book.AddProcess(node1, ProcessInfo{Name: "", PID: gen.PID{Node: node1, ID: 2}})
-	if len(book.GetProcessList(node1)) != 0 {
+	if list, err := book.GetProcessList(node1); err != nil || len(list) != 0 {
 		t.Error("AddProcess with empty name should be ignored")
 	}
 
@@ -171,7 +174,8 @@ func TestAddressBook_EdgeCases(t *testing.T) {
 	}
 	book.RemoveProcess(node1, ProcessInfo{Name: "p2", PID: gen.PID{Node: node1, ID: 2}})
 	if _, ok := book.Locate("p1"); !ok {
-		t.Errorf("RemoveProcess p2 should not affect p1. ProcessList: %v", book.GetProcessList(node1))
+		list, _ := book.GetProcessList(node1)
+		t.Errorf("RemoveProcess p2 should not affect p1. ProcessList: %v", list)
 	}
 
 	// RemoveProcess with correct name but wrong node
@@ -199,7 +203,8 @@ func TestAddressBook_SetProcess_Update(t *testing.T) {
 
 	// Initial set
 	book.SetProcess(node1, p1)
-	if got := findPID(book.GetProcessList(node1), gen.Atom("p1")); got.ID != 1 {
+	list, _ := book.GetProcessList(node1)
+	if got := findPID(list, gen.Atom("p1")); got.ID != 1 {
 		t.Error("p1 ID mismatch")
 	}
 
@@ -207,7 +212,8 @@ func TestAddressBook_SetProcess_Update(t *testing.T) {
 	// If we use same name "p1" but different PID
 	p1New := ProcessInfo{Name: "p1", PID: gen.PID{Node: node1, ID: 3}}
 	book.SetProcess(node1, p1New)
-	if got := findPID(book.GetProcessList(node1), gen.Atom("p1")); got.ID != 3 {
+	list, _ = book.GetProcessList(node1)
+	if got := findPID(list, gen.Atom("p1")); got.ID != 3 {
 		t.Error("p1 ID should be updated")
 	}
 
@@ -576,7 +582,7 @@ func TestPersistAddressBook_EpochInvalidatesStaleEntries(t *testing.T) {
 	book.SetRegistrar(reg)
 
 	_ = book.SetAvailableNodes([]gen.Atom{node})
-	if err := book.SetProcess(node, 1, proc); err != nil {
+	if err := book.SetProcess(node, ProcessInfo{Name: proc, Version: 1}); err != nil {
 		t.Fatalf("SetProcess: %v", err)
 	}
 	if got, ok := book.Locate(proc); !ok || got != node {
@@ -588,7 +594,7 @@ func TestPersistAddressBook_EpochInvalidatesStaleEntries(t *testing.T) {
 		t.Fatalf("Locate should fail after node epoch changes")
 	}
 
-	if err := book.SetProcess(node, 2, proc); err != nil {
+	if err := book.SetProcess(node, ProcessInfo{Name: proc, Version: 2}); err != nil {
 		t.Fatalf("SetProcess: %v", err)
 	}
 	if got, ok := book.Locate(proc); !ok || got != node {

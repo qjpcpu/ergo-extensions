@@ -9,7 +9,7 @@ import (
 
 type persist_whereis struct {
 	act.Actor
-	book      *PersistAddressBook
+	book      RWAddressBook
 	registrar gen.Registrar
 
 	pid_to_name map[gen.PID]gen.Atom
@@ -18,7 +18,7 @@ type persist_whereis struct {
 	inspect_interval time.Duration
 }
 
-func factory_persist_whereis(book *PersistAddressBook, inspect_interval time.Duration) gen.ProcessFactory {
+func factory_persist_whereis(book RWAddressBook, inspect_interval time.Duration) gen.ProcessFactory {
 	if inspect_interval == 0 {
 		inspect_interval = time.Second * 3
 	}
@@ -127,7 +127,7 @@ func (w *persist_whereis) collectProcessList() error {
 	for _, pid := range del {
 		name := w.pid_to_name[pid]
 		if name != "" {
-			if err := w.book.RemoveProcess(node.Name(), version, name); err != nil {
+			if err := w.book.RemoveProcess(node.Name(), w.makeProcessInfo(version, name)...); err != nil {
 				return err
 			}
 		}
@@ -145,7 +145,7 @@ func (w *persist_whereis) collectProcessList() error {
 			return err
 		} else {
 			if info.Name != "" {
-				if err := w.book.SetProcess(node.Name(), version, info.Name); err != nil {
+				if err := w.book.SetProcess(node.Name(), w.makeProcessInfo(version, info.Name)...); err != nil {
 					return err
 				}
 			}
@@ -202,7 +202,7 @@ func (w *persist_whereis) flushProcess(pid gen.PID) error {
 		if err != nil {
 			return err
 		}
-		if err := w.book.SetProcess(w.Node().Name(), version, info.Name); err != nil {
+		if err := w.book.SetProcess(w.Node().Name(), w.makeProcessInfo(version, info.Name)...); err != nil {
 			return err
 		}
 	}
@@ -210,5 +210,22 @@ func (w *persist_whereis) flushProcess(pid gen.PID) error {
 }
 
 func (w *persist_whereis) getNodeVersion(node gen.Atom) (int, error) {
-	return w.book.nodeVersion(node)
+	if r := w.registrar; r != nil {
+		val, err := r.ConfigItem(string(node))
+		if err != nil {
+			return -1, err
+		}
+		if ver, ok := val.(int); ok {
+			return ver, nil
+		}
+	}
+	return -1, nil
+}
+
+func (w *persist_whereis) makeProcessInfo(version int, names ...gen.Atom) []ProcessInfo {
+	list := make([]ProcessInfo, len(names))
+	for i, name := range names {
+		list[i] = ProcessInfo{Name: name, Version: version}
+	}
+	return list
 }
