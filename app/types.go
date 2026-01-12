@@ -43,5 +43,5 @@ type SimpleNodeOptions struct {
 	SyncProcessInterval   time.Duration               // Whereis sync interval for pulling remote changes.
 	ProcessChangeBuffer   int                         // Whereis change buffer size for compacting deltas.
 	Registrar             gen.Registrar               // Custom registrar implementation (used if Endpoints is empty).
-	AddressBookStorage    IAddressBookStorage         // Optional persistent backend for PersistAddressBook.
+	AddressBookStorage    IAddressBookStorage         // Optional persistent backend for AddressBook.
 }

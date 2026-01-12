@@ -19,12 +19,7 @@ type nodeImpl struct {
 }
 
 func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
-	var book system.RWAddressBook
-	if opts.AddressBookStorage != nil {
-		book = system.NewPersistAddressBook(opts.AddressBookStorage)
-	} else {
-		book = system.NewAddressBook()
-	}
+	book := system.NewAddressBook(opts.AddressBookStorage)
 	var options gen.NodeOptions
 	if len(opts.Options.Endpoints) != 0 {
 		registrar, err := zk.Create(opts.Options)

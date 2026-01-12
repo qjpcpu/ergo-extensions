@@ -6,11 +6,11 @@ import (
 )
 
 type simpleApp struct {
-	book system.RWAddressBook
+	book *system.AddressBook
 	opts SimpleNodeOptions
 }
 
-func newApp(book system.RWAddressBook, opts SimpleNodeOptions) *simpleApp {
+func newApp(book *system.AddressBook, opts SimpleNodeOptions) *simpleApp {
 	return &simpleApp{
 		book: book,
 		opts: opts,

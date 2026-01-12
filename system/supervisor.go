@@ -10,7 +10,7 @@ import (
 const Supervisor = gen.Atom("extensions_sup")
 
 type ApplicationMemberSepcOptions struct {
-	AddressBook             RWAddressBook
+	AddressBook             *AddressBook
 	CronJobs                []CronJob
 	SyncAddressBookInterval time.Duration
 	AddressBookBuffer       int
@@ -33,7 +33,7 @@ func FactorySystemSup(opts ApplicationMemberSepcOptions) gen.ProcessFactory {
 		if opts.AddressBook != nil {
 			sup.book = opts.AddressBook
 		} else {
-			sup.book = NewAddressBook()
+			sup.book = NewAddressBook(nil)
 		}
 		return sup
 	}
@@ -41,7 +41,7 @@ func FactorySystemSup(opts ApplicationMemberSepcOptions) gen.ProcessFactory {
 
 type systemSup struct {
 	act.Supervisor
-	book                RWAddressBook
+	book                *AddressBook
 	cron                []CronJob
 	syncProcessInterval time.Duration
 	changeBufferCap     int
@@ -71,16 +71,10 @@ func (sup *systemSup) Init(args ...any) (act.SupervisorSpec, error) {
 	book := sup.book
 
 	// add children
-	makeWhereIs := func() gen.ProcessFactory {
-		if book.SupportStorage() {
-			return factory_persist_whereis(book, sup.syncProcessInterval)
-		}
-		return factory_whereis(book, sup.syncProcessInterval, sup.changeBufferCap)
-	}
 	spec.Children = []act.SupervisorChildSpec{
 		{
 			Name:    WhereIsProcess,
-			Factory: makeWhereIs(),
+			Factory: factory_whereis(book, sup.syncProcessInterval, sup.changeBufferCap),
 		},
 		{
 			Name:    DaemonMonitorProcess,

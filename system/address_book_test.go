@@ -12,7 +12,7 @@ import (
 )
 
 func TestAddressBook_Basic(t *testing.T) {
-	book := NewAddressBook()
+	book := NewAddressBook(nil)
 	node1 := gen.Atom("node1")
 	node2 := gen.Atom("node2")
 
@@ -59,7 +59,7 @@ func TestAddressBook_Basic(t *testing.T) {
 }
 
 func TestAddressBook_NodeAvailability(t *testing.T) {
-	book := NewAddressBook()
+	book := NewAddressBook(nil)
 	node1 := gen.Atom("node1")
 	p1 := ProcessInfo{Name: "p1", PID: gen.PID{Node: node1, ID: 1}}
 
@@ -94,7 +94,7 @@ func TestAddressBook_NodeAvailability(t *testing.T) {
 }
 
 func TestAddressBook_ConsistentHashing(t *testing.T) {
-	book := NewAddressBook()
+	book := NewAddressBook(nil)
 
 	// Test PickNode with empty nodes
 	if n := book.PickNode("any"); n != "" {
@@ -126,7 +126,7 @@ func TestAddressBook_ConsistentHashing(t *testing.T) {
 }
 
 func TestAddressBook_EdgeCases(t *testing.T) {
-	book := NewAddressBook()
+	book := NewAddressBook(nil)
 	node1 := gen.Atom("node1")
 	p1 := ProcessInfo{Name: "p1", PID: gen.PID{Node: node1, ID: 1}}
 
@@ -194,7 +194,7 @@ func TestAddressBook_EdgeCases(t *testing.T) {
 }
 
 func TestAddressBook_SetProcess_Update(t *testing.T) {
-	book := NewAddressBook()
+	book := NewAddressBook(nil)
 	node1 := gen.Atom("node1")
 	p1 := ProcessInfo{Name: "p1", PID: gen.PID{Node: node1, ID: 1}}
 	p2 := ProcessInfo{Name: "p2", PID: gen.PID{Node: node1, ID: 2}}
@@ -228,7 +228,7 @@ func TestAddressBook_SetProcess_Update(t *testing.T) {
 }
 
 func TestAddressBook_Coverage_Boost(t *testing.T) {
-	book := NewAddressBook()
+	book := NewAddressBook(nil)
 	node1 := gen.Atom("node1")
 	node2 := gen.Atom("node2")
 	book.SetAvailableNodes([]gen.Atom{node1, node2})
@@ -288,7 +288,7 @@ func TestAddressBook_Helpers(t *testing.T) {
 
 func TestAddressBook_Internal_Locate(t *testing.T) {
 	// Test the loop in locate where node is not found or process not in node
-	book := NewAddressBook()
+	book := NewAddressBook(nil)
 	node1 := gen.Atom("node1")
 	node2 := gen.Atom("node2")
 	p1 := gen.Atom("p1")
@@ -341,7 +341,7 @@ func findPID(list ProcessInfoList, name gen.Atom) gen.PID {
 }
 
 func TestAddressBook_SetAvailableNodes_MultiNode(t *testing.T) {
-	book := NewAddressBook()
+	book := NewAddressBook(nil)
 	node1 := gen.Atom("node1")
 	node2 := gen.Atom("node2")
 	p1 := gen.Atom("p1")
@@ -375,7 +375,7 @@ func TestAddressBook_SetAvailableNodes_MultiNode(t *testing.T) {
 }
 
 func TestAddressBook_RemoveProcess_InconsistentState(t *testing.T) {
-	book := NewAddressBook()
+	book := NewAddressBook(nil)
 	node1 := gen.Atom("node1")
 	p1 := gen.Atom("p1")
 
@@ -405,7 +405,7 @@ func TestAddressBook_RemoveProcess_InconsistentState(t *testing.T) {
 }
 
 func TestAddressBook_RemoveProcess_MultiNode(t *testing.T) {
-	book := NewAddressBook()
+	book := NewAddressBook(nil)
 	node1 := gen.Atom("node1")
 	node2 := gen.Atom("node2")
 	p1 := gen.Atom("p1")
@@ -439,7 +439,7 @@ func TestAddressBook_RemoveProcess_MultiNode(t *testing.T) {
 }
 
 func TestAddressBook_Concurrency(t *testing.T) {
-	book := NewAddressBook()
+	book := NewAddressBook(nil)
 	node1 := gen.Atom("node1")
 	node2 := gen.Atom("node2")
 	book.SetAvailableNodes([]gen.Atom{node1, node2})
@@ -571,7 +571,7 @@ func TestPersistAddressBook_EpochInvalidatesStaleEntries(t *testing.T) {
 		node gen.Atom
 		ver  int
 	})}
-	book := NewPersistAddressBook(st)
+	book := NewAddressBook(st)
 
 	node := gen.Atom("node1")
 	proc := gen.Atom("p1")
@@ -580,6 +580,7 @@ func TestPersistAddressBook_EpochInvalidatesStaleEntries(t *testing.T) {
 		versions:  map[string]int{string(node): 1},
 	}
 	book.SetRegistrar(reg)
+	_ = book.SetSelfNode(node)
 
 	_ = book.SetAvailableNodes([]gen.Atom{node})
 	if err := book.SetProcess(node, ProcessInfo{Name: proc, Version: 1}); err != nil {

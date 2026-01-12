@@ -16,7 +16,7 @@ const (
 
 type whereis struct {
 	act.Actor
-	book      RWAddressBook
+	book      *AddressBook
 	registrar gen.Registrar
 
 	fetchSeq    uint64
@@ -60,7 +60,7 @@ const (
 	fetchReplyKindChanged uint8 = 2
 )
 
-func factory_whereis(book RWAddressBook, inspect_interval time.Duration, changeBuffer int) gen.ProcessFactory {
+func factory_whereis(book *AddressBook, inspect_interval time.Duration, changeBuffer int) gen.ProcessFactory {
 	var v atomic.Value
 	v.Store(ProcessInfoList{})
 	if inspect_interval == 0 {
@@ -85,15 +85,23 @@ func factory_whereis(book RWAddressBook, inspect_interval time.Duration, changeB
 }
 
 func (w *whereis) Init(args ...any) error {
-	w.SendAfter(w.PID(), inspect_process_list{}, w.inspect_interval)
+	w.SendAfter(w.PID(), start_init{}, time.Second)
 	return nil
 }
 
 func (w *whereis) HandleMessage(from gen.PID, message any) error {
 	switch e := message.(type) {
+	case start_init:
+		if err := w.setup(); err != nil {
+			w.SendAfter(w.PID(), start_init{}, time.Second)
+			return nil
+		}
+		w.SendAfter(w.PID(), inspect_process_list{}, w.inspect_interval)
 	case inspect_process_list:
 		w.inspectProcessList()
 		w.SendAfter(w.PID(), inspect_process_list{}, w.inspect_interval)
+	case MessageFlushProcess:
+		w.flushProcess(e.PID)
 	case MessageFetchProcessList:
 		self := w.Node().Name()
 		if e.Node == "" || e.Node == self || e.VersionSet.Size() == 0 {
@@ -234,6 +242,10 @@ func (w *whereis) collectProcessList() error {
 	}
 
 	node := w.Node()
+	nodeVersion, err := w.getNodeVersion(node.Name())
+	if err != nil {
+		return err
+	}
 	// Remove deleted processes from the lookup maps.
 	for _, pid := range del {
 		name := w.pid_to_name[pid]
@@ -267,6 +279,7 @@ func (w *whereis) collectProcessList() error {
 			PID:     pid,
 			Node:    node.Name(),
 			BirthAt: w.name_to_birth_at[name],
+			Version: nodeVersion,
 		})
 	}
 
@@ -275,15 +288,21 @@ func (w *whereis) collectProcessList() error {
 	return nil
 }
 
-func (w *whereis) fetchAvailableBookNodes() ([]gen.Atom, error) {
+func (w *whereis) setup() error {
 	if w.registrar == nil {
 		registrar, err := w.Node().Network().Registrar()
 		if err != nil {
-			return nil, err
+			return err
 		} else {
 			w.registrar = registrar
 		}
+		w.book.SetRegistrar(registrar)
+		w.book.SetSelfNode(w.Node().Name())
 	}
+	return nil
+}
+
+func (w *whereis) fetchAvailableBookNodes() ([]gen.Atom, error) {
 	nodes, err := w.registrar.Nodes()
 	if err != nil {
 		return nil, err
@@ -554,4 +573,35 @@ func (w *whereis) compactProcessChangeRing(start, end int) (MessageProcessChange
 		DownProcess: toList(del),
 		Version:     w.procChangeBuffer[lastIdx].Version,
 	}, true
+}
+
+func (w *whereis) getNodeVersion(node gen.Atom) (int, error) {
+	if r := w.registrar; r != nil {
+		val, err := r.ConfigItem(string(node))
+		if err != nil {
+			return -1, err
+		}
+		if ver, ok := val.(int); ok {
+			return ver, nil
+		}
+	}
+	return -1, nil
+}
+
+func (w *whereis) flushProcess(pid gen.PID) error {
+	if w.registrar == nil {
+		return nil
+	}
+	info, err := w.Node().ProcessInfo(pid)
+	if err != nil {
+		return err
+	}
+	if info.Name == "" {
+		return nil
+	}
+	version, err := w.getNodeVersion(w.Node().Name())
+	if err != nil {
+		return err
+	}
+	return w.book.Storage().Set(w.Node().Name(), info.Name, version)
 }

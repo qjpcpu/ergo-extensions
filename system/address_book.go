@@ -21,19 +21,6 @@ type IAddressBook interface {
 	LastModified() int64
 }
 
-type RWAddressBook interface {
-	IAddressBook
-	SetAvailableNodes(nodes []gen.Atom) error
-
-	GetProcessList(node gen.Atom) (ProcessInfoList, error)
-	SetProcess(node gen.Atom, ps ...ProcessInfo) error
-	AddProcess(node gen.Atom, ps ...ProcessInfo) error
-	RemoveProcess(node gen.Atom, ps ...ProcessInfo) error
-	SetRegistrar(r gen.Registrar) error
-
-	SupportStorage() bool
-}
-
 // AddressBook is a registry for all processes running on all nodes
 // in the cluster. It's used to locate processes by their registered names.
 type AddressBook struct {
@@ -43,15 +30,22 @@ type AddressBook struct {
 	processToNodes map[gen.Atom][]gen.Atom
 	nodeProcesses  map[gen.Atom]map[gen.Atom]ProcessInfo
 	ring           *consistent.Consistent // consistent hashing ring
+	registrar      gen.Registrar
 	lastModified   *atomic.Int64
+	st             IAddressBookStorage
+	self           gen.Atom
 }
 
 // NewAddressBook creates a new AddressBook
-func NewAddressBook() *AddressBook {
+func NewAddressBook(storage IAddressBookStorage) *AddressBook {
 	var c atomic.Value
 	c.Store([]gen.Atom{})
 	var lm atomic.Int64
 	lm.Store(time.Now().Unix())
+	if storage == nil {
+		storage = dummyStorage{}
+	}
+	storage = OmitSystemProcess(storage)
 	return &AddressBook{
 		nodes:          make(map[gen.Atom]struct{}),
 		processToNodes: make(map[gen.Atom][]gen.Atom),
@@ -59,18 +53,17 @@ func NewAddressBook() *AddressBook {
 		ring:           makeRing(),
 		nodesCache:     c,
 		lastModified:   &lm,
+		st:             storage,
 	}
 }
 
 // Locate returns a process information by its registered name.
 func (book *AddressBook) Locate(process gen.Atom) (gen.Atom, bool) {
-	book.mu.RLock()
-	defer book.mu.RUnlock()
-	v, ok := book.locate(process)
+	v, ok := book.locateFromMem(process)
 	if ok {
-		return v.Node, true
+		return v, true
 	}
-	return "", false
+	return book.locateFromStorage(process)
 }
 
 // GetProcessList returns a list of processes running on the given node.
@@ -81,6 +74,16 @@ func (book *AddressBook) GetProcessList(node gen.Atom) (list ProcessInfoList, er
 		list = append(list, p)
 	}
 	return
+}
+
+func (book *AddressBook) locateFromMem(process gen.Atom) (gen.Atom, bool) {
+	book.mu.RLock()
+	defer book.mu.RUnlock()
+	v, ok := book.locate(process)
+	if ok {
+		return v.Node, true
+	}
+	return "", false
 }
 
 // locate is an internal method to find a process by its registered name.
@@ -113,6 +116,19 @@ func (book *AddressBook) locate(process gen.Atom) (ProcessInfo, bool) {
 	return olderp, olderp.Node != ""
 }
 
+func (book *AddressBook) locateFromStorage(process gen.Atom) (gen.Atom, bool) {
+	node, ver, err := book.st.Get(process)
+	if err != nil || node == "" {
+		return "", false
+	}
+	if val, err := book.nodeVersion(node); err != nil {
+		return "", false
+	} else if val == ver {
+		return node, true
+	}
+	return "", false
+}
+
 // SetProcess sets a list of processes for the given node.
 // It removes all previously registered processes for this node.
 func (book *AddressBook) SetProcess(node gen.Atom, ps ...ProcessInfo) error {
@@ -128,6 +144,9 @@ func (book *AddressBook) SetProcess(node gen.Atom, ps ...ProcessInfo) error {
 			process.Node = node
 			newProcesses[name] = process
 			book.processToNodes[name] = unifyNodes(append(book.processToNodes[name], node))
+			if node == book.self {
+				book.st.Set(node, name, process.Version)
+			}
 		}
 	}
 
@@ -139,6 +158,9 @@ func (book *AddressBook) SetProcess(node gen.Atom, ps ...ProcessInfo) error {
 				delete(book.processToNodes, name)
 			} else {
 				book.processToNodes[name] = arr
+			}
+			if node == book.self {
+				book.st.Remove(node, name, oldProcesses[name].Version)
 			}
 		}
 	}
@@ -166,6 +188,9 @@ func (book *AddressBook) AddProcess(node gen.Atom, ps ...ProcessInfo) error {
 			process.Node = node
 			processes[name] = process
 			book.processToNodes[name] = unifyNodes(append(book.processToNodes[name], node))
+			if node == book.self {
+				book.st.Set(node, name, process.Version)
+			}
 		}
 	}
 	book.nodeProcesses[node] = processes
@@ -194,6 +219,9 @@ func (book *AddressBook) RemoveProcess(node gen.Atom, ps ...ProcessInfo) error {
 					book.processToNodes[name] = arr
 				}
 				delete(processes, name)
+				if node == book.self {
+					book.st.Remove(node, name, old.Version)
+				}
 				book.lastModified.Store(time.Now().Unix())
 			}
 		}
@@ -352,8 +380,29 @@ func shortInfo(ps []ProcessInfo) string {
 	return "(" + strings.Join(arr, ",") + ")"
 }
 
-func (book *AddressBook) SupportStorage() bool {
-	return false
+func (book *AddressBook) SetRegistrar(r gen.Registrar) error {
+	book.registrar = r
+	return nil
 }
 
-func (book *AddressBook) SetRegistrar(r gen.Registrar) error { return gen.ErrUnsupported }
+func (book *AddressBook) SetSelfNode(n gen.Atom) error {
+	book.self = n
+	return nil
+}
+
+func (book *AddressBook) Storage() IAddressBookStorage {
+	return book.st
+}
+
+func (book *AddressBook) nodeVersion(node gen.Atom) (int, error) {
+	if r := book.registrar; r != nil {
+		val, err := r.ConfigItem(string(node))
+		if err != nil {
+			return -1, err
+		}
+		if ver, ok := val.(int); ok {
+			return ver, nil
+		}
+	}
+	return -1, nil
+}
