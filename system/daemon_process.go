@@ -61,7 +61,7 @@ func (w *daemon) HandleEvent(event gen.MessageEvent) error {
 	case zk.EventNodeSwitchedToLeader:
 		if e.Name == w.Node().Name() {
 			w.isLeader = true
-			w.launchAllAfter(time.Second * 1)
+			w.launchAllAfter(time.Second * 10)
 			return nil
 		}
 	case zk.EventNodeSwitchedToFollower:

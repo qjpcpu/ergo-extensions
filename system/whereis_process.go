@@ -8,6 +8,7 @@ import (
 
 	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
+	"ergo.services/registrar/zk"
 )
 
 const (
@@ -298,6 +299,13 @@ func (w *whereis) setup() error {
 		}
 		w.book.SetRegistrar(registrar)
 		w.book.SetSelfNode(w.Node().Name())
+		event, err := registrar.Event()
+		if err != nil {
+			return err
+		}
+		if _, err := w.MonitorEvent(event); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -608,4 +616,12 @@ func (w *whereis) flushProcess(pid gen.PID) error {
 
 func (w *whereis) Terminate(reason error) {
 	w.book.RemoveProcess(w.Node().Name(), w.processCache.Load().(ProcessInfoList)...)
+}
+
+func (w *whereis) HandleEvent(event gen.MessageEvent) error {
+	switch event.Message.(type) {
+	case zk.EventNodeSwitchedToFollower, zk.EventNodeLeft:
+		w.fetchAvailableBookNodes()
+	}
+	return nil
 }
