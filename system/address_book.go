@@ -17,7 +17,7 @@ import (
 type IAddressBook interface {
 	Locate(process gen.Atom) (gen.Atom, bool)
 	PickNode(process gen.Atom) gen.Atom
-	GetAvailableNodes() []gen.Atom
+	GetAvailableNodes() *NodeList
 	LastModified() int64
 }
 
@@ -39,7 +39,7 @@ type AddressBook struct {
 // NewAddressBook creates a new AddressBook
 func NewAddressBook(storage IAddressBookStorage) *AddressBook {
 	var c atomic.Value
-	c.Store([]gen.Atom{})
+	c.Store(NewNodeList())
 	var lm atomic.Int64
 	lm.Store(time.Now().Unix())
 	if storage == nil {
@@ -234,21 +234,20 @@ func (book *AddressBook) LastModified() int64 {
 }
 
 // SetAvailableNodes sets a list of available nodes.
-func (book *AddressBook) SetAvailableNodes(nodes []gen.Atom) error {
+func (book *AddressBook) SetAvailableNodes(nodes *NodeList) error {
 	book.mu.Lock()
 	defer book.mu.Unlock()
 	var isChanged bool
-	newNodes := make(map[gen.Atom]struct{})
-	for _, item := range nodes {
+	nodes.Range(func(item gen.Atom) bool {
 		if _, ok := book.nodes[item]; !ok {
 			book.nodes[item] = struct{}{}
 			book.ring.Add(Member(item))
 		}
-		newNodes[item] = struct{}{}
 		isChanged = true
-	}
+		return true
+	})
 	for item := range book.nodes {
-		if _, ok := newNodes[item]; !ok {
+		if !nodes.Exist(item) {
 			book.ring.Remove(string(item))
 			delete(book.nodes, item)
 			isChanged = true
@@ -272,15 +271,15 @@ func (book *AddressBook) SetAvailableNodes(nodes []gen.Atom) error {
 		}
 	}
 	if isChanged {
-		book.nodesCache.Store(uniqNodes(nodes))
+		book.nodesCache.Store(nodes)
 	}
 
 	return nil
 }
 
 // GetAvailableNodes returns a list of available nodes.
-func (book *AddressBook) GetAvailableNodes() []gen.Atom {
-	return book.nodesCache.Load().([]gen.Atom)
+func (book *AddressBook) GetAvailableNodes() *NodeList {
+	return book.nodesCache.Load().(*NodeList)
 }
 
 // PickNode returns a node name by the given process name using consistent hashing.

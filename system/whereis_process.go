@@ -310,14 +310,14 @@ func (w *whereis) setup() error {
 	return nil
 }
 
-func (w *whereis) fetchAvailableBookNodes() ([]gen.Atom, error) {
+func (w *whereis) fetchAvailableBookNodes() (*NodeList, error) {
 	nodes, err := w.registrar.Nodes()
 	if err != nil {
 		return nil, err
 	}
-	nodes = uniqNodes(append(nodes, w.Node().Name()))
-	w.book.SetAvailableNodes(nodes)
-	return nodes, nil
+	nodeList := NewNodeList(sortNodes(uniqNodes(append(nodes, w.Node().Name())))...)
+	w.book.SetAvailableNodes(nodeList)
+	return nodeList, nil
 }
 
 func (w *whereis) HandleInspect(from gen.PID, item ...string) map[string]string {
@@ -326,19 +326,20 @@ func (w *whereis) HandleInspect(from gen.PID, item ...string) map[string]string 
 	}
 	nodes := w.book.GetAvailableNodes()
 	stats := map[string]string{
-		"nodes":                       strconv.FormatInt(int64(len(nodes)), 10),
+		"nodes":                       strconv.FormatInt(int64(nodes.Len()), 10),
 		"inspect_self_times":          tostr(w.inspect_self_times),
 		"send_fetch_proc_times":       tostr(w.send_fetch_proc_times),
 		"respond_fetch_proc_times":    tostr(w.respond_fetch_proc_times),
 		"receive_proc_snapshot_times": tostr(w.receive_proc_snapshot_times),
 		"receive_incr_proc_times":     tostr(w.receive_incr_proc_times),
 	}
-	for _, node := range nodes {
+	nodes.Range(func(node gen.Atom) bool {
 		procs, err := w.book.GetProcessList(node)
 		if err == nil {
 			stats[fmt.Sprintf("%s.process", string(node))] = strconv.FormatInt(int64(len(procs)), 10)
 		}
-	}
+		return true
+	})
 	return stats
 }
 
@@ -361,10 +362,9 @@ func (w *whereis) appendBuffer(msg MessageProcessChanged) {
 	w.procChangeStart = (w.procChangeStart + 1) % w.changeBufferCap
 }
 
-func (w *whereis) fetchOtherNodeProcess(nodes []gen.Atom) error {
-	nodes = sortNodes(nodes)
+func (w *whereis) fetchOtherNodeProcess(nodes *NodeList) error {
 	setSize := 64
-	if nsize := len(nodes); nsize <= 64 {
+	if nsize := nodes.Len(); nsize <= 64 {
 		setSize = 8
 	} else if nsize <= 256 {
 		setSize = 16
@@ -376,7 +376,7 @@ func (w *whereis) fetchOtherNodeProcess(nodes []gen.Atom) error {
 	nodeSet := make(map[gen.Atom]ProcessVersion)
 	var set VersionSet
 	selfGroupId := -1
-	for _, node := range nodes {
+	nodes.Range(func(node gen.Atom) bool {
 		if len(set) > setSize {
 			sets = append(sets, set)
 			set = nil
@@ -391,7 +391,8 @@ func (w *whereis) fetchOtherNodeProcess(nodes []gen.Atom) error {
 			nodeSet[node] = NewEmptyVersion()
 			set = append(set, NodeProcessVersion{Node: node, Version: NewEmptyVersion()})
 		}
-	}
+		return true
+	})
 	if len(set) > 0 {
 		sets = append(sets, set)
 	}

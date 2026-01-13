@@ -16,7 +16,7 @@ func TestAddressBook_Basic(t *testing.T) {
 	node1 := gen.Atom("node1")
 	node2 := gen.Atom("node2")
 
-	book.SetAvailableNodes([]gen.Atom{node1, node2})
+	book.SetAvailableNodes(NewNodeList(node1, node2))
 
 	p1 := ProcessInfo{Name: "p1", PID: gen.PID{Node: node1, ID: 1}}
 	p2 := ProcessInfo{Name: "p2", PID: gen.PID{Node: node2, ID: 2}}
@@ -63,25 +63,27 @@ func TestAddressBook_NodeAvailability(t *testing.T) {
 	node1 := gen.Atom("node1")
 	p1 := ProcessInfo{Name: "p1", PID: gen.PID{Node: node1, ID: 1}}
 
-	book.SetAvailableNodes([]gen.Atom{node1})
+	book.SetAvailableNodes(NewNodeList(node1))
 	book.SetProcess(node1, p1)
 
 	if _, ok := book.Locate("p1"); !ok {
 		t.Fatal("Locate p1 failed")
 	}
-	if nodes := book.GetAvailableNodes(); len(nodes) != 1 || nodes[0] != node1 {
-		t.Errorf("GetAvailableNodes mismatch: got %v", nodes)
+	if nodes := book.GetAvailableNodes(); nodes.Len() != 1 {
+		t.Errorf("GetAvailableNodes mismatch: got %v", nodes.GetAll())
+	} else if n, ok := nodes.Get(0); !ok || n != node1 {
+		t.Errorf("GetAvailableNodes mismatch: got %v", nodes.GetAll())
 	}
 
 	// Node goes offline
-	book.SetAvailableNodes([]gen.Atom{})
+	book.SetAvailableNodes(NewNodeList())
 
 	if _, ok := book.Locate("p1"); ok {
 		t.Error("Locate p1 should fail when node is offline")
 	}
 
 	// Node comes back
-	book.SetAvailableNodes([]gen.Atom{node1})
+	book.SetAvailableNodes(NewNodeList(node1))
 	// Note: SetAvailableNodes clears processes for removed nodes, so p1 is gone unless re-added.
 	if _, ok := book.Locate("p1"); ok {
 		t.Error("Locate p1 should still fail (cleared) until re-added")
@@ -102,7 +104,7 @@ func TestAddressBook_ConsistentHashing(t *testing.T) {
 	}
 
 	nodes := []gen.Atom{"node1", "node2", "node3"}
-	book.SetAvailableNodes(nodes)
+	book.SetAvailableNodes(NewNodeList(nodes...))
 
 	// Test PickNode consistency
 	target := "my-process"
@@ -122,7 +124,7 @@ func TestAddressBook_ConsistentHashing(t *testing.T) {
 	}
 
 	// Add a node
-	book.SetAvailableNodes(append(nodes, "node4"))
+	book.SetAvailableNodes(NewNodeList(append(nodes, "node4")...))
 }
 
 func TestAddressBook_EdgeCases(t *testing.T) {
@@ -148,7 +150,7 @@ func TestAddressBook_EdgeCases(t *testing.T) {
 	// NOTE: Locate requires the node to be in `AvailableNodes`.
 	// In this test, we didn't call SetAvailableNodes.
 	// So Locate returns false.
-	book.SetAvailableNodes([]gen.Atom{node1})
+	book.SetAvailableNodes(NewNodeList(node1))
 
 	// RemoveProcess with non-existent node
 	book.RemoveProcess("non-existent", p1)
@@ -199,7 +201,7 @@ func TestAddressBook_SetProcess_Update(t *testing.T) {
 	p1 := ProcessInfo{Name: "p1", PID: gen.PID{Node: node1, ID: 1}}
 	p2 := ProcessInfo{Name: "p2", PID: gen.PID{Node: node1, ID: 2}}
 
-	book.SetAvailableNodes([]gen.Atom{node1})
+	book.SetAvailableNodes(NewNodeList(node1))
 
 	// Initial set
 	book.SetProcess(node1, p1)
@@ -231,7 +233,7 @@ func TestAddressBook_Coverage_Boost(t *testing.T) {
 	book := NewAddressBook(nil)
 	node1 := gen.Atom("node1")
 	node2 := gen.Atom("node2")
-	book.SetAvailableNodes([]gen.Atom{node1, node2})
+	book.SetAvailableNodes(NewNodeList(node1, node2))
 
 	// 1. Test removeNode with multiple elements and gap closure
 	// Pattern: [A, B, A] remove A -> [B]
@@ -347,7 +349,7 @@ func TestAddressBook_SetAvailableNodes_MultiNode(t *testing.T) {
 	p1 := gen.Atom("p1")
 
 	// Setup: p1 exists on both node1 and node2
-	book.SetAvailableNodes([]gen.Atom{node1, node2})
+	book.SetAvailableNodes(NewNodeList(node1, node2))
 
 	p1Info1 := ProcessInfo{Name: p1, PID: gen.PID{Node: node1, ID: 1}}
 	p1Info2 := ProcessInfo{Name: p1, PID: gen.PID{Node: node2, ID: 2}}
@@ -361,7 +363,7 @@ func TestAddressBook_SetAvailableNodes_MultiNode(t *testing.T) {
 	}
 
 	// Remove node1 via SetAvailableNodes
-	book.SetAvailableNodes([]gen.Atom{node2})
+	book.SetAvailableNodes(NewNodeList(node2))
 
 	// Check p1 is still in processToNodes (pointing to node2)
 	// This exercises the `else` branch in SetAvailableNodes cleanup loop
@@ -379,7 +381,7 @@ func TestAddressBook_RemoveProcess_InconsistentState(t *testing.T) {
 	node1 := gen.Atom("node1")
 	p1 := gen.Atom("p1")
 
-	book.SetAvailableNodes([]gen.Atom{node1})
+	book.SetAvailableNodes(NewNodeList(node1))
 
 	// Manually inject inconsistent state:
 	// Process "p1" is recorded in nodeProcesses[node1], but the ProcessInfo says it's on "otherNode"
@@ -411,7 +413,7 @@ func TestAddressBook_RemoveProcess_MultiNode(t *testing.T) {
 	p1 := gen.Atom("p1")
 
 	// Setup: p1 exists on both node1 and node2
-	book.SetAvailableNodes([]gen.Atom{node1, node2})
+	book.SetAvailableNodes(NewNodeList(node1, node2))
 
 	p1Info1 := ProcessInfo{Name: p1, PID: gen.PID{Node: node1, ID: 1}}
 	p1Info2 := ProcessInfo{Name: p1, PID: gen.PID{Node: node2, ID: 2}}
@@ -442,7 +444,7 @@ func TestAddressBook_Concurrency(t *testing.T) {
 	book := NewAddressBook(nil)
 	node1 := gen.Atom("node1")
 	node2 := gen.Atom("node2")
-	book.SetAvailableNodes([]gen.Atom{node1, node2})
+	book.SetAvailableNodes(NewNodeList(node1, node2))
 
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
@@ -478,10 +480,10 @@ func TestAddressBook_Concurrency(t *testing.T) {
 				return
 			case <-time.After(5 * time.Millisecond):
 				// Toggle node2 availability
-				if len(book.GetAvailableNodes()) == 2 {
-					book.SetAvailableNodes([]gen.Atom{node1})
+				if book.GetAvailableNodes().Len() == 2 {
+					book.SetAvailableNodes(NewNodeList(node1))
 				} else {
-					book.SetAvailableNodes([]gen.Atom{node1, node2})
+					book.SetAvailableNodes(NewNodeList(node1, node2))
 				}
 			}
 		}
@@ -582,7 +584,7 @@ func TestPersistAddressBook_LocateIgnoresEpoch(t *testing.T) {
 	book.SetRegistrar(reg)
 	_ = book.SetSelfNode(node)
 
-	_ = book.SetAvailableNodes([]gen.Atom{node})
+	_ = book.SetAvailableNodes(NewNodeList(node))
 	if err := book.SetProcess(node, ProcessInfo{Name: proc, Version: 1}); err != nil {
 		t.Fatalf("SetProcess: %v", err)
 	}
