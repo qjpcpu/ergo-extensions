@@ -605,3 +605,7 @@ func (w *whereis) flushProcess(pid gen.PID) error {
 	}
 	return w.book.Storage().Set(w.Node().Name(), info.Name, version)
 }
+
+func (w *whereis) Terminate(reason error) {
+	w.book.RemoveProcess(w.Node().Name(), w.processCache.Load().(ProcessInfoList)...)
+}
