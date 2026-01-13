@@ -7,7 +7,7 @@ This repository provides a small set of building blocks to add distributed proce
 - `extensions_cron` — a cron-like scheduler that triggers messages on a node or across the cluster.
 - `AddressBook` — a thread-safe, eventually-consistent cache of nodes and their registered processes, with node picking via consistent hashing.
 
-Optionally, `PersistAddressBook` can be enabled via `app.SimpleNodeOptions.AddressBookStorage` to persist named processes into an external storage backend.
+Optionally, `AddressBookStorage` can be enabled via `app.SimpleNodeOptions.AddressBookStorage` to persist local named processes into an external storage backend.
 
 Core components live under the `system` package and are designed to integrate with `ergo.services/ergo` and a registrar (Zookeeper via `ergo.services/registrar/zk`, or the built-in in-memory registrar used by `app.StartSimpleNode` when no registrar is provided). The `app` package provides a small helper to start a node with these components wired in.
 
@@ -48,7 +48,7 @@ import "github.com/qjpcpu/ergo-extensions/system"
     - Maintains PID→Name and Name→PID maps
     - Stores a snapshot (`ProcessInfoList`) in-memory and updates the `AddressBook`
     - Syncs process snapshots or deltas with other nodes (request/reply with forwarding)
-    - If `PersistAddressBook` is enabled, persists local named processes into storage instead of keeping per-node snapshots
+    - If `AddressBookStorage` is configured, persists local named processes into storage for fallback lookups
     - Answers calls: `MessageLocate{Name}` → node, `MessageGetAddressBook{}` → `MessageAddressBook{Book IAddressBook}`
   - `DaemonMonitorProcess` (`extensions_daemon`):
     - Subscribes to registrar events for leader election and membership changes
@@ -59,9 +59,9 @@ import "github.com/qjpcpu/ergo-extensions/system"
   - `AddressBook`:
     - Tracks available nodes and per-node registered processes
     - Picks a node for a process name using a consistent hashing ring (PartitionCount: 10240, ReplicationFactor: 40)
-  - `PersistAddressBook`:
+  - `AddressBookStorage` (optional):
     - Persists local named processes into a user-provided storage backend
-    - Validates entries using a per-node version/epoch (via registrar config)
+    - Used by `AddressBook.Locate` as a fallback when the in-memory view misses
 - `app.StartSimpleNode`:
   - Starts an Ergo node and loads the `system.Supervisor` with a shared `IAddressBook`
   - Provides helper methods for locating named processes and forwarding sends/calls
@@ -185,6 +185,9 @@ if b, ok := book.(*system.AddressBook); ok {
   - `Spawner.SpawnRegister(processName gen.Atom, args ...any) (gen.PID, error)`
   - `Launcher{ Factory, Option, RecoveryScanner }`
   - `DaemonProcess{ ProcessName gen.Atom, Args []any }`
+- Persistence:
+  - `system.IAddressBookStorage`
+  - `app.SimpleNodeOptions.AddressBookStorage`
 - Discovery & address book:
   - Call `extensions_whereis` with `MessageLocate{Name gen.Atom}` → `gen.Atom` (node)
   - Call `extensions_whereis` with `MessageGetAddressBook{}` → `MessageAddressBook{Book IAddressBook}`
@@ -202,6 +205,7 @@ The code expects a working registrar from the Ergo network. With Zookeeper (`erg
 ## Design Notes
 
 - Consistency: the `AddressBook` is eventually consistent; broadcasts retry on failures.
+- Locate semantics: if multiple nodes report the same process name, `Locate` picks the oldest instance; ties are deterministic.
 - Hashing: consistent hashing ring uses `xxhash` and `buraksezer/consistent` to spread process names across nodes.
 - Scheduling: `whereis` inspects periodically (default: 3s); `extensions_daemon` schedules recovery with small delays to absorb churn.
 - Safety: remote spawns are issued via `SendImportant` to target nodes.
