@@ -102,6 +102,15 @@ func nodeMin(a, b gen.Atom) gen.Atom {
 	return b
 }
 
+func containsNode(nodes []gen.Atom, node gen.Atom) bool {
+	for _, n := range nodes {
+		if n == node {
+			return true
+		}
+	}
+	return false
+}
+
 func TestWhereisConvergesOnJoin(t *testing.T) {
 	cluster := mem.NewCluster()
 	n1 := startNode(t, cluster, "node-a@127.0.0.1")
@@ -319,6 +328,15 @@ func TestWhereisConvergesAfterManyLocalChanges(t *testing.T) {
 	cluster := mem.NewCluster()
 	n1 := startNode(t, cluster, "node-a@127.0.0.1")
 	n2 := startNode(t, cluster, "node-b@127.0.0.1")
+
+	waitUntil(t, 5*time.Second, func() bool {
+		n1Nodes := n1.AddressBook().GetAvailableNodes()
+		n2Nodes := n2.AddressBook().GetAvailableNodes()
+		return containsNode(n1Nodes, n1.Name()) &&
+			containsNode(n1Nodes, n2.Name()) &&
+			containsNode(n2Nodes, n1.Name()) &&
+			containsNode(n2Nodes, n2.Name())
+	})
 
 	var pids []gen.PID
 	var names []gen.Atom

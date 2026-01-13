@@ -566,7 +566,7 @@ func (m *mockPersistStorage) Remove(node gen.Atom, process gen.Atom, version int
 	return nil
 }
 
-func TestPersistAddressBook_EpochInvalidatesStaleEntries(t *testing.T) {
+func TestPersistAddressBook_LocateIgnoresEpoch(t *testing.T) {
 	st := &mockPersistStorage{data: make(map[gen.Atom]struct {
 		node gen.Atom
 		ver  int
@@ -591,8 +591,8 @@ func TestPersistAddressBook_EpochInvalidatesStaleEntries(t *testing.T) {
 	}
 
 	reg.versions[string(node)] = 2
-	if _, ok := book.Locate(proc); ok {
-		t.Fatalf("Locate should fail after node epoch changes")
+	if got, ok := book.Locate(proc); !ok || got != node {
+		t.Fatalf("Locate should still succeed after node epoch changes, got %v %v", got, ok)
 	}
 
 	if err := book.SetProcess(node, ProcessInfo{Name: proc, Version: 2}); err != nil {
