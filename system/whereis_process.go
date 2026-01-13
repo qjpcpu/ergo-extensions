@@ -620,7 +620,7 @@ func (w *whereis) Terminate(reason error) {
 
 func (w *whereis) HandleEvent(event gen.MessageEvent) error {
 	switch event.Message.(type) {
-	case zk.EventNodeSwitchedToFollower, zk.EventNodeLeft:
+	case zk.EventNodeJoined, zk.EventNodeLeft:
 		w.fetchAvailableBookNodes()
 	}
 	return nil
