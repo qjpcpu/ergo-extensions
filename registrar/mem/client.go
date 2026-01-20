@@ -36,7 +36,7 @@ func (c *client) ResolveApplication(name gen.Atom) ([]gen.ApplicationRoute, erro
 }
 
 func (c *client) ResolveProxy(name gen.Atom) ([]gen.ProxyRoute, error) {
-	// Proxy routing is not supported in zk registrar implementation
+	// Proxy routing is not supported in memory registrar implementation
 	return nil, gen.ErrNoRoute
 }
 

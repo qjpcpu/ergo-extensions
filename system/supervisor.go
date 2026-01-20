@@ -9,31 +9,29 @@ import (
 
 const Supervisor = gen.Atom("extensions_sup")
 
-type ApplicationMemberSepcOptions struct {
+type ApplicationMemberSpecOptions struct {
 	AddressBook             *AddressBook
 	CronJobs                []CronJob
 	SyncAddressBookInterval time.Duration
-	AddressBookBuffer       int
 }
 
-func ApplicationMemberSepc(opts ApplicationMemberSepcOptions) gen.ApplicationMemberSpec {
+func ApplicationMemberSpec(opts ApplicationMemberSpecOptions) gen.ApplicationMemberSpec {
 	return gen.ApplicationMemberSpec{
 		Name:    Supervisor,
 		Factory: FactorySystemSup(opts),
 	}
 }
 
-func FactorySystemSup(opts ApplicationMemberSepcOptions) gen.ProcessFactory {
+func FactorySystemSup(opts ApplicationMemberSpecOptions) gen.ProcessFactory {
 	return func() gen.ProcessBehavior {
 		sup := &systemSup{
 			cron:                opts.CronJobs,
 			syncProcessInterval: opts.SyncAddressBookInterval,
-			changeBufferCap:     opts.AddressBookBuffer,
 		}
 		if opts.AddressBook != nil {
 			sup.book = opts.AddressBook
 		} else {
-			sup.book = NewAddressBook(nil)
+			sup.book = NewAddressBook()
 		}
 		return sup
 	}
@@ -44,22 +42,6 @@ type systemSup struct {
 	book                *AddressBook
 	cron                []CronJob
 	syncProcessInterval time.Duration
-	changeBufferCap     int
-}
-
-var system_process = map[gen.Atom]struct{}{
-	WhereIsProcess:       {},
-	DaemonMonitorProcess: {},
-	CronJobProcess:       {},
-	Supervisor:           {},
-	"system_inspect":     {},
-	"system_metrics":     {},
-	"system_sup":         {},
-}
-
-func isSystemProc(p gen.Atom) bool {
-	_, ok := system_process[p]
-	return ok
 }
 
 func (sup *systemSup) Init(args ...any) (act.SupervisorSpec, error) {
@@ -74,15 +56,15 @@ func (sup *systemSup) Init(args ...any) (act.SupervisorSpec, error) {
 	spec.Children = []act.SupervisorChildSpec{
 		{
 			Name:    WhereIsProcess,
-			Factory: factory_whereis(book, sup.syncProcessInterval, sup.changeBufferCap),
+			Factory: factoryWhereIs(book, sup.syncProcessInterval),
 		},
 		{
 			Name:    DaemonMonitorProcess,
-			Factory: factory_daemon(book),
+			Factory: factoryDaemon(book),
 		},
 		{
 			Name:    CronJobProcess,
-			Factory: factory_cron(sup.cron),
+			Factory: factoryCron(sup.cron),
 		},
 	}
 

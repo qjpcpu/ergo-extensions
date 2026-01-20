@@ -1,7 +1,7 @@
 package system
 
 import (
-	"fmt"
+	"math/rand"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -20,120 +20,72 @@ type whereis struct {
 	book      *AddressBook
 	registrar gen.Registrar
 
-	fetchSeq    uint64
-	fetchRoutes map[fetchRouteKey]fetchRoute
-
-	changeBufferCap  int
-	procChangeBuffer []MessageProcessChanged
-	procChangeStart  int
-	procChangeCount  int
-
 	selfVersion  ProcessVersion
 	nodeVersions map[gen.Atom]ProcessVersion
 
-	pid_to_name      map[gen.PID]gen.Atom
-	name_to_birth_at map[gen.Atom]int64
-	name_to_pid      map[gen.Atom]gen.PID
+	pidToName      map[gen.PID]gen.Atom
+	nameToBirthAt  map[gen.Atom]int64
+	nameToPID      map[gen.Atom]gen.PID
 	// only includes named processes
-	processCache     atomic.Value
-	inspect_interval time.Duration
-
-	// stats
-	inspect_self_times          uint64
-	send_fetch_proc_times       uint64
-	respond_fetch_proc_times    uint64
-	receive_proc_snapshot_times uint64
-	receive_incr_proc_times     uint64
+	processCache       atomic.Value
+	inspectInterval    time.Duration
+	antiEntropyCounter int
+	topologyChangeID   int64
 }
 
-type fetchRouteKey struct {
-	Origin  gen.Atom
-	FetchID uint64
-}
-
-type fetchRoute struct {
-	Upstream gen.PID
-	ExpireAt time.Time
-}
-
-const (
-	fetchReplyKindFull    uint8 = 1
-	fetchReplyKindChanged uint8 = 2
-)
-
-func factory_whereis(book *AddressBook, inspect_interval time.Duration, changeBuffer int) gen.ProcessFactory {
+func factoryWhereIs(book *AddressBook, inspectInterval time.Duration) gen.ProcessFactory {
 	var v atomic.Value
 	v.Store(ProcessInfoList{})
-	if inspect_interval == 0 {
-		inspect_interval = time.Second * 3
-	}
-	if changeBuffer <= 0 {
-		changeBuffer = 16
+	if inspectInterval == 0 {
+		inspectInterval = time.Second * 3
 	}
 	return func() gen.ProcessBehavior {
 		return &whereis{
 			book:             book,
-			pid_to_name:      make(map[gen.PID]gen.Atom),
-			name_to_pid:      make(map[gen.Atom]gen.PID),
-			name_to_birth_at: make(map[gen.Atom]int64),
+			pidToName:        make(map[gen.PID]gen.Atom),
+			nameToPID:        make(map[gen.Atom]gen.PID),
+			nameToBirthAt:    make(map[gen.Atom]int64),
 			processCache:     v,
 			selfVersion:      NewVersion(),
 			nodeVersions:     make(map[gen.Atom]ProcessVersion),
-			inspect_interval: inspect_interval,
-			changeBufferCap:  changeBuffer,
+			inspectInterval:  inspectInterval,
 		}
 	}
 }
 
 func (w *whereis) Init(args ...any) error {
-	w.SendAfter(w.PID(), start_init{}, time.Second)
+	w.SendAfter(w.PID(), messageInit{}, time.Second)
 	return nil
 }
 
 func (w *whereis) HandleMessage(from gen.PID, message any) error {
 	switch e := message.(type) {
-	case start_init:
+	case messageInit:
 		if err := w.setup(); err != nil {
-			w.SendAfter(w.PID(), start_init{}, time.Second)
+			w.SendAfter(w.PID(), messageInit{}, time.Second)
 			return nil
 		}
-		w.SendAfter(w.PID(), inspect_process_list{}, w.inspect_interval)
-	case inspect_process_list:
+		delay := w.inspectInterval + time.Duration(rand.Intn(int(w.inspectInterval/10)+1))
+		w.SendAfter(w.PID(), messageInspectProcess{}, delay)
+	case messageInspectProcess:
 		w.inspectProcessList()
-		w.SendAfter(w.PID(), inspect_process_list{}, w.inspect_interval)
-	case MessageFlushProcess:
-		w.flushProcess(e.PID)
-	case MessageFetchProcessList:
-		self := w.Node().Name()
-		if e.Node == "" || e.Node == self || e.VersionSet.Size() == 0 {
-			return nil
+		delay := w.inspectInterval + time.Duration(rand.Intn(int(w.inspectInterval/10)+1))
+		w.SendAfter(w.PID(), messageInspectProcess{}, delay)
+	case messageTopologyChange:
+		if e.ID == w.topologyChangeID {
+			w.handleTopologyChange()
 		}
-		if remote := e.VersionSet.Next(); remote.Node != self {
-			return nil
-		} else {
-			w.keepFetchRoute(fetchRouteKey{Origin: e.Node, FetchID: e.FetchID}, from)
-			e.VersionSet = e.VersionSet.Drop()
-			if w.sendFetchProcessList(e.Node, e.FetchID, e.VersionSet) {
-				w.send_fetch_proc_times++
-			}
-			if reply, ok := w.makeFetchReply(remote.Version); ok {
-				reply.Origin = e.Node
-				reply.FetchID = e.FetchID
-				reply.Base = remote.Version
-				if err := w.Send(from, reply); err != nil {
-					w.Log().Warning("send process info to node:%s failure %v", from.Node, err)
-				}
-				w.respond_fetch_proc_times++
-			}
-		}
-	case MessageFetchProcessReply:
-		if err := w.handleFetchReply(e); err != nil {
-			return err
-		}
-	case MessageProcesses:
-		return w.handleProcesses(e)
 	case MessageProcessChanged:
 		return w.handleProcessChanged(e)
+	case MessageForwardLocate:
+		var node gen.Atom
+		owner := w.book.PickDirectoryNode(e.Name)
+		if owner == w.Node().Name() {
+			if p, ok := w.book.LocateLocal(e.Name); ok {
+				node = p
+			}
+		}
+		w.SendResponse(e.From, e.Ref, node)
 	}
 	return nil
 }
@@ -141,18 +93,51 @@ func (w *whereis) HandleMessage(from gen.PID, message any) error {
 func (w *whereis) HandleCall(from gen.PID, ref gen.Ref, request any) (any, error) {
 	switch e := request.(type) {
 	case MessageLocate:
-		if p, ok := w.book.Locate(e.Name); ok {
-			return p, nil
-		} else {
+		if e.Name == "" {
 			return gen.Atom(""), nil
 		}
+		owner := w.book.PickDirectoryNode(e.Name)
+		if owner == w.Node().Name() {
+			if p, ok := w.book.LocateLocal(e.Name); ok {
+				return p, nil
+			}
+			return gen.Atom(""), nil
+		}
+		if owner == "" {
+			return gen.Atom(""), nil
+		}
+		w.Send(gen.ProcessID{Node: owner, Name: WhereIsProcess}, MessageForwardLocate{
+			Name: e.Name,
+			From: from,
+			Ref:  ref,
+		})
+		return nil, nil
 	case MessageGetAddressBook:
 		return MessageAddressBook{Book: w.book, Owner: w.PID()}, nil
 	}
 	return w.PID(), nil
 }
 
-func (w *whereis) diff(newList []ProcessInfo) error {
+func (w *whereis) HandleEvent(event gen.MessageEvent) error {
+	switch event.Message.(type) {
+	case zk.EventNodeJoined, zk.EventNodeLeft:
+		nodeList, _ := w.fetchAvailableBookNodes()
+		n := 1
+		if nodeList != nil {
+			n = nodeList.Len()
+		}
+		// Stagger the sync based on cluster size to prevent sync storms.
+		// Base delay 100ms, max delay proportional to node count (10ms per node).
+		// Cap the max random delay at 20 seconds.
+		maxRand := min(max(n*10, 1000), 20000)
+		delay := time.Duration(100+rand.Intn(maxRand)) * time.Millisecond
+		w.topologyChangeID++
+		w.SendAfter(w.PID(), messageTopologyChange{ID: w.topologyChangeID}, delay)
+	}
+	return nil
+}
+
+func (w *whereis) syncLocalChanges(newList []ProcessInfo) error {
 	selfNode := w.Node().Name()
 	oldList, err := w.book.GetProcessList(selfNode)
 	if err != nil {
@@ -171,43 +156,81 @@ func (w *whereis) diff(newList []ProcessInfo) error {
 
 	msg := MessageProcessChanged{Node: selfNode}
 	for name, p := range newMap {
-		if _, ok := oldMap[name]; !ok {
+		if old, ok := oldMap[name]; !ok || old.PID != p.PID || old.BirthAt != p.BirthAt {
 			msg.UpProcess = append(msg.UpProcess, p)
 		}
 	}
 
 	for name, p := range oldMap {
-		if _, ok := newMap[name]; !ok {
+		if newP, ok := newMap[name]; !ok || newP.PID != p.PID || newP.BirthAt != p.BirthAt {
 			msg.DownProcess = append(msg.DownProcess, p)
 		}
 	}
 
 	w.book.SetProcess(selfNode, newList...)
-	if len(msg.DownProcess) > 0 {
-		w.book.RemoveProcess(selfNode, msg.DownProcess...)
-	}
 	if len(msg.UpProcess) > 0 || len(msg.DownProcess) > 0 {
 		ver := w.selfVersion.Incr()
 		msg.Version = ver
 		w.selfVersion = ver
-		w.appendBuffer(msg)
+		w.registerToShards(msg)
 	}
 	return nil
 }
 
+func (w *whereis) registerToShards(msg MessageProcessChanged) {
+	shards := make(map[gen.Atom]*MessageProcessChanged)
+	for _, p := range msg.UpProcess {
+		owner := w.book.PickDirectoryNode(p.Name)
+		if owner == "" {
+			continue
+		}
+		if _, ok := shards[owner]; !ok {
+			shards[owner] = &MessageProcessChanged{
+				Node:     w.Node().Name(),
+				Version:  msg.Version,
+				FullSync: msg.FullSync,
+			}
+		}
+		shards[owner].UpProcess = append(shards[owner].UpProcess, p)
+	}
+	for _, p := range msg.DownProcess {
+		owner := w.book.PickDirectoryNode(p.Name)
+		if owner == "" {
+			continue
+		}
+		if _, ok := shards[owner]; !ok {
+			shards[owner] = &MessageProcessChanged{
+				Node:     w.Node().Name(),
+				Version:  msg.Version,
+				FullSync: msg.FullSync,
+			}
+		}
+		shards[owner].DownProcess = append(shards[owner].DownProcess, p)
+	}
+
+	for owner, shardMsg := range shards {
+		if owner == w.Node().Name() {
+			w.handleProcessChanged(*shardMsg)
+		} else {
+			w.Send(gen.ProcessID{Node: owner, Name: WhereIsProcess}, *shardMsg)
+		}
+	}
+}
+
 func (w *whereis) inspectProcessList() error {
-	w.cleanupFetchRoutes(time.Now())
 	if err := w.collectProcessList(); err != nil {
 		return err
 	}
-	nodes, err := w.fetchAvailableBookNodes()
-	if err != nil {
-		w.Log().Error("fetch nodes fail %v", err)
-		return err
+
+	w.antiEntropyCounter++
+	if w.antiEntropyCounter >= 100 {
+		w.antiEntropyCounter = 0
+		w.selfVersion = w.selfVersion.Incr()
+		w.handleTopologyChange()
+	} else {
+		w.syncLocalChanges(w.processCache.Load().(ProcessInfoList))
 	}
-	w.diff(w.processCache.Load().(ProcessInfoList))
-	w.inspect_self_times++
-	return w.fetchOtherNodeProcess(nodes)
+	return nil
 }
 
 // collectProcessList gets all processes from the current node,
@@ -226,12 +249,12 @@ func (w *whereis) collectProcessList() error {
 	// Iterate through the current process list to find newly added processes.
 	for _, pid := range pidList {
 		pidMap[pid] = struct{}{}
-		if _, ok := w.pid_to_name[pid]; !ok {
+		if _, ok := w.pidToName[pid]; !ok {
 			added = append(added, pid)
 		}
 	}
-	// Iterate through the old process list (pid_to_name) to find deleted (terminated) processes.
-	for pid := range w.pid_to_name {
+	// Iterate through the old process list (pidToName) to find deleted (terminated) processes.
+	for pid := range w.pidToName {
 		if _, ok := pidMap[pid]; !ok {
 			del = append(del, pid)
 		}
@@ -249,14 +272,14 @@ func (w *whereis) collectProcessList() error {
 	}
 	// Remove deleted processes from the lookup maps.
 	for _, pid := range del {
-		name := w.pid_to_name[pid]
+		name := w.pidToName[pid]
 		// Ensure we only delete the entry if the PID matches,
 		// avoiding issues with stale/reused process names.
-		if w.name_to_pid[name] == pid {
-			delete(w.name_to_pid, name)
-			delete(w.name_to_birth_at, name)
+		if w.nameToPID[name] == pid {
+			delete(w.nameToPID, name)
+			delete(w.nameToBirthAt, name)
 		}
-		delete(w.pid_to_name, pid)
+		delete(w.pidToName, pid)
 	}
 
 	// Add new processes to the lookup maps.
@@ -264,22 +287,22 @@ func (w *whereis) collectProcessList() error {
 		if info, err := node.ProcessInfo(pid); err != nil {
 			return err
 		} else {
-			w.pid_to_name[pid] = info.Name
+			w.pidToName[pid] = info.Name
 			if info.Name != "" {
-				w.name_to_pid[info.Name] = pid
-				w.name_to_birth_at[info.Name] = time.Now().Unix() - info.Uptime
+				w.nameToPID[info.Name] = pid
+				w.nameToBirthAt[info.Name] = time.Now().Unix() - info.Uptime
 			}
 		}
 	}
 
-	// Rebuild the full process list from the updated name_to_pid map.
-	procList := make(ProcessInfoList, 0, len(w.name_to_pid))
-	for name, pid := range w.name_to_pid {
+	// Rebuild the full process list from the updated nameToPID map.
+	procList := make(ProcessInfoList, 0, len(w.nameToPID))
+	for name, pid := range w.nameToPID {
 		procList = append(procList, ProcessInfo{
 			Name:    name,
 			PID:     pid,
 			Node:    node.Name(),
-			BirthAt: w.name_to_birth_at[name],
+			BirthAt: w.nameToBirthAt[name],
 			Version: nodeVersion,
 		})
 	}
@@ -297,8 +320,6 @@ func (w *whereis) setup() error {
 		} else {
 			w.registrar = registrar
 		}
-		w.book.SetRegistrar(registrar)
-		w.book.SetSelfNode(w.Node().Name())
 		event, err := registrar.Event()
 		if err != nil {
 			return err
@@ -306,6 +327,8 @@ func (w *whereis) setup() error {
 		if _, err := w.MonitorEvent(event); err != nil {
 			return err
 		}
+		// Initial fetch of available nodes
+		w.fetchAvailableBookNodes()
 	}
 	return nil
 }
@@ -321,267 +344,25 @@ func (w *whereis) fetchAvailableBookNodes() (*NodeList, error) {
 }
 
 func (w *whereis) HandleInspect(from gen.PID, item ...string) map[string]string {
-	tostr := func(i uint64) string {
-		return strconv.FormatUint(i, 10)
-	}
 	nodes := w.book.GetAvailableNodes()
 	stats := map[string]string{
-		"nodes":                       strconv.FormatInt(int64(nodes.Len()), 10),
-		"inspect_self_times":          tostr(w.inspect_self_times),
-		"send_fetch_proc_times":       tostr(w.send_fetch_proc_times),
-		"respond_fetch_proc_times":    tostr(w.respond_fetch_proc_times),
-		"receive_proc_snapshot_times": tostr(w.receive_proc_snapshot_times),
-		"receive_incr_proc_times":     tostr(w.receive_incr_proc_times),
+		"nodes": strconv.FormatInt(int64(nodes.Len()), 10),
 	}
-	nodes.Range(func(node gen.Atom) bool {
-		procs, err := w.book.GetProcessList(node)
-		if err == nil {
-			stats[fmt.Sprintf("%s.process", string(node))] = strconv.FormatInt(int64(len(procs)), 10)
-		}
-		return true
-	})
 	return stats
 }
 
-func (w *whereis) appendBuffer(msg MessageProcessChanged) {
-	if w.changeBufferCap <= 0 {
-		return
-	}
-	if w.procChangeBuffer == nil {
-		w.procChangeBuffer = make([]MessageProcessChanged, w.changeBufferCap)
-		w.procChangeStart = 0
-		w.procChangeCount = 0
-	}
-	if w.procChangeCount < w.changeBufferCap {
-		idx := (w.procChangeStart + w.procChangeCount) % w.changeBufferCap
-		w.procChangeBuffer[idx] = msg
-		w.procChangeCount++
-		return
-	}
-	w.procChangeBuffer[w.procChangeStart] = msg
-	w.procChangeStart = (w.procChangeStart + 1) % w.changeBufferCap
-}
-
-func (w *whereis) fetchOtherNodeProcess(nodes *NodeList) error {
-	setSize := 64
-	if nsize := nodes.Len(); nsize <= 64 {
-		setSize = 8
-	} else if nsize <= 256 {
-		setSize = 16
-	} else if nsize <= 1024 {
-		setSize = 32
-	}
-	self := w.Node().Name()
-	var sets []VersionSet
-	nodeSet := make(map[gen.Atom]ProcessVersion)
-	var set VersionSet
-	selfGroupId := -1
-	nodes.Range(func(node gen.Atom) bool {
-		if len(set) > setSize {
-			sets = append(sets, set)
-			set = nil
-		}
-		if node == self {
-			selfGroupId = len(sets)
-		}
-		if version, ok := w.nodeVersions[node]; ok {
-			nodeSet[node] = version
-			set = append(set, NodeProcessVersion{Node: node, Version: version})
-		} else {
-			nodeSet[node] = NewEmptyVersion()
-			set = append(set, NodeProcessVersion{Node: node, Version: NewEmptyVersion()})
-		}
-		return true
-	})
-	if len(set) > 0 {
-		sets = append(sets, set)
-	}
-	if selfGroupId != -1 {
-		sets[selfGroupId] = sets[selfGroupId].MoveNodeToNext(self).Drop()
-	}
-	delete(nodeSet, self)
-
-	for _, group := range sets {
-		fetchID := w.nextFetchID()
-		if w.sendFetchProcessList(self, fetchID, group) {
-			w.send_fetch_proc_times++
-		}
-	}
-
-	w.nodeVersions = nodeSet
-	return nil
-}
-
-func (w *whereis) sendFetchProcessList(source gen.Atom, fetchID uint64, versionSet VersionSet) bool {
-	// Robust forwarding: retry until success or no nodes left
-	for len(versionSet) > 0 {
-		msg := MessageFetchProcessList{
-			Node:       source,
-			FetchID:    fetchID,
-			VersionSet: versionSet,
-		}
-		node := versionSet.NextNode()
-		if err := w.Send(gen.ProcessID{Node: node, Name: WhereIsProcess}, msg); err != nil {
-			w.Log().Warning("send fetch request to node:%s process failure %v, trying next...", node, err)
-			versionSet = versionSet.Drop()
-			continue
-		}
-		return true
-	}
-	return false
-}
-
-func (w *whereis) makeFetchReply(version ProcessVersion) (MessageFetchProcessReply, bool) {
-	if version == w.selfVersion {
-		return MessageFetchProcessReply{}, false
-	}
-	size := w.procChangeCount
-	for i := 0; i < size; i++ {
-		idx := (w.procChangeStart + i) % w.changeBufferCap
-		ver := w.procChangeBuffer[idx]
-		if ver.Version == version {
-			if i < size-1 {
-				if msg, ok := w.compactProcessChangeRing(i+1, size); ok {
-					return MessageFetchProcessReply{Kind: fetchReplyKindChanged, Changed: msg}, true
-				}
-			}
-			return MessageFetchProcessReply{}, false
-		}
-	}
-	list, err := w.book.GetProcessList(w.Node().Name())
-	if err != nil {
-		return MessageFetchProcessReply{}, false
-	}
-	return MessageFetchProcessReply{Kind: fetchReplyKindFull, Full: MessageProcesses{
-		Node:        w.Node().Name(),
-		ProcessList: list,
-		Version:     w.selfVersion,
-	}}, true
-}
-
-func (w *whereis) handleFetchReply(e MessageFetchProcessReply) error {
-	now := time.Now()
-	w.cleanupFetchRoutes(now)
-	if e.Kind != fetchReplyKindFull && e.Kind != fetchReplyKindChanged {
-		return nil
-	}
-	isOrigin := w.Node().Name() == e.Origin
-	if !isOrigin {
-		key := fetchRouteKey{Origin: e.Origin, FetchID: e.FetchID}
-		if route, ok := w.fetchRoutes[key]; ok && now.Before(route.ExpireAt) {
-			if err := w.Send(route.Upstream, e); err != nil {
-				w.Log().Warning("forward process info to node:%s failure %v", route.Upstream.Node, err)
-			}
-		}
-	}
-	switch e.Kind {
-	case fetchReplyKindFull:
-		return w.handleProcesses(e.Full)
-	case fetchReplyKindChanged:
-		if !isOrigin {
-			return nil
-		}
-		return w.handleProcessChanged(e.Changed)
-	default:
-		return nil
-	}
-}
-
-func (w *whereis) handleProcesses(e MessageProcesses) error {
-	w.receive_proc_snapshot_times++
-	if version, ok := w.nodeVersions[e.Node]; ok && version.GreaterThanOrEq(e.Version) {
-		return nil
-	}
-	if _, err := w.fetchAvailableBookNodes(); err != nil {
-		w.Log().Error("fetch nodes fail %v", err)
-		return err
-	}
-	w.book.SetProcess(e.Node, e.ProcessList...)
-	w.Log().Debug("received %d process snapshot on %s %s", len(e.ProcessList), e.Node, shortInfo(e.ProcessList))
-	w.nodeVersions[e.Node] = e.Version
-	return nil
-}
-
 func (w *whereis) handleProcessChanged(e MessageProcessChanged) error {
-	w.receive_incr_proc_times++
-	if version, ok := w.nodeVersions[e.Node]; ok && version.GreaterThanOrEq(e.Version) {
+	if version, ok := w.nodeVersions[e.Node]; ok && version.GreaterThan(e.Version) {
 		return nil
 	}
-	w.book.AddProcess(e.Node, e.UpProcess...)
-	w.book.RemoveProcess(e.Node, e.DownProcess...)
-	w.Log().Debug("received +%d%s/-%d%s process on %s", len(e.UpProcess), shortInfo(e.UpProcess), len(e.DownProcess), shortInfo(e.DownProcess), e.Node)
+	if e.FullSync {
+		w.book.SetProcess(e.Node, e.UpProcess...)
+	} else {
+		w.book.AddProcess(e.Node, e.UpProcess...)
+		w.book.RemoveProcess(e.Node, e.DownProcess...)
+	}
 	w.nodeVersions[e.Node] = e.Version
 	return nil
-}
-
-func (w *whereis) keepFetchRoute(key fetchRouteKey, upstream gen.PID) {
-	if w.fetchRoutes == nil {
-		w.fetchRoutes = make(map[fetchRouteKey]fetchRoute)
-	}
-	w.fetchRoutes[key] = fetchRoute{Upstream: upstream, ExpireAt: time.Now().Add(w.fetchRouteTTL())}
-}
-
-func (w *whereis) cleanupFetchRoutes(now time.Time) {
-	if len(w.fetchRoutes) == 0 {
-		return
-	}
-	for k, v := range w.fetchRoutes {
-		if now.After(v.ExpireAt) {
-			delete(w.fetchRoutes, k)
-		}
-	}
-}
-
-func (w *whereis) nextFetchID() uint64 {
-	w.fetchSeq++
-	if w.fetchSeq == 0 {
-		w.fetchSeq = 1
-	}
-	return w.fetchSeq
-}
-
-func (w *whereis) fetchRouteTTL() time.Duration {
-	ttl := w.inspect_interval * 4
-	if ttl < 2*time.Second {
-		ttl = 2 * time.Second
-	}
-	if ttl > time.Minute {
-		ttl = time.Minute
-	}
-	return ttl
-}
-
-func (w *whereis) compactProcessChangeRing(start, end int) (MessageProcessChanged, bool) {
-	if start >= end || w.procChangeCount == 0 {
-		return MessageProcessChanged{}, false
-	}
-	add, del := make(map[gen.Atom]ProcessInfo), make(map[gen.Atom]ProcessInfo)
-	for j := start; j < end; j++ {
-		idx := (w.procChangeStart + j) % w.changeBufferCap
-		item := w.procChangeBuffer[idx]
-		for _, val := range item.UpProcess {
-			add[val.Name] = val
-			delete(del, val.Name)
-		}
-		for _, val := range item.DownProcess {
-			del[val.Name] = val
-			delete(add, val.Name)
-		}
-	}
-	toList := func(v map[gen.Atom]ProcessInfo) []ProcessInfo {
-		var arr []ProcessInfo
-		for _, item := range v {
-			arr = append(arr, item)
-		}
-		return arr
-	}
-	lastIdx := (w.procChangeStart + end - 1) % w.changeBufferCap
-	return MessageProcessChanged{
-		Node:        w.Node().Name(),
-		UpProcess:   toList(add),
-		DownProcess: toList(del),
-		Version:     w.procChangeBuffer[lastIdx].Version,
-	}, true
 }
 
 func (w *whereis) getNodeVersion(node gen.Atom) (int, error) {
@@ -597,32 +378,16 @@ func (w *whereis) getNodeVersion(node gen.Atom) (int, error) {
 	return -1, nil
 }
 
-func (w *whereis) flushProcess(pid gen.PID) error {
-	if w.registrar == nil {
-		return nil
-	}
-	info, err := w.Node().ProcessInfo(pid)
-	if err != nil {
-		return err
-	}
-	if info.Name == "" {
-		return nil
-	}
-	version, err := w.getNodeVersion(w.Node().Name())
-	if err != nil {
-		return err
-	}
-	return w.book.Storage().Set(w.Node().Name(), info.Name, version)
-}
-
 func (w *whereis) Terminate(reason error) {
-	w.book.RemoveProcess(w.Node().Name(), w.processCache.Load().(ProcessInfoList)...)
 }
 
-func (w *whereis) HandleEvent(event gen.MessageEvent) error {
-	switch event.Message.(type) {
-	case zk.EventNodeJoined, zk.EventNodeLeft:
-		w.fetchAvailableBookNodes()
+func (w *whereis) handleTopologyChange() {
+	localProcs := w.processCache.Load().(ProcessInfoList)
+	msg := MessageProcessChanged{
+		Node:      w.Node().Name(),
+		UpProcess: localProcs,
+		Version:   w.selfVersion,
+		FullSync:  true,
 	}
-	return nil
+	w.registerToShards(msg)
 }

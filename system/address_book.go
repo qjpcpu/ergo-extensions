@@ -1,11 +1,11 @@
 package system
 
 import (
+	"math"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"ergo.services/ergo/gen"
 
@@ -13,12 +13,19 @@ import (
 	"github.com/cespare/xxhash"
 )
 
+// IAddressBookQuery defines the interface for performing distributed queries on the address book.
+type IAddressBookQuery interface {
+	// Locate performs a global lookup for a process name across the cluster.
+	// This operation involves network communication and may fail due to timeouts.
+	Locate(processName gen.Atom) (node gen.Atom, err error)
+}
+
 // IAddressBook defines address book interface
 type IAddressBook interface {
-	Locate(process gen.Atom) (gen.Atom, bool)
+	QueryBy(caller gen.Process) IAddressBookQuery
 	PickNode(process gen.Atom) gen.Atom
+	PickDirectoryNode(process gen.Atom) gen.Atom
 	GetAvailableNodes() *NodeList
-	LastModified() int64
 }
 
 // AddressBook is a registry for all processes running on all nodes
@@ -26,44 +33,36 @@ type IAddressBook interface {
 type AddressBook struct {
 	mu             sync.RWMutex
 	nodes          map[gen.Atom]struct{} // all available nodes
-	nodesCache     atomic.Value          // cache for available nodes to avoid frequent lock
 	processToNodes map[gen.Atom][]gen.Atom
 	nodeProcesses  map[gen.Atom]map[gen.Atom]ProcessInfo
 	ring           *consistent.Consistent // consistent hashing ring
-	registrar      gen.Registrar
-	lastModified   *atomic.Int64
-	st             IAddressBookStorage
-	self           gen.Atom
+	dirRing        *consistent.Consistent // directory hashing ring
+	nodesCache     atomic.Value           // cache for available nodes to avoid frequent lock
 }
 
 // NewAddressBook creates a new AddressBook
-func NewAddressBook(storage IAddressBookStorage) *AddressBook {
+func NewAddressBook() *AddressBook {
 	var c atomic.Value
 	c.Store(NewNodeList())
-	var lm atomic.Int64
-	lm.Store(time.Now().Unix())
-	if storage == nil {
-		storage = dummyStorage{}
-	}
-	storage = OmitSystemProcess(storage)
 	return &AddressBook{
 		nodes:          make(map[gen.Atom]struct{}),
 		processToNodes: make(map[gen.Atom][]gen.Atom),
 		nodeProcesses:  make(map[gen.Atom]map[gen.Atom]ProcessInfo),
 		ring:           makeRing(),
+		dirRing:        makeRing(),
 		nodesCache:     c,
-		lastModified:   &lm,
-		st:             storage,
 	}
 }
 
 // Locate returns a process information by its registered name.
-func (book *AddressBook) Locate(process gen.Atom) (gen.Atom, bool) {
-	v, ok := book.locateFromMem(process)
-	if ok {
-		return v, true
-	}
-	return book.locateFromStorage(process)
+func (book *AddressBook) QueryBy(caller gen.Process) IAddressBookQuery {
+	return newBookQuery(caller)
+}
+
+// LocateLocal returns a process information by its registered name.
+// Note: this only contains local data and should not be used for global process discovery.
+func (book *AddressBook) LocateLocal(process gen.Atom) (gen.Atom, bool) {
+	return book.locateFromMem(process)
 }
 
 // GetProcessList returns a list of processes running on the given node.
@@ -92,7 +91,7 @@ func (book *AddressBook) locate(process gen.Atom) (ProcessInfo, bool) {
 	// Read-view convergence: processToNodes may temporarily contain multiple nodes
 	// for the same process name (during concurrent updates or membership churn).
 	// The slice is kept sorted and de-duplicated. Among online nodes that still
-	// report this process, Locate selects the oldest instance (smallest BirthAt).
+	// report this process, LocateLocal selects the oldest instance (smallest BirthAt).
 	// If BirthAt is equal, the sorted node order provides a deterministic winner.
 	nodes, ok := book.processToNodes[process]
 	if !ok {
@@ -116,19 +115,6 @@ func (book *AddressBook) locate(process gen.Atom) (ProcessInfo, bool) {
 	return olderp, olderp.Node != ""
 }
 
-func (book *AddressBook) locateFromStorage(process gen.Atom) (gen.Atom, bool) {
-	node, ver, err := book.st.Get(process)
-	if err != nil || node == "" {
-		return "", false
-	}
-	if val, err := book.nodeVersion(node); err != nil {
-		return "", false
-	} else if val == ver {
-		return node, true
-	}
-	return "", false
-}
-
 // SetProcess sets a list of processes for the given node.
 // It removes all previously registered processes for this node.
 func (book *AddressBook) SetProcess(node gen.Atom, ps ...ProcessInfo) error {
@@ -144,9 +130,6 @@ func (book *AddressBook) SetProcess(node gen.Atom, ps ...ProcessInfo) error {
 			process.Node = node
 			newProcesses[name] = process
 			book.processToNodes[name] = unifyNodes(append(book.processToNodes[name], node))
-			if node == book.self {
-				book.st.Set(node, name, process.Version)
-			}
 		}
 	}
 
@@ -159,14 +142,10 @@ func (book *AddressBook) SetProcess(node gen.Atom, ps ...ProcessInfo) error {
 			} else {
 				book.processToNodes[name] = arr
 			}
-			if node == book.self {
-				book.st.Remove(node, name, oldProcesses[name].Version)
-			}
 		}
 	}
 
 	book.nodeProcesses[node] = newProcesses
-	book.lastModified.Store(time.Now().Unix())
 	return nil
 }
 
@@ -188,13 +167,9 @@ func (book *AddressBook) AddProcess(node gen.Atom, ps ...ProcessInfo) error {
 			process.Node = node
 			processes[name] = process
 			book.processToNodes[name] = unifyNodes(append(book.processToNodes[name], node))
-			if node == book.self {
-				book.st.Set(node, name, process.Version)
-			}
 		}
 	}
 	book.nodeProcesses[node] = processes
-	book.lastModified.Store(time.Now().Unix())
 	return nil
 }
 
@@ -219,18 +194,10 @@ func (book *AddressBook) RemoveProcess(node gen.Atom, ps ...ProcessInfo) error {
 					book.processToNodes[name] = arr
 				}
 				delete(processes, name)
-				if node == book.self {
-					book.st.Remove(node, name, old.Version)
-				}
-				book.lastModified.Store(time.Now().Unix())
 			}
 		}
 	}
 	return nil
-}
-
-func (book *AddressBook) LastModified() int64 {
-	return book.lastModified.Load()
 }
 
 // SetAvailableNodes sets a list of available nodes.
@@ -238,7 +205,22 @@ func (book *AddressBook) SetAvailableNodes(nodes *NodeList) error {
 	book.mu.Lock()
 	defer book.mu.Unlock()
 	var isChanged bool
+
+	n := nodes.Len()
+	dirNodeCount := 5
+	if n > 25 {
+		dirNodeCount = int(math.Sqrt(float64(n)))
+		if dirNodeCount < 5 {
+			dirNodeCount = 5
+		}
+	}
+
+	dirNodes := make(map[gen.Atom]struct{})
 	nodes.Range(func(item gen.Atom) bool {
+		// Update directory ring: pick top N nodes as directory nodes
+		if len(dirNodes) < dirNodeCount {
+			dirNodes[item] = struct{}{}
+		}
 		if _, ok := book.nodes[item]; !ok {
 			book.nodes[item] = struct{}{}
 			book.ring.Add(Member(item))
@@ -246,6 +228,25 @@ func (book *AddressBook) SetAvailableNodes(nodes *NodeList) error {
 		isChanged = true
 		return true
 	})
+
+	// Refresh dirRing: simplest way is to rebuild it if set of nodes changed
+	// but let's be more efficient.
+	currentDirNodes := make(map[gen.Atom]struct{})
+	for _, m := range book.dirRing.GetMembers() {
+		currentDirNodes[gen.Atom(m.String())] = struct{}{}
+	}
+
+	for node := range dirNodes {
+		if _, ok := currentDirNodes[node]; !ok {
+			book.dirRing.Add(Member(node))
+		}
+	}
+	for node := range currentDirNodes {
+		if _, ok := dirNodes[node]; !ok {
+			book.dirRing.Remove(string(node))
+		}
+	}
+
 	for item := range book.nodes {
 		if !nodes.Exist(item) {
 			book.ring.Remove(string(item))
@@ -253,11 +254,11 @@ func (book *AddressBook) SetAvailableNodes(nodes *NodeList) error {
 			isChanged = true
 			// Clean up process indices for the node that has been removed.
 			// Scenario: when a node goes offline, actors (named processes) may migrate to other nodes.
-			// If the old node comes back, stale mappings could make Locate() return the old node,
+			// If the old node comes back, stale mappings could make LocateLocal() return the old node,
 			// causing abnormal re-location or misrouting.
 			// Action: for each process previously recorded on this node, remove the node from
 			// the reverse index (processToNodes) and delete the node's process table entry.
-			// Effect: AddressBook remains consistent with the current membership; Locate/PickNode
+			// Effect: AddressBook remains consistent with the current membership; LocateLocal/PickNode
 			// won't point to offline or outdated nodes, preventing incorrect actor placement on rejoin.
 			for proc := range book.nodeProcesses[item] {
 				arr := removeNode(book.processToNodes[proc], item)
@@ -275,6 +276,19 @@ func (book *AddressBook) SetAvailableNodes(nodes *NodeList) error {
 	}
 
 	return nil
+}
+
+// PickDirectoryNode returns a directory node name by the given process name using consistent hashing.
+func (book *AddressBook) PickDirectoryNode(process gen.Atom) gen.Atom {
+	if process == "" {
+		return gen.Atom("")
+	}
+	book.mu.RLock()
+	defer book.mu.RUnlock()
+	if m := book.dirRing.LocateKey([]byte(process)); m != nil {
+		return gen.Atom(m.String())
+	}
+	return gen.Atom("")
 }
 
 // GetAvailableNodes returns a list of available nodes.
@@ -379,29 +393,26 @@ func shortInfo(ps []ProcessInfo) string {
 	return "(" + strings.Join(arr, ",") + ")"
 }
 
-func (book *AddressBook) SetRegistrar(r gen.Registrar) error {
-	book.registrar = r
-	return nil
+func newBookQuery(caller gen.Process) IAddressBookQuery {
+	return &bookQuery{caller: caller}
 }
 
-func (book *AddressBook) SetSelfNode(n gen.Atom) error {
-	book.self = n
-	return nil
+type bookQuery struct {
+	caller gen.Process
 }
 
-func (book *AddressBook) Storage() IAddressBookStorage {
-	return book.st
-}
-
-func (book *AddressBook) nodeVersion(node gen.Atom) (int, error) {
-	if r := book.registrar; r != nil {
-		val, err := r.ConfigItem(string(node))
-		if err != nil {
-			return -1, err
-		}
-		if ver, ok := val.(int); ok {
-			return ver, nil
-		}
+func (query *bookQuery) Locate(processName gen.Atom) (node gen.Atom, err error) {
+	if processName == "" {
+		return
 	}
-	return -1, nil
+	res, err := query.caller.CallWithTimeout(WhereIsProcess, MessageLocate{Name: processName}, 5)
+	if err != nil {
+		return "", err
+	}
+	var ok bool
+	node, ok = res.(gen.Atom)
+	if !ok {
+		return "", gen.ErrProcessUnknown
+	}
+	return node, nil
 }

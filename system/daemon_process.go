@@ -3,8 +3,10 @@ package system
 import (
 	"errors"
 	"fmt"
+	"math/rand"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"ergo.services/ergo/act"
@@ -24,20 +26,20 @@ type daemon struct {
 	cancelLaunchAll gen.CancelFunc
 }
 
-func factory_daemon(book IAddressBook) gen.ProcessFactory {
+func factoryDaemon(book IAddressBook) gen.ProcessFactory {
 	return func() gen.ProcessBehavior { return &daemon{book: book} }
 }
 
 func (w *daemon) Init(args ...any) error {
-	w.SendAfter(w.PID(), start_init{}, time.Second*1)
+	w.SendAfter(w.PID(), messageInit{}, time.Second*1)
 	return nil
 }
 
 func (w *daemon) HandleMessage(from gen.PID, message any) error {
 	switch e := message.(type) {
-	case start_init:
+	case messageInit:
 		if err := w.setupRegistrarMonitoring(); err != nil {
-			w.SendAfter(w.PID(), start_init{}, time.Second*1)
+			w.SendAfter(w.PID(), messageInit{}, time.Second*1)
 		} else {
 			w.launchAllAfter(time.Second * 10)
 		}
@@ -80,6 +82,9 @@ func (w *daemon) launchAllAfter(duration time.Duration) {
 		cancel()
 		w.cancelLaunchAll = nil
 	}
+	// Add jitter to avoid synchronized leader recovery in case of registrar issues
+	// or multiple nodes triggering at once.
+	duration += time.Duration(rand.Intn(1000)) * time.Millisecond
 	if duration <= 0 {
 		w.Send(w.PID(), MessageLaunchAllDaemon{})
 	} else {
@@ -165,8 +170,9 @@ func (w *daemon) launchDaemonOnNode(node gen.Atom, launcher Launcher, proc Daemo
 			err = fmt.Errorf("panic when launch daemon %s: %v", launcher.name, r)
 		}
 	}()
-	if _, ok := w.book.Locate(proc.ProcessName); ok {
-		return
+	if runningNode, _ := w.book.QueryBy(w).Locate(proc.ProcessName); runningNode != "" {
+		w.Log().Info("daemon process %s already exists on %s", proc.ProcessName, runningNode)
+		return nil
 	}
 	if node == w.Node().Name() {
 		_, err = w.SpawnRegister(proc.ProcessName, launcher.Factory, launcher.Option, proc.Args...)
@@ -191,9 +197,24 @@ func (w *daemon) launchDaemonOnNode(node gen.Atom, launcher Launcher, proc Daemo
 	return
 }
 
+func (w *daemon) HandleCall(from gen.PID, ref gen.Ref, request any) (any, error) {
+	if s, ok := request.(string); ok && s == "inspect" {
+		return w.HandleInspect(from), nil
+	}
+	return nil, nil
+}
+
 func (w *daemon) HandleInspect(from gen.PID, item ...string) map[string]string {
 	stats := map[string]string{
 		"is_leader": strconv.FormatBool(w.isLeader),
+	}
+	var daemonNames []string
+	launchers.Range(func(key, value any) bool {
+		daemonNames = append(daemonNames, string(key.(gen.Atom)))
+		return true
+	})
+	if len(daemonNames) > 0 {
+		stats["daemons"] = strings.Join(daemonNames, ",")
 	}
 	if r := w.registrar; r != nil {
 		if n, err := r.ConfigItem(zk.LeaderNodeConfigItem); err == nil {

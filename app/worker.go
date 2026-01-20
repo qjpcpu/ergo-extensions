@@ -56,6 +56,12 @@ type messageNodeCall struct {
 	ch  chan nodeResult
 }
 
+type messageNodeCallLocal struct {
+	to  string
+	msg any
+	ch  chan nodeResult
+}
+
 type messageWaitProcess struct {
 	PID gen.PID
 	Ch  chan error
@@ -72,19 +78,24 @@ type messageSpawnProcess struct {
 func (w *myworker) HandleMessage(from gen.PID, message any) error {
 	switch e := message.(type) {
 	case messageNodeSend:
-		if p, ok := w.book.Locate(gen.Atom(e.to)); !ok || w.Node().Name() == p {
+		p, err := w.book.QueryBy(w).Locate(gen.Atom(e.to))
+		if err != nil || p == "" || w.Node().Name() == p {
 			e.ch <- nodeResult{err: w.Send(gen.Atom(e.to), e.msg)}
 		} else {
 			e.ch <- nodeResult{err: w.SendImportant(gen.ProcessID{Node: p, Name: gen.Atom(e.to)}, e.msg)}
 		}
 	case messageNodeCall:
-		if p, ok := w.book.Locate(gen.Atom(e.to)); !ok || w.Node().Name() == p {
+		p, err := w.book.QueryBy(w).Locate(gen.Atom(e.to))
+		if err != nil || p == "" || w.Node().Name() == p {
 			res, err := w.Call(gen.Atom(e.to), e.msg)
 			e.ch <- nodeResult{response: res, err: err}
 		} else {
 			res, err := w.CallImportant(gen.ProcessID{Node: p, Name: gen.Atom(e.to)}, e.msg)
 			e.ch <- nodeResult{response: res, err: err}
 		}
+	case messageNodeCallLocal:
+		res, err := w.Call(gen.Atom(e.to), e.msg)
+		e.ch <- nodeResult{response: res, err: err}
 	case messageSpawnProcess:
 		sendResp := func(err error) {
 			if e.Ch != nil {

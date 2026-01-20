@@ -19,14 +19,13 @@ func newApp(book *system.AddressBook, opts SimpleNodeOptions) *simpleApp {
 
 func (app *simpleApp) Load(node gen.Node, args ...any) (gen.ApplicationSpec, error) {
 	var members []gen.ApplicationMemberSpec
-	opts := system.ApplicationMemberSepcOptions{
+	opts := system.ApplicationMemberSpecOptions{
 		CronJobs:                app.opts.CronJobs,
 		SyncAddressBookInterval: app.opts.SyncProcessInterval,
-		AddressBookBuffer:       app.opts.ProcessChangeBuffer,
 		AddressBook:             app.book,
 	}
 	members = append([]gen.ApplicationMemberSpec{
-		system.ApplicationMemberSepc(opts)},
+		system.ApplicationMemberSpec(opts)},
 		app.opts.MemberSpecs...,
 	)
 	return gen.ApplicationSpec{

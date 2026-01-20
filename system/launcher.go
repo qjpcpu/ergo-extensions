@@ -27,6 +27,11 @@ func GetLauncher(name gen.Atom) (Launcher, bool) {
 	return Launcher{}, false
 }
 
+// UnregisterLauncher unregisters a launcher by its name.
+func UnregisterLauncher(name gen.Atom) {
+	launchers.Delete(name)
+}
+
 func NewSpawner(parent gen.Process, launcher gen.Atom) Spawner {
 	return Spawner{parent: parent, launcher: launcher}
 }

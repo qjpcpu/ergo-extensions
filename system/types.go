@@ -9,30 +9,22 @@ import (
 )
 
 type (
-	start_init           struct{}
-	inspect_process_list struct{}
-	schedule_cronjob     struct{}
-	MessageLocate        struct {
+	messageInit           struct{}
+	messageInspectProcess struct{}
+	messageTopologyChange struct {
+		ID int64
+	}
+	messageScheduleCron struct{}
+	MessageLocate       struct {
 		Name gen.Atom
 	}
-	MessageFlushProcess struct {
-		PID gen.PID
+	MessageForwardLocate struct {
+		Name gen.Atom
+		From gen.PID
+		Ref  gen.Ref
 	}
-	MessageFetchProcessReply struct {
-		Origin  gen.Atom
-		FetchID uint64
-		Kind    uint8
-		Base    ProcessVersion
-		Changed MessageProcessChanged
-		Full    MessageProcesses
-	}
-	ProcessVersion     [2]int64
-	NodeProcessVersion struct {
-		Node    gen.Atom
-		Version ProcessVersion
-	}
-	VersionSet  []NodeProcessVersion
-	ProcessInfo struct {
+	ProcessVersion [2]int64
+	ProcessInfo    struct {
 		// Node is the node name hosting this process.
 		Node gen.Atom
 		// PID is the process identifier.
@@ -49,23 +41,9 @@ type (
 		UpProcess   []ProcessInfo
 		DownProcess []ProcessInfo
 		Version     ProcessVersion
+		FullSync    bool
 	}
-	MessageFetchProcessList struct {
-		Node       gen.Atom
-		FetchID    uint64
-		VersionSet VersionSet
-	}
-	MessageProcesses struct {
-		Node        gen.Atom
-		ProcessList []ProcessInfo
-		Version     ProcessVersion
-	}
-	ProcessInfoList    []ProcessInfo
-	MessageProcessList struct {
-		Node        gen.Atom
-		ProcessList ProcessInfoList
-		Version     ProcessVersion
-	}
+	ProcessInfoList       []ProcessInfo
 	MessageGetAddressBook struct{}
 	MessageAddressBook    struct {
 		Owner gen.PID
@@ -80,18 +58,12 @@ type (
 
 func init() {
 	types := []any{
-		MessageFlushProcess{},
 		ProcessVersion{},
-		NodeProcessVersion{},
-		VersionSet{},
 		ProcessInfo{},
 		ProcessInfoList{},
 		MessageProcessChanged{},
-		MessageProcesses{},
-		MessageFetchProcessList{},
-		MessageFetchProcessReply{},
-		MessageProcessList{},
 		MessageLocate{},
+		MessageForwardLocate{},
 		MessageLaunchAllDaemon{},
 		DaemonProcess{},
 		MessageLaunchOneDaemon{},
@@ -128,40 +100,4 @@ func (v ProcessVersion) String() string {
 
 func NewVersion() ProcessVersion {
 	return [2]int64{time.Now().UnixNano(), 0}
-}
-func NewEmptyVersion() ProcessVersion {
-	return [2]int64{0, 0}
-}
-
-func (vs VersionSet) Size() int {
-	return len(vs)
-}
-
-func (vs VersionSet) NextNode() (node gen.Atom) {
-	return vs[len(vs)-1].Node
-}
-
-func (vs VersionSet) Next() NodeProcessVersion {
-	return vs[len(vs)-1]
-}
-
-func (vs VersionSet) Drop() VersionSet {
-	ret := vs[:len(vs)-1]
-	return ret
-}
-
-func (vs VersionSet) MoveNodeToNext(node gen.Atom) VersionSet {
-	for i, item := range vs {
-		if item.Node == node && i < len(vs)-1 {
-			set := make(VersionSet, 0, len(vs))
-			for j := i + 1; j < len(vs); j++ {
-				set = append(set, vs[j])
-			}
-			for j := 0; j <= i; j++ {
-				set = append(set, vs[j])
-			}
-			return set
-		}
-	}
-	return vs
 }

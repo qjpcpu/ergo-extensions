@@ -3,6 +3,7 @@ package system
 import (
 	"encoding/json"
 	"errors"
+	"math/rand"
 	"time"
 
 	"ergo.services/ergo/act"
@@ -50,9 +51,10 @@ type cron struct {
 	local, cluster  []CronJob
 	startOnSelfJobs map[gen.Atom]struct{}
 	cancelSchedule  gen.CancelFunc
+	locBJ           *time.Location
 }
 
-func factory_cron(jobs []CronJob) gen.ProcessFactory {
+func factoryCron(jobs []CronJob) gen.ProcessFactory {
 	local, cluster := splitJobs(jobs)
 	return func() gen.ProcessBehavior {
 		return &cron{
@@ -80,21 +82,29 @@ func (w *cron) Init(args ...any) error {
 	if len(w.local) == 0 && len(w.cluster) == 0 {
 		return nil
 	}
-	w.SendAfter(w.PID(), start_init{}, time.Second*3)
+	// Add jitter to avoid synchronized initialization
+	delay := time.Second*3 + time.Duration(rand.Intn(1000))*time.Millisecond
+	w.SendAfter(w.PID(), messageInit{}, delay)
 	return nil
 }
 
 func (w *cron) HandleMessage(from gen.PID, message any) error {
 	switch message.(type) {
-	case start_init:
+	case messageInit:
 		if err := w.setupRegistrarMonitoring(); err != nil {
-			w.SendAfter(w.PID(), start_init{}, time.Second*5)
+			w.SendAfter(w.PID(), messageInit{}, time.Second*5)
 		} else {
 			w.turnOnLocalCronJobs()
-			w.turnOnClusterCronJobs()
+			if err := w.turnOnClusterCronJobs(); err != nil {
+				w.Log().Error("turn on cluster cron jobs fail: %v, retry in 5s", err)
+				w.SendAfter(w.PID(), messageInit{}, time.Second*5)
+			}
 		}
-	case schedule_cronjob:
-		w.turnOnClusterCronJobs()
+	case messageScheduleCron:
+		if err := w.turnOnClusterCronJobs(); err != nil {
+			w.Log().Error("schedule cluster cron jobs fail: %v, retry in 5s", err)
+			w.scheduleClusterCronJobs()
+		}
 	}
 	return nil
 }
@@ -142,7 +152,9 @@ func (w *cron) scheduleClusterCronJobs() error {
 		w.cancelSchedule()
 		w.cancelSchedule = nil
 	}
-	if cancel, err := w.SendAfter(w.PID(), schedule_cronjob{}, time.Second*5); err == nil {
+	// Add jitter to avoid synchronized cluster cron jobs scheduling
+	delay := time.Second*5 + time.Duration(rand.Intn(1000))*time.Millisecond
+	if cancel, err := w.SendAfter(w.PID(), messageScheduleCron{}, delay); err == nil {
 		w.cancelSchedule = cancel
 	}
 	return nil
@@ -202,8 +214,11 @@ func (w *cron) getLoc(loc CronJobLocation) *time.Location {
 	case CronJobLocationUTC:
 		return time.UTC
 	default:
-		bj, _ := time.LoadLocation("Asia/Shanghai")
-		return bj
+		if w.locBJ == nil {
+			bj, _ := time.LoadLocation("Asia/Shanghai")
+			w.locBJ = bj
+		}
+		return w.locBJ
 	}
 }
 
@@ -213,6 +228,18 @@ func (w *cron) HandleEvent(event gen.MessageEvent) error {
 		w.scheduleClusterCronJobs()
 	}
 	return nil
+}
+
+func (w *cron) HandleCall(from gen.PID, ref gen.Ref, request any) (any, error) {
+	switch request.(type) {
+	case string:
+		if request.(string) == "inspect" {
+			return w.HandleInspect(from), nil
+		}
+	case messageInspectProcess:
+		return w.HandleInspect(from), nil
+	}
+	return nil, gen.ErrUnsupported
 }
 
 func (w *cron) HandleInspect(from gen.PID, item ...string) map[string]string {

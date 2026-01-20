@@ -19,7 +19,7 @@ type nodeImpl struct {
 }
 
 func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
-	book := system.NewAddressBook(opts.AddressBookStorage)
+	book := system.NewAddressBook()
 	var options gen.NodeOptions
 	if len(opts.Options.Endpoints) != 0 {
 		registrar, err := zk.Create(opts.Options)
@@ -122,6 +122,23 @@ func (n *nodeImpl) ForwardSend(to string, msg any) error {
 	return nil
 }
 
+func (n *nodeImpl) CallLocal(to string, msg any) (any, error) {
+	ch := make(chan nodeResult, 1)
+	err := n.Send(n.route, messageNodeCallLocal{
+		to:  to,
+		msg: msg,
+		ch:  ch,
+	})
+	if err != nil {
+		return nil, err
+	}
+	res := <-ch
+	if res.err != nil {
+		return nil, res.err
+	}
+	return res.response, nil
+}
+
 func (n *nodeImpl) ForwardCall(to string, msg any) (any, error) {
 	ch := make(chan nodeResult, 1)
 	err := n.Send(n.route, messageNodeCall{
@@ -162,8 +179,14 @@ func (n *nodeImpl) ForwardSpawn(fac gen.ProcessFactory, args ...any) error {
 }
 
 func (n *nodeImpl) LocateProcess(process gen.Atom) gen.Atom {
-	p, _ := n.book.Locate(process)
-	return p
+	res, err := n.ForwardCall(string(system.WhereIsProcess), system.MessageLocate{Name: process})
+	if err != nil {
+		return ""
+	}
+	if p, ok := res.(gen.Atom); ok {
+		return p
+	}
+	return ""
 }
 
 func (n *nodeImpl) AddressBook() system.IAddressBook {
