@@ -24,6 +24,7 @@ The project is built using standard Go toolchains (Go 1.24+).
 - **Naming**: Follows standard Go conventions (CamelCase).
 - **Patterns**: Heavily uses the Ergo/Erlang actor model (`gen.ProcessBehavior`, `gen.ApplicationBehavior`).
 - **Communication**: Inter-process communication via `self.Send`, `self.Call`, and `self.Cast`.
+- **Interaction**: Prefer using Chinese for communication and interaction with the user.
 - **Comments**: Always write comments in english.
 
 ## 4. Testing

@@ -24,10 +24,11 @@ type daemon struct {
 	registrar       gen.Registrar
 	isLeader        bool
 	cancelLaunchAll gen.CancelFunc
+	recovered       map[gen.Atom]struct{}
 }
 
 func factoryDaemon(book IAddressBook) gen.ProcessFactory {
-	return func() gen.ProcessBehavior { return &daemon{book: book} }
+	return func() gen.ProcessBehavior { return &daemon{book: book, recovered: make(map[gen.Atom]struct{})} }
 }
 
 func (w *daemon) Init(args ...any) error {
@@ -45,7 +46,10 @@ func (w *daemon) HandleMessage(from gen.PID, message any) error {
 		}
 	case MessageLaunchAllDaemon:
 		if err := w.leaderShouldRecoverDaemon(); err != nil {
-			w.launchAllAfter(time.Second * 10)
+			w.launchAllAfter(time.Second * 60)
+		} else {
+			w.recovered = make(map[gen.Atom]struct{})
+			w.launchAllAfter(time.Minute * 15)
 		}
 	case MessageLaunchOneDaemon:
 		val, ok := launchers.Load(e.Launcher)
@@ -63,16 +67,19 @@ func (w *daemon) HandleEvent(event gen.MessageEvent) error {
 	case zk.EventNodeSwitchedToLeader:
 		if e.Name == w.Node().Name() {
 			w.isLeader = true
+			w.recovered = make(map[gen.Atom]struct{})
 			w.launchAllAfter(time.Second * 10)
 			return nil
 		}
 	case zk.EventNodeSwitchedToFollower:
 		if e.Name == w.Node().Name() {
 			w.isLeader = false
+			w.recovered = make(map[gen.Atom]struct{})
 			return nil
 		}
 	case zk.EventNodeLeft:
-		w.launchAllAfter(time.Second * 10)
+		w.recovered = make(map[gen.Atom]struct{})
+		w.launchAllAfter(time.Second * 60)
 	}
 	return nil
 }
@@ -145,12 +152,13 @@ func (w *daemon) recoverDaemon(launcher Launcher) error {
 			return err
 		}
 		for _, proc := range processList {
-			node := w.book.PickNode(proc.ProcessName)
-			if node == "" {
-				return ErrNoAvailableNodes
+			if _, ok := w.recovered[proc.ProcessName]; ok {
+				continue
 			}
-			if err = w.launchDaemonOnNode(node, launcher, proc); err != nil {
+			if err = w.pickNodeAndLaunchDaemon(launcher, proc); err != nil {
 				retErr = err
+			} else {
+				w.recovered[proc.ProcessName] = struct{}{}
 			}
 		}
 		if !hasMore {
@@ -164,13 +172,26 @@ func (w *daemon) recoverDaemon(launcher Launcher) error {
 	return retErr
 }
 
+func (w *daemon) pickNodeAndLaunchDaemon(launcher Launcher, proc DaemonProcess) error {
+	node := w.book.PickNode(proc.ProcessName)
+	if node == "" {
+		return ErrNoAvailableNodes
+	}
+	return w.launchDaemonOnNode(node, launcher, proc)
+}
+
 func (w *daemon) launchDaemonOnNode(node gen.Atom, launcher Launcher, proc DaemonProcess) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic when launch daemon %s: %v", launcher.name, r)
 		}
 	}()
-	if runningNode, _ := w.book.QueryBy(w).Locate(proc.ProcessName); runningNode != "" {
+	runningNode, err := w.book.QueryBy(w).Locate(proc.ProcessName)
+	if err != nil {
+		w.Log().Warning("locate daemon process %s fail: %v, will retry later", proc.ProcessName, err)
+		return err
+	}
+	if runningNode != "" {
 		w.Log().Info("daemon process %s already exists on %s", proc.ProcessName, runningNode)
 		return nil
 	}
@@ -206,7 +227,8 @@ func (w *daemon) HandleCall(from gen.PID, ref gen.Ref, request any) (any, error)
 
 func (w *daemon) HandleInspect(from gen.PID, item ...string) map[string]string {
 	stats := map[string]string{
-		"is_leader": strconv.FormatBool(w.isLeader),
+		"is_leader":       strconv.FormatBool(w.isLeader),
+		"recovered_count": strconv.Itoa(len(w.recovered)),
 	}
 	var daemonNames []string
 	launchers.Range(func(key, value any) bool {
