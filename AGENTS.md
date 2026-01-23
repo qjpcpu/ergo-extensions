@@ -25,7 +25,10 @@ The project is built using standard Go toolchains (Go 1.24+).
 - **Patterns**: Heavily uses the Ergo/Erlang actor model (`gen.ProcessBehavior`, `gen.ApplicationBehavior`).
 - **Communication**: Inter-process communication via `self.Send`, `self.Call`, and `self.Cast`.
 - **Interaction**: Prefer using Chinese for communication and interaction with the user.
-- **Comments**: Always write comments in english.
+- **Comments**:
+  - Always write comments in English.
+  - Use `//` for comments on the same line as code.
+  - Use `/* ... */` for comments on their own line or multi-line comments.
 
 ## 4. Testing
 - **Framework**: Standard Go `testing` package.
