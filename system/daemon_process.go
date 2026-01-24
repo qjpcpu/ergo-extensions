@@ -186,7 +186,7 @@ func (w *daemon) launchDaemonOnNode(node gen.Atom, launcher Launcher, proc Daemo
 			err = fmt.Errorf("panic when launch daemon %s: %v", launcher.name, r)
 		}
 	}()
-	runningNode, err := w.book.QueryBy(w).Locate(proc.ProcessName)
+	runningNode, err := w.book.QueryBy(w, QueryOption{Timeout: 15}).Locate(proc.ProcessName)
 	if err != nil {
 		w.Log().Warning("locate daemon process %s fail: %v, will retry later", proc.ProcessName, err)
 		return err

@@ -13,6 +13,12 @@ import (
 	"github.com/cespare/xxhash"
 )
 
+// QueryOption defines the options for process lookup.
+type QueryOption struct {
+	// Timeout specifies the query timeout in seconds.
+	Timeout int
+}
+
 // IAddressBookQuery defines the interface for performing distributed queries on the address book.
 type IAddressBookQuery interface {
 	// Locate performs a global lookup for a process name across the cluster.
@@ -22,7 +28,7 @@ type IAddressBookQuery interface {
 
 // IAddressBook defines address book interface
 type IAddressBook interface {
-	QueryBy(caller gen.Process) IAddressBookQuery
+	QueryBy(caller gen.Process, option QueryOption) IAddressBookQuery
 	PickNode(process gen.Atom) gen.Atom
 	PickDirectoryNode(process gen.Atom) gen.Atom
 	GetAvailableNodes() *NodeList
@@ -55,8 +61,8 @@ func NewAddressBook() *AddressBook {
 }
 
 // Locate returns a process information by its registered name.
-func (book *AddressBook) QueryBy(caller gen.Process) IAddressBookQuery {
-	return newBookQuery(caller)
+func (book *AddressBook) QueryBy(caller gen.Process, option QueryOption) IAddressBookQuery {
+	return newBookQuery(caller, book, option)
 }
 
 // LocateLocal returns a process information by its registered name.
@@ -393,19 +399,35 @@ func shortInfo(ps []ProcessInfo) string {
 	return "(" + strings.Join(arr, ",") + ")"
 }
 
-func newBookQuery(caller gen.Process) IAddressBookQuery {
-	return &bookQuery{caller: caller}
+func newBookQuery(caller gen.Process, book *AddressBook, option QueryOption) IAddressBookQuery {
+	return &bookQuery{caller: caller, book: book, option: option}
 }
 
 type bookQuery struct {
 	caller gen.Process
+	book   *AddressBook
+	option QueryOption
 }
 
 func (query *bookQuery) Locate(processName gen.Atom) (node gen.Atom, err error) {
 	if processName == "" {
 		return
 	}
-	res, err := query.caller.CallWithTimeout(WhereIsProcess, MessageLocate{Name: processName}, 5)
+	owner := query.book.PickDirectoryNode(processName)
+	if owner == "" {
+		return "", ErrNoAvailableNodes
+	}
+	if owner == query.caller.Node().Name() {
+		if n, ok := query.book.LocateLocal(processName); ok {
+			return n, nil
+		}
+		return "", nil
+	}
+	res, err := query.caller.CallWithTimeout(
+		gen.ProcessID{Name: WhereIsProcess, Node: owner},
+		MessageLocate{Name: processName},
+		max(10, query.option.Timeout),
+	)
 	if err != nil {
 		return "", err
 	}

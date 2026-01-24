@@ -78,14 +78,14 @@ type messageSpawnProcess struct {
 func (w *myworker) HandleMessage(from gen.PID, message any) error {
 	switch e := message.(type) {
 	case messageNodeSend:
-		p, err := w.book.QueryBy(w).Locate(gen.Atom(e.to))
+		p, err := w.book.QueryBy(w, system.QueryOption{}).Locate(gen.Atom(e.to))
 		if err != nil || p == "" || w.Node().Name() == p {
 			e.ch <- nodeResult{err: w.Send(gen.Atom(e.to), e.msg)}
 		} else {
 			e.ch <- nodeResult{err: w.SendImportant(gen.ProcessID{Node: p, Name: gen.Atom(e.to)}, e.msg)}
 		}
 	case messageNodeCall:
-		p, err := w.book.QueryBy(w).Locate(gen.Atom(e.to))
+		p, err := w.book.QueryBy(w, system.QueryOption{}).Locate(gen.Atom(e.to))
 		if err != nil || p == "" || w.Node().Name() == p {
 			res, err := w.Call(gen.Atom(e.to), e.msg)
 			e.ch <- nodeResult{response: res, err: err}
