@@ -3,7 +3,6 @@ package system
 import (
 	"math/rand"
 	"strconv"
-	"sync/atomic"
 	"time"
 
 	"ergo.services/ergo/act"
@@ -23,32 +22,30 @@ type whereis struct {
 	selfVersion  ProcessVersion
 	nodeVersions map[gen.Atom]ProcessVersion
 
-	pidToName      map[gen.PID]gen.Atom
-	nameToBirthAt  map[gen.Atom]int64
-	nameToPID      map[gen.Atom]gen.PID
+	pidToName     map[gen.PID]gen.Atom
+	nameToBirthAt map[gen.Atom]int64
+	nameToPID     map[gen.Atom]gen.PID
 	// only includes named processes
-	processCache       atomic.Value
+	processCache       *zk.AtomicValue[ProcessInfoList]
 	inspectInterval    time.Duration
 	antiEntropyCounter int
 	topologyChangeID   int64
 }
 
 func factoryWhereIs(book *AddressBook, inspectInterval time.Duration) gen.ProcessFactory {
-	var v atomic.Value
-	v.Store(ProcessInfoList{})
 	if inspectInterval == 0 {
 		inspectInterval = time.Second * 3
 	}
 	return func() gen.ProcessBehavior {
 		return &whereis{
-			book:             book,
-			pidToName:        make(map[gen.PID]gen.Atom),
-			nameToPID:        make(map[gen.Atom]gen.PID),
-			nameToBirthAt:    make(map[gen.Atom]int64),
-			processCache:     v,
-			selfVersion:      NewVersion(),
-			nodeVersions:     make(map[gen.Atom]ProcessVersion),
-			inspectInterval:  inspectInterval,
+			book:            book,
+			pidToName:       make(map[gen.PID]gen.Atom),
+			nameToPID:       make(map[gen.Atom]gen.PID),
+			nameToBirthAt:   make(map[gen.Atom]int64),
+			processCache:    zk.NewAtomicValue[ProcessInfoList](),
+			selfVersion:     NewVersion(),
+			nodeVersions:    make(map[gen.Atom]ProcessVersion),
+			inspectInterval: inspectInterval,
 		}
 	}
 }
@@ -73,7 +70,7 @@ func (w *whereis) HandleMessage(from gen.PID, message any) error {
 		w.SendAfter(w.PID(), messageInspectProcess{}, delay)
 	case messageTopologyChange:
 		if e.ID == w.topologyChangeID {
-			w.handleTopologyChange()
+			w.handleTopologyChange(w.processCache.Load())
 		}
 	case MessageProcessChanged:
 		return w.handleProcessChanged(e)
@@ -226,9 +223,11 @@ func (w *whereis) inspectProcessList() error {
 	if w.antiEntropyCounter >= 100 {
 		w.antiEntropyCounter = 0
 		w.selfVersion = w.selfVersion.Incr()
-		w.handleTopologyChange()
+		localProcs := w.processCache.Load()
+		w.book.SetProcess(w.Node().Name(), localProcs...)
+		w.handleTopologyChange(localProcs)
 	} else {
-		w.syncLocalChanges(w.processCache.Load().(ProcessInfoList))
+		w.syncLocalChanges(w.processCache.Load())
 	}
 	return nil
 }
@@ -381,8 +380,7 @@ func (w *whereis) getNodeVersion(node gen.Atom) (int, error) {
 func (w *whereis) Terminate(reason error) {
 }
 
-func (w *whereis) handleTopologyChange() {
-	localProcs := w.processCache.Load().(ProcessInfoList)
+func (w *whereis) handleTopologyChange(localProcs ProcessInfoList) {
 	msg := MessageProcessChanged{
 		Node:      w.Node().Name(),
 		UpProcess: localProcs,
