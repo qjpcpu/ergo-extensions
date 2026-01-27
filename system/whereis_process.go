@@ -206,9 +206,7 @@ func (w *whereis) registerToShards(msg MessageProcessChanged) {
 	}
 
 	for owner, shardMsg := range shards {
-		if owner == w.Node().Name() {
-			w.handleProcessChanged(*shardMsg)
-		} else {
+		if owner != w.Node().Name() {
 			w.Send(gen.ProcessID{Node: owner, Name: WhereIsProcess}, *shardMsg)
 		}
 	}
