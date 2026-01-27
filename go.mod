@@ -2,7 +2,7 @@ module github.com/qjpcpu/ergo-extensions
 
 go 1.24
 
-replace ergo.services/registrar/zk => github.com/qjpcpu/registrar/zk v0.0.0-20260105135713-974cdd9e963f
+replace ergo.services/registrar/zk => github.com/qjpcpu/registrar/zk v0.0.0-20260127115641-c3e402c0d915
 
 require (
 	ergo.services/ergo v1.999.310
