@@ -166,7 +166,6 @@ func (w *daemon) recoverDaemon(launcher Launcher) error {
 		}
 		if len(processList) == 0 && hasMore {
 			w.Log().Warning("launcher %s fetch empty process list but hasMore=true", launcher.name)
-			break
 		}
 	}
 	return retErr
