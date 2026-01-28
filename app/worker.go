@@ -143,3 +143,41 @@ func (w *myworker) HandleMessage(from gen.PID, message any) error {
 	}
 	return nil
 }
+
+func NewCaller(process gen.Process) *Caller {
+	return &Caller{process: process}
+}
+
+type Caller struct {
+	process gen.Process
+}
+
+func (caller *Caller) Send(to gen.Atom, msg any) error {
+	res, err := caller.process.Call(system.WhereIsProcess, system.MessageLocate{Name: to})
+	if err != nil {
+		return err
+	}
+	node, ok := res.(gen.Atom)
+	if !ok || node == "" {
+		return gen.ErrProcessUnknown
+	}
+	if node == caller.process.Node().Name() {
+		return caller.process.Send(to, msg)
+	}
+	return caller.process.SendImportant(gen.ProcessID{Node: node, Name: to}, msg)
+}
+
+func (caller *Caller) Call(to gen.Atom, msg any) (any, error) {
+	res, err := caller.process.Call(system.WhereIsProcess, system.MessageLocate{Name: to})
+	if err != nil {
+		return nil, err
+	}
+	node, ok := res.(gen.Atom)
+	if !ok || node == "" {
+		return nil, gen.ErrProcessUnknown
+	}
+	if node == caller.process.Node().Name() {
+		return caller.process.Call(to, msg)
+	}
+	return caller.process.Call(gen.ProcessID{Node: node, Name: to}, msg)
+}
