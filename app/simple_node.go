@@ -1,6 +1,8 @@
 package app
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"time"
@@ -20,6 +22,16 @@ type nodeImpl struct {
 
 func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 	book := system.NewAddressBook()
+	if opts.NodeName == "" {
+		host, err := os.Hostname()
+		if err != nil {
+			return nil, err
+		}
+		if host == "" {
+			return nil, errors.New("blank NodeName")
+		}
+		opts.NodeName = fmt.Sprintf("node@%s", host)
+	}
 	var options gen.NodeOptions
 	if len(opts.Options.Endpoints) != 0 {
 		registrar, err := zk.Create(opts.Options)
