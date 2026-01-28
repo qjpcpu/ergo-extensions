@@ -134,46 +134,6 @@ func (w *whereis) HandleEvent(event gen.MessageEvent) error {
 	return nil
 }
 
-func (w *whereis) syncLocalChanges(newList []ProcessInfo) error {
-	selfNode := w.Node().Name()
-	oldList, err := w.book.GetProcessList(selfNode)
-	if err != nil {
-		return err
-	}
-
-	newMap := make(map[gen.Atom]ProcessInfo)
-	for _, p := range newList {
-		newMap[p.Name] = p
-	}
-
-	oldMap := make(map[gen.Atom]ProcessInfo)
-	for _, p := range oldList {
-		oldMap[p.Name] = p
-	}
-
-	msg := MessageProcessChanged{Node: selfNode}
-	for name, p := range newMap {
-		if old, ok := oldMap[name]; !ok || old.PID != p.PID || old.BirthAt != p.BirthAt {
-			msg.UpProcess = append(msg.UpProcess, p)
-		}
-	}
-
-	for name, p := range oldMap {
-		if newP, ok := newMap[name]; !ok || newP.PID != p.PID || newP.BirthAt != p.BirthAt {
-			msg.DownProcess = append(msg.DownProcess, p)
-		}
-	}
-
-	w.book.SetProcess(selfNode, newList...)
-	if len(msg.UpProcess) > 0 || len(msg.DownProcess) > 0 {
-		ver := w.selfVersion.Incr()
-		msg.Version = ver
-		w.selfVersion = ver
-		w.registerToShards(msg)
-	}
-	return nil
-}
-
 func (w *whereis) registerToShards(msg MessageProcessChanged) {
 	shards := make(map[gen.Atom]*MessageProcessChanged)
 	for _, p := range msg.UpProcess {
@@ -213,7 +173,8 @@ func (w *whereis) registerToShards(msg MessageProcessChanged) {
 }
 
 func (w *whereis) inspectProcessList() error {
-	if err := w.collectProcessList(); err != nil {
+	up, down, all, err := w.collectProcessList()
+	if err != nil {
 		return err
 	}
 
@@ -221,24 +182,30 @@ func (w *whereis) inspectProcessList() error {
 	if w.antiEntropyCounter >= 100 {
 		w.antiEntropyCounter = 0
 		w.selfVersion = w.selfVersion.Incr()
-		localProcs := w.processCache.Load()
-		w.book.SetProcess(w.Node().Name(), localProcs...)
-		w.handleTopologyChange(localProcs)
-	} else {
-		w.syncLocalChanges(w.processCache.Load())
+		w.book.SetProcess(w.Node().Name(), all...)
+		w.handleTopologyChange(all)
+	} else if len(up) > 0 || len(down) > 0 {
+		w.book.AddProcess(w.Node().Name(), up...)
+		w.book.RemoveProcess(w.Node().Name(), down...)
+		w.selfVersion = w.selfVersion.Incr()
+		w.registerToShards(MessageProcessChanged{
+			Node:        w.Node().Name(),
+			UpProcess:   up,
+			DownProcess: down,
+			Version:     w.selfVersion,
+		})
 	}
 	return nil
 }
 
 // collectProcessList gets all processes from the current node,
 // finds the newly started and recently stopped processes,
-// updates the internal cache, and stores the full process list
-// into the processCache.
-func (w *whereis) collectProcessList() error {
+// updates the internal cache, and returns incremental and full process lists.
+func (w *whereis) collectProcessList() (up, down, all ProcessInfoList, err error) {
 	// Get the list of all running process PIDs on the current node.
 	pidList, err := w.Node().ProcessList()
 	if err != nil {
-		return err
+		return
 	}
 
 	pidMap := make(map[gen.PID]struct{})
@@ -257,22 +224,23 @@ func (w *whereis) collectProcessList() error {
 		}
 	}
 
-	// If there are no added or deleted processes, there is nothing to do.
 	if len(added) == 0 && len(del) == 0 {
-		return nil
+		return nil, nil, w.processCache.Load(), nil
 	}
 
 	node := w.Node()
-	nodeVersion, err := w.getNodeVersion(node.Name())
-	if err != nil {
-		return err
-	}
 	// Remove deleted processes from the lookup maps.
 	for _, pid := range del {
 		name := w.pidToName[pid]
 		// Ensure we only delete the entry if the PID matches,
 		// avoiding issues with stale/reused process names.
-		if w.nameToPID[name] == pid {
+		if name != "" && w.nameToPID[name] == pid {
+			down = append(down, ProcessInfo{
+				Name:    name,
+				PID:     pid,
+				Node:    node.Name(),
+				BirthAt: w.nameToBirthAt[name],
+			})
 			delete(w.nameToPID, name)
 			delete(w.nameToBirthAt, name)
 		}
@@ -281,32 +249,36 @@ func (w *whereis) collectProcessList() error {
 
 	// Add new processes to the lookup maps.
 	for _, pid := range added {
-		if info, err := node.ProcessInfo(pid); err != nil {
-			return err
-		} else {
+		if info, err0 := node.ProcessInfo(pid); err0 == nil {
 			w.pidToName[pid] = info.Name
 			if info.Name != "" {
+				birthAt := time.Now().Unix() - info.Uptime
 				w.nameToPID[info.Name] = pid
-				w.nameToBirthAt[info.Name] = time.Now().Unix() - info.Uptime
+				w.nameToBirthAt[info.Name] = birthAt
+				up = append(up, ProcessInfo{
+					Name:    info.Name,
+					PID:     pid,
+					Node:    node.Name(),
+					BirthAt: birthAt,
+				})
 			}
 		}
 	}
 
 	// Rebuild the full process list from the updated nameToPID map.
-	procList := make(ProcessInfoList, 0, len(w.nameToPID))
+	all = make(ProcessInfoList, 0, len(w.nameToPID))
 	for name, pid := range w.nameToPID {
-		procList = append(procList, ProcessInfo{
+		all = append(all, ProcessInfo{
 			Name:    name,
 			PID:     pid,
 			Node:    node.Name(),
 			BirthAt: w.nameToBirthAt[name],
-			Version: nodeVersion,
 		})
 	}
 
 	// Atomically update the process cache with the new list.
-	w.processCache.Store(procList)
-	return nil
+	w.processCache.Store(all)
+	return
 }
 
 func (w *whereis) setup() error {
@@ -349,7 +321,7 @@ func (w *whereis) HandleInspect(from gen.PID, item ...string) map[string]string 
 }
 
 func (w *whereis) handleProcessChanged(e MessageProcessChanged) error {
-	if version, ok := w.nodeVersions[e.Node]; ok && version.GreaterThan(e.Version) {
+	if version, ok := w.nodeVersions[e.Node]; ok && version.GreaterThanOrEq(e.Version) {
 		return nil
 	}
 	if e.FullSync {
@@ -360,19 +332,6 @@ func (w *whereis) handleProcessChanged(e MessageProcessChanged) error {
 	}
 	w.nodeVersions[e.Node] = e.Version
 	return nil
-}
-
-func (w *whereis) getNodeVersion(node gen.Atom) (int, error) {
-	if r := w.registrar; r != nil {
-		val, err := r.ConfigItem(string(node))
-		if err != nil {
-			return -1, err
-		}
-		if ver, ok := val.(int); ok {
-			return ver, nil
-		}
-	}
-	return -1, nil
 }
 
 func (w *whereis) Terminate(reason error) {

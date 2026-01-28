@@ -33,8 +33,6 @@ type (
 		Name gen.Atom
 		// BirthAt is the Unix timestamp (seconds) when the process was started.
 		BirthAt int64
-		// used in persist book
-		Version int
 	}
 	MessageProcessChanged struct {
 		Node        gen.Atom
