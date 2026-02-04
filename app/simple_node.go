@@ -71,6 +71,7 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 	options.Log.DefaultLogger = opts.DefaultLogOptions
 	if options.Log.DefaultLogger.TimeFormat == "" {
 		options.Log.DefaultLogger.TimeFormat = time.DateTime
+		options.Log.DefaultLogger.DisableBanner = true
 	}
 
 	// Start the node
