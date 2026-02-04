@@ -11,7 +11,7 @@ import (
 
 	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
-	"ergo.services/registrar/zk"
+	"github.com/qjpcpu/registrar/zk"
 )
 
 const DaemonMonitorProcess = gen.Atom("extensions_daemon")

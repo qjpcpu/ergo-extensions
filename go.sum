@@ -1,13 +1,13 @@
-ergo.services/ergo v1.999.311-0.20260130075926-ed8c381bbce9 h1:eAYieqIB9RTS2T+hp9+G/6WlVp3PxnUbyjc3Ats3wzc=
-ergo.services/ergo v1.999.311-0.20260130075926-ed8c381bbce9/go.mod h1:bLQ6PoO6Mz/8gVuzvPv3xfMfo1P9w6rZV1WnMXMeMdg=
+ergo.services/ergo v1.999.320 h1:IYyjCBJvXPLW8Mpy6pq5FoBa2RjNAS4QSL2lK7bBueQ=
+ergo.services/ergo v1.999.320/go.mod h1:bLQ6PoO6Mz/8gVuzvPv3xfMfo1P9w6rZV1WnMXMeMdg=
 github.com/OneOfOne/xxhash v1.2.2 h1:KMrpdQIwFcEqXDklaen+P1axHaj9BSKzvpUUfnHldSE=
 github.com/OneOfOne/xxhash v1.2.2/go.mod h1:HSdplMjZKSmBqAxg5vPj2TmRDmfkzw+cTzAElWljhcU=
 github.com/buraksezer/consistent v0.10.0 h1:hqBgz1PvNLC5rkWcEBVAL9dFMBWz6I0VgUCW25rrZlU=
 github.com/buraksezer/consistent v0.10.0/go.mod h1:6BrVajWq7wbKZlTOUPs/XVfR8c0maujuPowduSpZqmw=
 github.com/cespare/xxhash v1.1.0 h1:a6HrQnmkObjyL+Gs60czilIUGqrzKutQD6XZog3p+ko=
 github.com/cespare/xxhash v1.1.0/go.mod h1:XrSqR1VqqWfGrhpAt58auRo0WTKS1nRRg3ghfAqPWnc=
-github.com/qjpcpu/registrar/zk v0.0.0-20260127115641-c3e402c0d915 h1:Do5CzmcvLhjzkeaNImFaHBMfezy+YCR6VjvRMW3yLEE=
-github.com/qjpcpu/registrar/zk v0.0.0-20260127115641-c3e402c0d915/go.mod h1:PpQLkeAB72SO04ChGuIIroMVSwoU3waOVYRKhHqyiMc=
+github.com/qjpcpu/registrar v0.0.0-20260204070723-08b4c460ff9a h1:Pk2YYq5UAT7eZX8AlA81q7DTRBvB9yJVIBp7fuau8dg=
+github.com/qjpcpu/registrar v0.0.0-20260204070723-08b4c460ff9a/go.mod h1:ekd7eByJoRLkXd9b4SY4/F1G2spKOSYqlAtQSBdeR7k=
 github.com/qjpcpu/zk v0.0.0-20251119061628-055c093a17d5 h1:QmTRwea63Z4jjuTK8HiBKWa8fNqLPJT6rZMZQkibmx0=
 github.com/qjpcpu/zk v0.0.0-20251119061628-055c093a17d5/go.mod h1:yEy5PQ4C8sYZiLuIH259wnlvDq1V5PN7gN8gdUepl1c=
 github.com/spaolacci/murmur3 v0.0.0-20180118202830-f09979ecbc72 h1:qLC7fQah7D6K1B0ujays3HV9gkFtllcxhzImRR7ArPQ=

@@ -4,8 +4,8 @@ import (
 	"time"
 
 	"ergo.services/ergo/gen"
-	"ergo.services/registrar/zk"
 	"github.com/qjpcpu/ergo-extensions/system"
+	"github.com/qjpcpu/registrar/zk"
 )
 
 // Node is the minimal interface returned by StartSimpleNode.
@@ -31,7 +31,9 @@ type SimpleNodeOptions struct {
 	zk.Options        // ZooKeeper registrar options.
 	NodeName   string // Node name.
 	// Optional
-	Port                  uint16                      // Listen port, default to 11144
+	Port                  uint16 // Listen port, default to 11144
+	AdvertiseHost         string // Publicly accessible hostname or IP address of the node.
+	AdvertisePort         uint16 // Publicly accessible port of the node.
 	Cookie                string                      // Cluster cookie (must match across nodes).
 	MoreApps              []gen.ApplicationBehavior   // Extra applications to start on the node.
 	MemberSpecs           []gen.ApplicationMemberSpec // Additional application members to start.

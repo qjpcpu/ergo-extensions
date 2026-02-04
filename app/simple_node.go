@@ -4,14 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strconv"
 	"time"
 
 	"ergo.services/ergo"
 	"ergo.services/ergo/gen"
-	"ergo.services/registrar/zk"
 	"github.com/qjpcpu/ergo-extensions/registrar/mem"
 	"github.com/qjpcpu/ergo-extensions/system"
+	"github.com/qjpcpu/registrar/zk"
 )
 
 type nodeImpl struct {
@@ -49,7 +48,15 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 	} else {
 		gen.DefaultRequestTimeout = opts.DefaultRequestTimeout
 	}
-	options.Network.Acceptors = []gen.AcceptorOptions{{Host: "0.0.0.0", Port: opts.Port, TCP: "tcp"}}
+	options.Network.Acceptors = []gen.AcceptorOptions{
+		{
+			Host:      "0.0.0.0",
+			Port:      opts.Port,
+			RouteHost: opts.AdvertiseHost,
+			RoutePort: opts.AdvertisePort,
+			TCP:       "tcp",
+		},
+	}
 	options.Network.Cookie = str(opts.Cookie, "simple-app-cookie")
 	options.Network.InsecureSkipVerify = true
 	router := gen.Atom("app_routes")
@@ -72,28 +79,6 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 		return nil, err
 	}
 	return &nodeImpl{Node: node, route: router, book: book}, nil
-}
-
-// GetAdvertiseAddressByENV creates a RoutesMapper that determines the advertise address/port
-// by inspecting environment variables.
-// It iterates through the provided environment variable names (hostEnv and portEnv)
-// and uses the first non-empty value found.
-func GetAdvertiseAddressByENV(hostEnv []string, portEnv []string) zk.RoutesMapper {
-	var host string
-	var port int
-	for _, e := range hostEnv {
-		if val := os.Getenv(e); val != "" {
-			host = val
-			break
-		}
-	}
-	for _, e := range portEnv {
-		if p, _ := strconv.Atoi(os.Getenv(e)); p > 0 {
-			port = p
-			break
-		}
-	}
-	return zk.MapRoutesByAdvertiseAddress(host, port)
 }
 
 func str(list ...string) string {

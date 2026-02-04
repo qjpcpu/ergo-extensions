@@ -72,3 +72,11 @@ type Launcher struct {
 type DaemonIteratorFactory func() DaemonIterator
 
 type DaemonIterator func() ([]DaemonProcess, bool, error)
+
+func SingletonDaemon(name gen.Atom, args []any) DaemonIteratorFactory {
+	return func() DaemonIterator {
+		return func() ([]DaemonProcess, bool, error) {
+			return []DaemonProcess{{ProcessName: name, Args: args}}, false, nil
+		}
+	}
+}

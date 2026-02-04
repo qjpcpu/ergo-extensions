@@ -40,7 +40,7 @@ The project is built using standard Go toolchains (Go 1.24+).
 
 ## 6. Configuration
 - **Node Setup**: Configured via `app.SimpleNodeOptions` and `gen.NodeOptions`.
-- **Registrar**: Supports Zookeeper (`ergo.services/registrar/zk`) or a built-in in-memory registrar for local development.
+- **Registrar**: Supports Zookeeper (`github.com/qjpcpu/registrar`) or a built-in in-memory registrar for local development.
 - **Environment Variables**: `GetAdvertiseAddressByENV` can be used to set the node's advertise address via environment variables.
 
 ## 7. Directory Structure

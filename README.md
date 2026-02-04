@@ -2,12 +2,12 @@
 
 This repository provides a small set of building blocks to add distributed process discovery and daemon orchestration to an Ergo-based cluster. It ships a supervisor that wires together:
 
-- `extensions_whereis` — a process that periodically inspects local processes, maintains an address book, and syncs snapshots/changes with the cluster.
+- `extensions_whereis` — a process that periodically inspects local processes and maintains a distributed sharded directory for process discovery.
 - `extensions_daemon` — a process that (on the elected leader) recovers and launches daemon processes across nodes using consistent hashing.
 - `extensions_cron` — a cron-like scheduler that triggers messages on a node or across the cluster.
 - `AddressBook` — a thread-safe, eventually-consistent cache of nodes and their registered processes, with node picking via consistent hashing.
 
-Core components live under the `system` package and are designed to integrate with `ergo.services/ergo` and a registrar (Zookeeper via `ergo.services/registrar/zk`, or the built-in in-memory registrar used by `app.StartSimpleNode` when no registrar is provided). The `app` package provides a small helper to start a node with these components wired in.
+Core components live under the `system` package and are designed to integrate with `ergo.services/ergo` and a registrar (Zookeeper via `github.com/qjpcpu/registrar`, or the built-in in-memory registrar used by `app.StartSimpleNode` when no registrar is provided). The `app` package provides a small helper to start a node with these components wired in.
 
 ## Features
 
@@ -20,8 +20,8 @@ Core components live under the `system` package and are designed to integrate wi
 
 ## Requirements
 
-- `ergo.services/ergo v1.999.310`
-- A network registrar; the default code expects Zookeeper via `ergo.services/registrar/zk`
+- `ergo.services/ergo v1.999.320`
+- A network registrar; the default code expects Zookeeper via `github.com/qjpcpu/registrar`
 
 The module’s `go.mod` includes a `replace` directive to use `github.com/qjpcpu/registrar/zk` for the registrar.
 
@@ -43,8 +43,8 @@ import "github.com/qjpcpu/ergo-extensions/system"
   - `WhereIsProcess` (`extensions_whereis`):
     - Inspects local processes periodically (default: every 3 seconds)
     - Maintains PID→Name and Name→PID maps
-    - Stores a snapshot (`ProcessInfoList`) in-memory and updates the `AddressBook`
-    - Syncs process snapshots or deltas with other nodes (request/reply with forwarding)
+    - Stores a snapshot (`ProcessInfoList`) in-memory and updates the local `AddressBook`
+    - Distributes process location information across nodes using a sharded directory model
     - Answers calls: `MessageLocate{Name}` → node, `MessageGetAddressBook{}` → `MessageAddressBook{Book IAddressBook}`
   - `DaemonMonitorProcess` (`extensions_daemon`):
     - Subscribes to registrar events for leader election and membership changes
@@ -55,9 +55,10 @@ import "github.com/qjpcpu/ergo-extensions/system"
   - `AddressBook`:
     - Tracks available nodes and per-node registered processes
     - Picks a node for a process name using a consistent hashing ring (PartitionCount: 10240, ReplicationFactor: 40)
+    - Supports global process lookups via `IAddressBookQuery` (returned by `book.QueryBy(caller)`)
 - `app.StartSimpleNode`:
   - Starts an Ergo node and loads the `system.Supervisor` with a shared `IAddressBook`
-  - Provides helper methods for locating named processes and forwarding sends/calls
+  - Returns an `app.Node` with helpers: `LocateProcess`, `ForwardCall`, `ForwardSend`, `ForwardSpawn`, `WaitPID`, etc.
 
 ## Quick Start
 
@@ -131,25 +132,28 @@ sp := system.NewSpawner(self, gen.Atom("worker"))
 pid, err := sp.SpawnRegister(gen.Atom("worker.A"), /* args... */)
 ```
 
-4) Locate a process by its registered name via `whereis`:
+4) Locate a process by its registered name:
 
+Using `app.Node` helper:
 ```go
-nodeAny, err := self.Call(gen.ProcessID{Name: system.WhereIsProcess}, system.MessageLocate{Name: gen.Atom("worker.A")})
-if err != nil { /* handle */ }
-node := nodeAny.(gen.Atom) // empty atom if unknown
+node := n.LocateProcess(gen.Atom("worker.A"))
 ```
 
-5) Access the shared `AddressBook` if you need more control:
+Or via `AddressBook` for distributed lookup:
+```go
+respAny, err := self.Call(gen.ProcessID{Name: system.WhereIsProcess}, system.MessageGetAddressBook{})
+if err != nil { /* handle */ }
+book := respAny.(system.MessageAddressBook).Book
+node, err := book.QueryBy(self, system.QueryOption{Timeout: 5}).Locate(gen.Atom("worker.A"))
+```
+
+5) Access the shared `AddressBook` if you need more control (e.g., local pick):
 
 ```go
 respAny, err := self.Call(gen.ProcessID{Name: system.WhereIsProcess}, system.MessageGetAddressBook{})
 if err != nil { /* handle */ }
 book := respAny.(system.MessageAddressBook).Book
-picked := book.PickNode(gen.Atom("worker.A"))
-if b, ok := book.(*system.AddressBook); ok {
-    list, _ := b.GetProcessList(picked)
-    _ = list
-}
+picked := book.PickNode(gen.Atom("worker.A")) // pick based on consistent hashing
 ```
 
 ## Public API (selected)
@@ -159,20 +163,29 @@ if b, ok := book.(*system.AddressBook); ok {
 - Supervisor helpers:
   - `system.ApplicationMemberSpec(opts system.ApplicationMemberSpecOptions) gen.ApplicationMemberSpec`
   - `system.FactorySystemSup(opts system.ApplicationMemberSpecOptions) gen.ProcessFactory`
+- SimpleNode helpers (`app.Node`):
+  - `LocateProcess(name gen.Atom) gen.Atom`
+  - `ForwardCall(to string, msg any) (any, error)`
+  - `ForwardSend(to string, msg any) error`
+  - `ForwardSpawn(fac gen.ProcessFactory, args ...any) error`
+  - `WaitPID(pid gen.PID) error`
+  - `AddressBook() IAddressBook`
 - Daemon orchestration:
   - `system.RegisterLauncher(name gen.Atom, launcher system.Launcher) error`
   - `system.NewSpawner(parent gen.Process, launcher gen.Atom) system.Spawner`
   - `Spawner.SpawnRegister(processName gen.Atom, args ...any) (gen.PID, error)`
+  - `system.SingletonDaemon(name gen.Atom, args []any) system.DaemonIteratorFactory`
   - `Launcher{ Factory, Option, RecoveryScanner }`
   - `DaemonProcess{ ProcessName gen.Atom, Args []any }`
 - Discovery & address book:
   - Call `extensions_whereis` with `MessageLocate{Name gen.Atom}` → `gen.Atom` (node)
   - Call `extensions_whereis` with `MessageGetAddressBook{}` → `MessageAddressBook{Book IAddressBook}`
-  - `IAddressBook` provides: `PickNode`, `GetAvailableNodes`
+  - `IAddressBook` provides: `PickNode`, `GetAvailableNodes`, `QueryBy(caller, opts)` → `IAddressBookQuery`
+  - `IAddressBookQuery` provides: `Locate(processName)` → `gen.Atom` (node)
 
 ## Registrar & Events
 
-The code expects a working registrar from the Ergo network. With Zookeeper (`ergo.services/registrar/zk`), the following events are handled:
+The code expects a working registrar from the Ergo network. With Zookeeper (`github.com/qjpcpu/registrar`), the following events are handled:
 
 - Leadership changes: `EventNodeSwitchedToLeader`, `EventNodeSwitchedToFollower`
 - Membership changes: `EventNodeJoined`, `EventNodeLeft`

@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 
 	"ergo.services/ergo/gen"
-	"ergo.services/registrar/zk"
+	"github.com/qjpcpu/registrar/zk"
 )
 
 func NewCluster() *Cluster {
