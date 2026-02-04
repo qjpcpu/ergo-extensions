@@ -18,6 +18,10 @@ type (
 	MessageLocate       struct {
 		Name gen.Atom
 	}
+	MessageLocateResult struct {
+		Name gen.Atom
+		Node gen.Atom
+	}
 	MessageForwardLocate struct {
 		Name gen.Atom
 		From gen.PID
@@ -61,6 +65,7 @@ func init() {
 		ProcessInfoList{},
 		MessageProcessChanged{},
 		MessageLocate{},
+		MessageLocateResult{},
 		MessageForwardLocate{},
 		MessageLaunchAllDaemon{},
 		DaemonProcess{},

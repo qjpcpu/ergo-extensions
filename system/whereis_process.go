@@ -74,6 +74,27 @@ func (w *whereis) HandleMessage(from gen.PID, message any) error {
 		}
 	case MessageProcessChanged:
 		return w.handleProcessChanged(e)
+	case MessageLocate:
+		if e.Name == "" {
+			return nil
+		}
+		owner := w.book.PickDirectoryNode(e.Name)
+		if owner == w.Node().Name() {
+			if p, ok := w.book.LocateLocal(e.Name); ok {
+				w.Send(from, MessageLocateResult{Name: e.Name, Node: p})
+				return nil
+			}
+			w.Send(from, MessageLocateResult{Name: e.Name})
+			return nil
+		}
+		if owner == "" {
+			w.Send(from, MessageLocateResult{Name: e.Name})
+			return nil
+		}
+		w.Send(gen.ProcessID{Node: owner, Name: WhereIsProcess}, MessageForwardLocate{
+			Name: e.Name,
+			From: from,
+		})
 	case MessageForwardLocate:
 		var node gen.Atom
 		owner := w.book.PickDirectoryNode(e.Name)
@@ -82,7 +103,12 @@ func (w *whereis) HandleMessage(from gen.PID, message any) error {
 				node = p
 			}
 		}
-		w.SendResponse(e.From, e.Ref, node)
+		if e.Ref.ID[0] == 0 && e.Ref.ID[1] == 0 && e.Ref.ID[2] == 0 {
+			// it's a Send request
+			w.Send(e.From, MessageLocateResult{Name: e.Name, Node: node})
+		} else {
+			w.SendResponse(e.From, e.Ref, node)
+		}
 	}
 	return nil
 }
