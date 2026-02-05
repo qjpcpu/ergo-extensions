@@ -7,7 +7,7 @@ import (
 
 	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
-	"github.com/qjpcpu/registrar/zk"
+	"github.com/qjpcpu/registrar/events"
 )
 
 const (
@@ -26,7 +26,7 @@ type whereis struct {
 	nameToBirthAt map[gen.Atom]int64
 	nameToPID     map[gen.Atom]gen.PID
 	// only includes named processes
-	processCache       *zk.AtomicValue[ProcessInfoList]
+	processCache       *AtomicValue[ProcessInfoList]
 	inspectInterval    time.Duration
 	antiEntropyCounter int
 	topologyChangeID   int64
@@ -42,7 +42,7 @@ func factoryWhereIs(book *AddressBook, inspectInterval time.Duration) gen.Proces
 			pidToName:       make(map[gen.PID]gen.Atom),
 			nameToPID:       make(map[gen.Atom]gen.PID),
 			nameToBirthAt:   make(map[gen.Atom]int64),
-			processCache:    zk.NewAtomicValue[ProcessInfoList](),
+			processCache:    NewAtomicValue[ProcessInfoList](),
 			selfVersion:     NewVersion(),
 			nodeVersions:    make(map[gen.Atom]ProcessVersion),
 			inspectInterval: inspectInterval,
@@ -143,7 +143,7 @@ func (w *whereis) HandleCall(from gen.PID, ref gen.Ref, request any) (any, error
 
 func (w *whereis) HandleEvent(event gen.MessageEvent) error {
 	switch event.Message.(type) {
-	case zk.EventNodeJoined, zk.EventNodeLeft:
+	case events.EventNodeJoined, events.EventNodeLeft:
 		nodeList, _ := w.fetchAvailableBookNodes()
 		n := 1
 		if nodeList != nil {

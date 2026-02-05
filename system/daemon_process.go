@@ -11,7 +11,8 @@ import (
 
 	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
-	"github.com/qjpcpu/registrar/zk"
+	"github.com/qjpcpu/registrar/constants"
+	"github.com/qjpcpu/registrar/events"
 )
 
 const DaemonMonitorProcess = gen.Atom("extensions_daemon")
@@ -64,20 +65,20 @@ func (w *daemon) HandleMessage(from gen.PID, message any) error {
 
 func (w *daemon) HandleEvent(event gen.MessageEvent) error {
 	switch e := event.Message.(type) {
-	case zk.EventNodeSwitchedToLeader:
+	case events.EventNodeSwitchedToLeader:
 		if e.Name == w.Node().Name() {
 			w.isLeader = true
 			w.recovered = make(map[gen.Atom]struct{})
 			w.launchAllAfter(time.Second * 10)
 			return nil
 		}
-	case zk.EventNodeSwitchedToFollower:
+	case events.EventNodeSwitchedToFollower:
 		if e.Name == w.Node().Name() {
 			w.isLeader = false
 			w.recovered = make(map[gen.Atom]struct{})
 			return nil
 		}
-	case zk.EventNodeLeft:
+	case events.EventNodeLeft:
 		w.recovered = make(map[gen.Atom]struct{})
 		w.launchAllAfter(time.Second * 60)
 	}
@@ -116,7 +117,7 @@ func (w *daemon) setupRegistrarMonitoring() error {
 		if _, err := w.MonitorEvent(event); err != nil {
 			return err
 		} else {
-			if n, err := registrar.ConfigItem(zk.LeaderNodeConfigItem); err != nil {
+			if n, err := registrar.ConfigItem(constants.LeaderNodeConfigItem); err != nil {
 				return err
 			} else if node, ok := n.(gen.Atom); ok {
 				w.isLeader = node == w.Node().Name()
@@ -238,7 +239,7 @@ func (w *daemon) HandleInspect(from gen.PID, item ...string) map[string]string {
 		stats["daemons"] = strings.Join(daemonNames, ",")
 	}
 	if r := w.registrar; r != nil {
-		if n, err := r.ConfigItem(zk.LeaderNodeConfigItem); err == nil {
+		if n, err := r.ConfigItem(constants.LeaderNodeConfigItem); err == nil {
 			if node, ok := n.(gen.Atom); ok {
 				stats["leader"] = string(node)
 			}

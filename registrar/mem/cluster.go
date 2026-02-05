@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 
 	"ergo.services/ergo/gen"
-	"github.com/qjpcpu/registrar/zk"
+	"github.com/qjpcpu/registrar/events"
 )
 
 func NewCluster() *Cluster {
@@ -68,7 +68,7 @@ func (c *Cluster) AddRoutes(node gen.Atom, routes []gen.Route, onEvent func(any)
 	c.nodes = append(c.nodes, node)
 	c.onEvent.Store(node, onEvent)
 	c.onEvent.Range(func(key, value any) bool {
-		event := zk.EventNodeJoined{Name: node}
+		event := events.EventNodeJoined{Name: node}
 		value.(func(any))(event)
 		return true
 	})
@@ -93,7 +93,7 @@ func (c *Cluster) RemoveNode(node gen.Atom) {
 		}
 	}
 	c.onEvent.Range(func(key, value any) bool {
-		event := zk.EventNodeLeft{Name: node}
+		event := events.EventNodeLeft{Name: node}
 		value.(func(any))(event)
 		return true
 	})
@@ -106,7 +106,7 @@ func (c *Cluster) updateLeadership() {
 		if c.leader != "" {
 			if value, ok := c.onEvent.Load(c.leader); ok {
 				sendEvent := value.(func(any))
-				sendEvent(zk.EventNodeSwitchedToFollower{Name: c.leader})
+				sendEvent(events.EventNodeSwitchedToFollower{Name: c.leader})
 			}
 			c.leader = ""
 		}
@@ -116,11 +116,11 @@ func (c *Cluster) updateLeadership() {
 	if leader != c.leader {
 		if value, ok := c.onEvent.Load(c.leader); ok {
 			sendEvent := value.(func(any))
-			sendEvent(zk.EventNodeSwitchedToFollower{Name: c.leader})
+			sendEvent(events.EventNodeSwitchedToFollower{Name: c.leader})
 		}
 		if value, ok := c.onEvent.Load(leader); ok {
 			sendEvent := value.(func(any))
-			sendEvent(zk.EventNodeSwitchedToLeader{Name: leader})
+			sendEvent(events.EventNodeSwitchedToLeader{Name: leader})
 		}
 		c.leader = leader
 	}

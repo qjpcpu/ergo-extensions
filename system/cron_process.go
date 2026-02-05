@@ -9,7 +9,7 @@ import (
 	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
 
-	"github.com/qjpcpu/registrar/zk"
+	"github.com/qjpcpu/registrar/events"
 	"github.com/buraksezer/consistent"
 )
 
@@ -224,7 +224,7 @@ func (w *cron) getLoc(loc CronJobLocation) *time.Location {
 
 func (w *cron) HandleEvent(event gen.MessageEvent) error {
 	switch event.Message.(type) {
-	case zk.EventNodeJoined, zk.EventNodeLeft:
+	case events.EventNodeJoined, events.EventNodeLeft:
 		w.scheduleClusterCronJobs()
 	}
 	return nil
