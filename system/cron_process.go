@@ -9,15 +9,13 @@ import (
 	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
 
-	"github.com/qjpcpu/registrar/events"
 	"github.com/buraksezer/consistent"
+	"github.com/qjpcpu/registrar/events"
 )
 
-type CronJobLocation int
-
 const (
-	CronJobLocationBeijing CronJobLocation = iota
-	CronJobLocationUTC
+	CronJobLocationUTC     = "UTC"
+	CronJobLocationBeijing = "Asia/Shanghai"
 )
 
 type CronJobScope int
@@ -35,8 +33,8 @@ type CronJob struct {
 	Name gen.Atom
 	// Spec is the cron expression (e.g., "* * * * *").
 	Spec string
-	// Location specifies the timezone for the schedule.
-	Location CronJobLocation
+	// Location specifies the timezone for the schedule, default is UTC.
+	Location string
 	// TriggerProcess is the name of the process to receive the trigger message.
 	TriggerProcess gen.Atom
 	// Scope defines whether the job runs on a single node or across the cluster.
@@ -51,7 +49,6 @@ type cron struct {
 	local, cluster  []CronJob
 	startOnSelfJobs map[gen.Atom]struct{}
 	cancelSchedule  gen.CancelFunc
-	locBJ           *time.Location
 }
 
 func factoryCron(jobs []CronJob) gen.ProcessFactory {
@@ -209,16 +206,11 @@ func (w *cron) turnOnClusterCronJobs() error {
 	return nil
 }
 
-func (w *cron) getLoc(loc CronJobLocation) *time.Location {
-	switch loc {
-	case CronJobLocationUTC:
+func (w *cron) getLoc(loc string) *time.Location {
+	if loc, err := time.LoadLocation(loc); err != nil {
 		return time.UTC
-	default:
-		if w.locBJ == nil {
-			bj, _ := time.LoadLocation("Asia/Shanghai")
-			w.locBJ = bj
-		}
-		return w.locBJ
+	} else {
+		return loc
 	}
 }
 
