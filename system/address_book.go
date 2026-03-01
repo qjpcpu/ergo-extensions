@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"ergo.services/ergo/gen"
 
@@ -17,6 +18,8 @@ import (
 type QueryOption struct {
 	// Timeout specifies the query timeout in seconds.
 	Timeout int
+	// CacheTTL specifies the cache time to live in seconds.
+	CacheTTL int
 }
 
 // IAddressBookQuery defines the interface for performing distributed queries on the address book.
@@ -44,6 +47,7 @@ type AddressBook struct {
 	ring           *consistent.Consistent // consistent hashing ring
 	dirRing        *consistent.Consistent // directory hashing ring
 	nodesCache     atomic.Value           // cache for available nodes to avoid frequent lock
+	nodesVersion   atomic.Int64
 }
 
 // NewAddressBook creates a new AddressBook
@@ -215,10 +219,7 @@ func (book *AddressBook) SetAvailableNodes(nodes *NodeList) error {
 	n := nodes.Len()
 	dirNodeCount := 5
 	if n > 25 {
-		dirNodeCount = int(math.Sqrt(float64(n)))
-		if dirNodeCount < 5 {
-			dirNodeCount = 5
-		}
+		dirNodeCount = max(5, int(math.Sqrt(float64(n))))
 	}
 
 	dirNodes := make(map[gen.Atom]struct{})
@@ -279,6 +280,7 @@ func (book *AddressBook) SetAvailableNodes(nodes *NodeList) error {
 	}
 	if isChanged {
 		book.nodesCache.Store(nodes)
+		book.nodesVersion.Add(1)
 	}
 
 	return nil
@@ -310,6 +312,10 @@ func (book *AddressBook) PickNode(process gen.Atom) gen.Atom {
 		return gen.Atom(m.String())
 	}
 	return gen.Atom("")
+}
+
+func (book *AddressBook) NodesVersion() int64 {
+	return book.nodesVersion.Load()
 }
 
 // unifyNodes sorts and removes duplicates from the given list of nodes.
@@ -403,16 +409,48 @@ func newBookQuery(caller gen.Process, book *AddressBook, option QueryOption) IAd
 	return &bookQuery{caller: caller, book: book, option: option}
 }
 
+type cacheProcess struct {
+	node     gen.Atom
+	expireAt int64
+}
+
 type bookQuery struct {
-	caller gen.Process
-	book   *AddressBook
-	option QueryOption
+	caller        gen.Process
+	book          *AddressBook
+	option        QueryOption
+	nodesVersion  atomic.Int64
+	processToNode sync.Map
 }
 
 func (query *bookQuery) Locate(processName gen.Atom) (node gen.Atom, err error) {
 	if processName == "" {
 		return
 	}
+	setCache := func(n gen.Atom) {}
+	if ttl := query.option.CacheTTL; ttl > 0 {
+		if version := query.book.NodesVersion(); query.nodesVersion.Load() != version {
+			query.processToNode.Clear()
+			query.nodesVersion.Store(version)
+		}
+		if val, ok := query.processToNode.Load(processName); ok {
+			p := val.(cacheProcess)
+			if p.expireAt > time.Now().Unix() {
+				return p.node, nil
+			}
+		}
+		setCache = func(n gen.Atom) {
+			query.processToNode.Store(processName, cacheProcess{node: n, expireAt: time.Now().Add(time.Second * time.Duration(ttl)).Unix()})
+		}
+	}
+	node, err = query.locate(processName)
+	if err != nil {
+		return
+	}
+	setCache(node)
+	return
+}
+
+func (query *bookQuery) locate(processName gen.Atom) (node gen.Atom, err error) {
 	owner := query.book.PickDirectoryNode(processName)
 	if owner == "" {
 		return "", ErrNoAvailableNodes
