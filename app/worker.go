@@ -51,15 +51,17 @@ type messageNodeSend struct {
 }
 
 type messageNodeCall struct {
-	to  string
-	msg any
-	ch  chan nodeResult
+	to      string
+	msg     any
+	timeout int
+	ch      chan nodeResult
 }
 
 type messageNodeCallLocal struct {
-	to  string
-	msg any
-	ch  chan nodeResult
+	to      string
+	msg     any
+	timeout int
+	ch      chan nodeResult
 }
 
 type messageWaitProcess struct {
@@ -85,17 +87,31 @@ func (w *myworker) HandleMessage(from gen.PID, message any) error {
 			e.ch <- nodeResult{err: w.SendImportant(gen.ProcessID{Node: p, Name: gen.Atom(e.to)}, e.msg)}
 		}
 	case messageNodeCall:
-		p, err := w.book.QueryBy(w, system.QueryOption{}).Locate(gen.Atom(e.to))
+		var res any
+		var err error
+		p, err := w.book.QueryBy(w, system.QueryOption{Timeout: e.timeout}).Locate(gen.Atom(e.to))
 		if err != nil || p == "" || w.Node().Name() == p {
-			res, err := w.Call(gen.Atom(e.to), e.msg)
+			if e.timeout > 0 {
+				res, err = w.CallWithTimeout(gen.Atom(e.to), e.msg, e.timeout)
+			} else {
+				res, err = w.Call(gen.Atom(e.to), e.msg)
+			}
+		} else {
+			if e.timeout > 0 {
+				res, err = w.CallWithTimeout(gen.ProcessID{Node: p, Name: gen.Atom(e.to)}, e.msg, e.timeout)
+			} else {
+				res, err = w.CallImportant(gen.ProcessID{Node: p, Name: gen.Atom(e.to)}, e.msg)
+			}
+		}
+		e.ch <- nodeResult{response: res, err: err}
+	case messageNodeCallLocal:
+		if e.timeout > 0 {
+			res, err := w.CallWithTimeout(gen.Atom(e.to), e.msg, e.timeout)
 			e.ch <- nodeResult{response: res, err: err}
 		} else {
-			res, err := w.CallImportant(gen.ProcessID{Node: p, Name: gen.Atom(e.to)}, e.msg)
+			res, err := w.Call(gen.Atom(e.to), e.msg)
 			e.ch <- nodeResult{response: res, err: err}
 		}
-	case messageNodeCallLocal:
-		res, err := w.Call(gen.Atom(e.to), e.msg)
-		e.ch <- nodeResult{response: res, err: err}
 	case messageSpawnProcess:
 		sendResp := func(err error) {
 			if e.Ch != nil {

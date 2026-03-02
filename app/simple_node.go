@@ -120,12 +120,14 @@ func (n *nodeImpl) ForwardSend(to string, msg any) error {
 	return nil
 }
 
-func (n *nodeImpl) CallLocal(to string, msg any) (any, error) {
+func (n *nodeImpl) CallLocal(to string, msg any, opts ...CallOpts) (any, error) {
 	ch := make(chan nodeResult, 1)
+	option := n.getOpts(opts...)
 	err := n.Send(n.route, messageNodeCallLocal{
-		to:  to,
-		msg: msg,
-		ch:  ch,
+		to:      to,
+		msg:     msg,
+		ch:      ch,
+		timeout: option.Timeout,
 	})
 	if err != nil {
 		return nil, err
@@ -137,12 +139,14 @@ func (n *nodeImpl) CallLocal(to string, msg any) (any, error) {
 	return res.response, nil
 }
 
-func (n *nodeImpl) ForwardCall(to string, msg any) (any, error) {
+func (n *nodeImpl) ForwardCall(to string, msg any, opts ...CallOpts) (any, error) {
 	ch := make(chan nodeResult, 1)
+	option := n.getOpts(opts...)
 	err := n.Send(n.route, messageNodeCall{
-		to:  to,
-		msg: msg,
-		ch:  ch,
+		to:      to,
+		msg:     msg,
+		ch:      ch,
+		timeout: option.Timeout,
 	})
 	if err != nil {
 		return nil, err
@@ -177,7 +181,7 @@ func (n *nodeImpl) ForwardSpawn(fac gen.ProcessFactory, args ...any) error {
 }
 
 func (n *nodeImpl) LocateProcess(process gen.Atom) gen.Atom {
-	res, err := n.ForwardCall(string(system.WhereIsProcess), system.MessageLocate{Name: process})
+	res, err := n.CallLocal(string(system.WhereIsProcess), system.MessageLocate{Name: process}, CallTimeout(10))
 	if err != nil {
 		return ""
 	}
@@ -189,4 +193,12 @@ func (n *nodeImpl) LocateProcess(process gen.Atom) gen.Atom {
 
 func (n *nodeImpl) AddressBook() system.IAddressBook {
 	return n.book
+}
+
+func (n *nodeImpl) getOpts(options ...CallOpts) *callopts {
+	o := new(callopts)
+	for _, fn := range options {
+		fn(o)
+	}
+	return o
 }
