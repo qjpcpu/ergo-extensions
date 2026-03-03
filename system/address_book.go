@@ -405,7 +405,7 @@ func shortInfo(ps []ProcessInfo) string {
 	return "(" + strings.Join(arr, ",") + ")"
 }
 
-func newBookQuery(caller gen.Process, book *AddressBook, option QueryOption) IAddressBookQuery {
+func newBookQuery(caller ICaller, book *AddressBook, option QueryOption) IAddressBookQuery {
 	return &bookQuery{caller: caller, book: book, option: option}
 }
 
@@ -414,8 +414,13 @@ type cacheProcess struct {
 	expireAt int64
 }
 
+type ICaller interface {
+	Node() gen.Node
+	CallWithTimeout(to any, request any, timeout int) (any, error)
+}
+
 type bookQuery struct {
-	caller        gen.Process
+	caller        ICaller
 	book          *AddressBook
 	option        QueryOption
 	nodesVersion  atomic.Int64
