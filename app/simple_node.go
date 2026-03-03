@@ -103,12 +103,14 @@ func (n *nodeImpl) WaitPID(pid gen.PID) error {
 	return <-ch
 }
 
-func (n *nodeImpl) ForwardSend(to string, msg any) error {
+func (n *nodeImpl) ForwardSend(to string, msg any, opts ...CallOpts) error {
 	ch := make(chan nodeResult, 1)
+	option := n.getOpts(opts...)
 	err := n.Send(n.route, messageNodeSend{
-		to:  to,
-		msg: msg,
-		ch:  ch,
+		to:     to,
+		toNode: option.Node,
+		msg:    msg,
+		ch:     ch,
 	})
 	if err != nil {
 		return err
@@ -144,6 +146,7 @@ func (n *nodeImpl) ForwardCall(to string, msg any, opts ...CallOpts) (any, error
 	option := n.getOpts(opts...)
 	err := n.Send(n.route, messageNodeCall{
 		to:      to,
+		toNode:  option.Node,
 		msg:     msg,
 		ch:      ch,
 		timeout: option.Timeout,

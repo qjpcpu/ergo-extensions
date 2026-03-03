@@ -45,13 +45,15 @@ type nodeResult struct {
 }
 
 type messageNodeSend struct {
-	to  string
-	msg any
-	ch  chan nodeResult
+	to     string
+	toNode gen.Atom
+	msg    any
+	ch     chan nodeResult
 }
 
 type messageNodeCall struct {
 	to      string
+	toNode  gen.Atom
 	msg     any
 	timeout int
 	ch      chan nodeResult
@@ -80,16 +82,29 @@ type messageSpawnProcess struct {
 func (w *myworker) HandleMessage(from gen.PID, message any) error {
 	switch e := message.(type) {
 	case messageNodeSend:
-		p, err := w.book.QueryBy(w, system.QueryOption{}).Locate(gen.Atom(e.to))
-		if err != nil || p == "" || w.Node().Name() == p {
-			e.ch <- nodeResult{err: w.Send(gen.Atom(e.to), e.msg)}
+		if e.toNode != "" {
+			if e.toNode == w.Node().Name() {
+				e.ch <- nodeResult{err: w.Send(gen.Atom(e.to), e.msg)}
+			} else {
+				e.ch <- nodeResult{err: w.SendImportant(gen.ProcessID{Node: e.toNode, Name: gen.Atom(e.to)}, e.msg)}
+			}
 		} else {
-			e.ch <- nodeResult{err: w.SendImportant(gen.ProcessID{Node: p, Name: gen.Atom(e.to)}, e.msg)}
+			p, err := w.book.QueryBy(w, system.QueryOption{}).Locate(gen.Atom(e.to))
+			if err != nil || p == "" || w.Node().Name() == p {
+				e.ch <- nodeResult{err: w.Send(gen.Atom(e.to), e.msg)}
+			} else {
+				e.ch <- nodeResult{err: w.SendImportant(gen.ProcessID{Node: p, Name: gen.Atom(e.to)}, e.msg)}
+			}
 		}
 	case messageNodeCall:
 		var res any
 		var err error
-		p, err := w.book.QueryBy(w, system.QueryOption{Timeout: e.timeout}).Locate(gen.Atom(e.to))
+		var p gen.Atom
+		if e.toNode != "" {
+			p = e.toNode
+		} else {
+			p, err = w.book.QueryBy(w, system.QueryOption{Timeout: e.timeout}).Locate(gen.Atom(e.to))
+		}
 		if err != nil || p == "" || w.Node().Name() == p {
 			if e.timeout > 0 {
 				res, err = w.CallWithTimeout(gen.Atom(e.to), e.msg, e.timeout)

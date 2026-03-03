@@ -18,7 +18,7 @@ type Node interface {
 	LocateProcess(process gen.Atom) gen.Atom
 	ForwardCall(to string, msg any, opts ...CallOpts) (any, error)
 	CallLocal(to string, msg any, opts ...CallOpts) (any, error)
-	ForwardSend(to string, msg any) error
+	ForwardSend(to string, msg any, opts ...CallOpts) error
 	ForwardSpawn(fac gen.ProcessFactory, args ...any) error
 	ForwardSpawnAndWait(fac gen.ProcessFactory, args ...any) error
 	WaitPID(pid gen.PID) error
@@ -49,8 +49,13 @@ type SimpleNodeOptions struct {
 type CallOpts func(*callopts)
 type callopts struct {
 	Timeout int
+	Node    gen.Atom
 }
 
 func CallTimeout(t int) CallOpts {
 	return func(o *callopts) { o.Timeout = t }
+}
+
+func CallNode(t gen.Atom) CallOpts {
+	return func(o *callopts) { o.Node = t }
 }
