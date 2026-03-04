@@ -170,11 +170,16 @@ func (w *cron) turnOnClusterCronJobs() error {
 	}
 	nodesMap := make(map[gen.Atom]struct{})
 	for _, node := range nodes {
-		w.ring.Add(Member(node))
+		// Only add nodes not already in the ring to avoid redundant O(partitions) work.
+		if _, ok := w.prevNodes[node]; !ok {
+			w.ring.Add(Member(node))
+		}
 		nodesMap[node] = struct{}{}
 	}
 	node := w.Node().Name()
-	w.ring.Add(Member(node))
+	if _, ok := w.prevNodes[node]; !ok {
+		w.ring.Add(Member(node))
+	}
 	nodesMap[node] = struct{}{}
 	for n := range w.prevNodes {
 		if _, ok := nodesMap[n]; !ok {
@@ -185,7 +190,12 @@ func (w *cron) turnOnClusterCronJobs() error {
 
 	c := w.Node().Cron()
 	for _, job := range w.cluster {
+		_, wasOnSelf := w.startOnSelfJobs[job.Name]
+		shouldBeOnSelf := false
 		if target := w.ring.LocateKey([]byte(job.Name)); target != nil && gen.Atom(target.String()) == node {
+			shouldBeOnSelf = true
+		}
+		if shouldBeOnSelf && !wasOnSelf {
 			genjob := gen.CronJob{
 				Name:     job.Name,
 				Spec:     job.Spec,
@@ -196,7 +206,7 @@ func (w *cron) turnOnClusterCronJobs() error {
 				w.Log().Debug("turn on cron job %s", job.Name)
 				w.startOnSelfJobs[job.Name] = struct{}{}
 			}
-		} else {
+		} else if !shouldBeOnSelf && wasOnSelf {
 			if err = c.RemoveJob(job.Name); err == nil {
 				w.Log().Debug("turn off cron job %s", job.Name)
 				delete(w.startOnSelfJobs, job.Name)

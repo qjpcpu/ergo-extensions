@@ -29,150 +29,64 @@ func (p *myPool) Init(args ...any) (act.PoolOptions, error) {
 	return opts, nil
 }
 
-type myworker struct {
+// tempActor is a short-lived actor that executes a function and exits.
+type tempActor struct {
 	act.Actor
-	monitorPID map[gen.PID]chan error
-	book       system.IAddressBook
+	book system.IAddressBook
+	fn   func(*tempActor)
 }
 
-func (w *myworker) Init(args ...any) error {
+func (w *tempActor) Init(args ...any) error {
+	w.Send(w.PID(), "start")
+	return nil
+}
+
+func (w *tempActor) HandleMessage(from gen.PID, message any) error {
+	if message == "start" {
+		w.fn(w)
+		return gen.TerminateReasonNormal
+	}
+	return nil
+}
+
+// monitorActor monitors a PID and reports its exit via a channel.
+type monitorActor struct {
+	act.Actor
+	setup func(w *monitorActor) error
+	ch    chan error
+	pid   gen.PID
+}
+
+func (w *monitorActor) Init(args ...any) error {
+	w.Send(w.PID(), "start")
+	return nil
+}
+
+func (w *monitorActor) HandleMessage(from gen.PID, message any) error {
+	switch e := message.(type) {
+	case string:
+		if e == "start" {
+			if err := w.setup(w); err != nil {
+				w.ch <- err
+				return gen.TerminateReasonNormal
+			}
+		}
+	case gen.MessageDownPID:
+		if e.PID == w.pid {
+			if e.Reason == gen.TerminateReasonNormal {
+				w.ch <- nil
+			} else {
+				w.ch <- e.Reason
+			}
+			return gen.TerminateReasonNormal
+		}
+	}
 	return nil
 }
 
 type nodeResult struct {
 	response any
 	err      error
-}
-
-type messageNodeSend struct {
-	to     string
-	toNode gen.Atom
-	msg    any
-	ch     chan nodeResult
-}
-
-type messageNodeCall struct {
-	to      string
-	toNode  gen.Atom
-	msg     any
-	timeout int
-	ch      chan nodeResult
-}
-
-type messageNodeCallLocal struct {
-	to      string
-	msg     any
-	timeout int
-	ch      chan nodeResult
-}
-
-type messageWaitProcess struct {
-	PID gen.PID
-	Ch  chan error
-}
-
-type messageSpawnProcess struct {
-	Name    gen.Atom // Optional
-	Factory gen.ProcessFactory
-	Options gen.ProcessOptions // Optional
-	Args    []any              // Optional
-	Ch      chan error         // Optional
-}
-
-func (w *myworker) HandleMessage(from gen.PID, message any) error {
-	switch e := message.(type) {
-	case messageNodeSend:
-		if e.toNode != "" {
-			if e.toNode == w.Node().Name() {
-				e.ch <- nodeResult{err: w.Send(gen.Atom(e.to), e.msg)}
-			} else {
-				e.ch <- nodeResult{err: w.SendImportant(gen.ProcessID{Node: e.toNode, Name: gen.Atom(e.to)}, e.msg)}
-			}
-		} else {
-			p, err := w.book.QueryBy(w, system.QueryOption{}).Locate(gen.Atom(e.to))
-			if err != nil || p == "" || w.Node().Name() == p {
-				e.ch <- nodeResult{err: w.Send(gen.Atom(e.to), e.msg)}
-			} else {
-				e.ch <- nodeResult{err: w.SendImportant(gen.ProcessID{Node: p, Name: gen.Atom(e.to)}, e.msg)}
-			}
-		}
-	case messageNodeCall:
-		var res any
-		var err error
-		var p gen.Atom
-		if e.toNode != "" {
-			p = e.toNode
-		} else {
-			p, err = w.book.QueryBy(w, system.QueryOption{Timeout: e.timeout}).Locate(gen.Atom(e.to))
-		}
-		if err != nil || p == "" || w.Node().Name() == p {
-			if e.timeout > 0 {
-				res, err = w.CallWithTimeout(gen.Atom(e.to), e.msg, e.timeout)
-			} else {
-				res, err = w.Call(gen.Atom(e.to), e.msg)
-			}
-		} else {
-			if e.timeout > 0 {
-				res, err = w.CallWithTimeout(gen.ProcessID{Node: p, Name: gen.Atom(e.to)}, e.msg, e.timeout)
-			} else {
-				res, err = w.CallImportant(gen.ProcessID{Node: p, Name: gen.Atom(e.to)}, e.msg)
-			}
-		}
-		e.ch <- nodeResult{response: res, err: err}
-	case messageNodeCallLocal:
-		if e.timeout > 0 {
-			res, err := w.CallWithTimeout(gen.Atom(e.to), e.msg, e.timeout)
-			e.ch <- nodeResult{response: res, err: err}
-		} else {
-			res, err := w.Call(gen.Atom(e.to), e.msg)
-			e.ch <- nodeResult{response: res, err: err}
-		}
-	case messageSpawnProcess:
-		sendResp := func(err error) {
-			if e.Ch != nil {
-				e.Ch <- err
-			}
-		}
-		var pid gen.PID
-		var err error
-		if e.Name != "" {
-			pid, err = w.SpawnRegister(e.Name, e.Factory, e.Options, e.Args...)
-		} else {
-			pid, err = w.Spawn(e.Factory, e.Options, e.Args...)
-		}
-		if err != nil {
-			sendResp(err)
-			return nil
-		}
-		if e.Ch != nil {
-			err = w.MonitorPID(pid)
-			if err != nil {
-				w.Node().Kill(pid)
-				sendResp(err)
-				return nil
-			}
-			w.monitorPID[pid] = e.Ch
-		}
-	case messageWaitProcess:
-		if err := w.MonitorPID(e.PID); err != nil {
-			e.Ch <- err
-			return nil
-		} else {
-			w.monitorPID[e.PID] = e.Ch
-		}
-	case gen.MessageDownPID:
-		if ch, ok := w.monitorPID[e.PID]; ok {
-			delete(w.monitorPID, e.PID)
-			if e.Reason == gen.TerminateReasonNormal {
-				ch <- nil
-			} else {
-				ch <- e.Reason
-			}
-			w.Log().Info("PID:%s exit with reason %v", e.PID, e.Reason)
-			w.DemonitorPID(e.PID)
-		}
-	}
-	return nil
 }
 
 func NewCaller(process gen.Process) *Caller {

@@ -16,10 +16,8 @@ import (
 type Node interface {
 	gen.Node
 	LocateProcess(process gen.Atom) gen.Atom
-	ForwardCall(to string, msg any, opts ...CallOpts) (any, error)
-	CallLocal(to string, msg any, opts ...CallOpts) (any, error)
-	ForwardSend(to string, msg any, opts ...CallOpts) error
-	ForwardSpawn(fac gen.ProcessFactory, args ...any) error
+	ForwardCall(to string, msg any, opts ...ForwardOpts) (any, error)
+	ForwardSend(to string, msg any, opts ...ForwardOpts) error
 	ForwardSpawnAndWait(fac gen.ProcessFactory, args ...any) error
 	WaitPID(pid gen.PID) error
 	AddressBook() system.IAddressBook
@@ -37,7 +35,6 @@ type SimpleNodeOptions struct {
 	Cookie                string                      // Cluster cookie (must match across nodes).
 	MoreApps              []gen.ApplicationBehavior   // Extra applications to start on the node.
 	MemberSpecs           []gen.ApplicationMemberSpec // Additional application members to start.
-	NodeForwardWorker     int64                       // Worker count for forwarding calls/sends.
 	LogLevel              gen.LogLevel                // Node log level.
 	DefaultLogOptions     gen.DefaultLoggerOptions    // Default logger configuration.
 	CronJobs              []CronJob                   // Cron jobs for `system.CronJobProcess`.
@@ -46,16 +43,16 @@ type SimpleNodeOptions struct {
 	Registrar             gen.Registrar               // Custom registrar implementation (used if Endpoints is empty).
 }
 
-type CallOpts func(*callopts)
-type callopts struct {
+type ForwardOpts func(*forwardopts)
+type forwardopts struct {
 	Timeout int
 	Node    gen.Atom
 }
 
-func CallTimeout(t int) CallOpts {
-	return func(o *callopts) { o.Timeout = t }
+func ForwardTimeout(t int) ForwardOpts {
+	return func(o *forwardopts) { o.Timeout = t }
 }
 
-func CallNode(t gen.Atom) CallOpts {
-	return func(o *callopts) { o.Node = t }
+func ForwardNode(t gen.Atom) ForwardOpts {
+	return func(o *forwardopts) { o.Node = t }
 }

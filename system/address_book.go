@@ -139,7 +139,7 @@ func (book *AddressBook) SetProcess(node gen.Atom, ps ...ProcessInfo) error {
 			// enforce node consistency
 			process.Node = node
 			newProcesses[name] = process
-			book.processToNodes[name] = unifyNodes(append(book.processToNodes[name], node))
+			book.processToNodes[name] = appendNodeIfAbsent(book.processToNodes[name], node)
 		}
 	}
 
@@ -176,7 +176,7 @@ func (book *AddressBook) AddProcess(node gen.Atom, ps ...ProcessInfo) error {
 			// enforce node consistency
 			process.Node = node
 			processes[name] = process
-			book.processToNodes[name] = unifyNodes(append(book.processToNodes[name], node))
+			book.processToNodes[name] = appendNodeIfAbsent(book.processToNodes[name], node)
 		}
 	}
 	book.nodeProcesses[node] = processes
@@ -212,29 +212,50 @@ func (book *AddressBook) RemoveProcess(node gen.Atom, ps ...ProcessInfo) error {
 
 // SetAvailableNodes sets a list of available nodes.
 func (book *AddressBook) SetAvailableNodes(nodes *NodeList) error {
-	book.mu.Lock()
-	defer book.mu.Unlock()
-	var isChanged bool
-
 	n := nodes.Len()
+	allNodes := nodes.GetAll()
+
+	// Phase 1: Compute directory node set without holding the lock.
+	// Sorting and hashing can be expensive for large clusters; doing this
+	// outside the critical section avoids blocking concurrent readers.
 	dirNodeCount := 5
 	if n > 25 {
 		dirNodeCount = max(5, int(math.Sqrt(float64(n))))
 	}
 
-	dirNodes := make(map[gen.Atom]struct{})
-	nodes.Range(func(item gen.Atom) bool {
-		// Update directory ring: pick top N nodes as directory nodes
-		if len(dirNodes) < dirNodeCount {
-			dirNodes[item] = struct{}{}
-		}
+	hashMap := make(map[gen.Atom]uint64, len(allNodes))
+	for _, nd := range allNodes {
+		hashMap[nd] = xxhash.Sum64([]byte(nd))
+	}
+	dirCandidates := make([]gen.Atom, len(allNodes))
+	copy(dirCandidates, allNodes)
+	sort.Slice(dirCandidates, func(i, j int) bool {
+		return hashMap[dirCandidates[i]] < hashMap[dirCandidates[j]]
+	})
+	dirNodes := make(map[gen.Atom]struct{}, dirNodeCount)
+	for i := 0; i < dirNodeCount && i < len(dirCandidates); i++ {
+		dirNodes[dirCandidates[i]] = struct{}{}
+	}
+
+	// Also pre-build a lookup set outside the lock.
+	newNodeSet := make(map[gen.Atom]struct{}, len(allNodes))
+	for _, nd := range allNodes {
+		newNodeSet[nd] = struct{}{}
+	}
+
+	// Phase 2: Acquire lock and apply changes.
+	book.mu.Lock()
+	defer book.mu.Unlock()
+	var isChanged bool
+
+	// Update data ring with new nodes
+	for _, item := range allNodes {
 		if _, ok := book.nodes[item]; !ok {
 			book.nodes[item] = struct{}{}
 			book.ring.Add(Member(item))
+			isChanged = true
 		}
-		isChanged = true
-		return true
-	})
+	}
 
 	// Refresh dirRing: simplest way is to rebuild it if set of nodes changed
 	// but let's be more efficient.
@@ -255,7 +276,7 @@ func (book *AddressBook) SetAvailableNodes(nodes *NodeList) error {
 	}
 
 	for item := range book.nodes {
-		if !nodes.Exist(item) {
+		if _, ok := newNodeSet[item]; !ok {
 			book.ring.Remove(string(item))
 			delete(book.nodes, item)
 			isChanged = true
@@ -299,6 +320,27 @@ func (book *AddressBook) PickDirectoryNode(process gen.Atom) gen.Atom {
 	return gen.Atom("")
 }
 
+// PickDirectoryNodeBatch returns directory node names for all given process names
+// using consistent hashing. It acquires the read lock once for all lookups,
+// reducing lock overhead compared to calling PickDirectoryNode per process.
+func (book *AddressBook) PickDirectoryNodeBatch(processes []gen.Atom) map[gen.Atom]gen.Atom {
+	if len(processes) == 0 {
+		return nil
+	}
+	book.mu.RLock()
+	defer book.mu.RUnlock()
+	result := make(map[gen.Atom]gen.Atom, len(processes))
+	for _, p := range processes {
+		if p == "" {
+			continue
+		}
+		if m := book.dirRing.LocateKey([]byte(p)); m != nil {
+			result[p] = gen.Atom(m.String())
+		}
+	}
+	return result
+}
+
 // GetAvailableNodes returns a list of available nodes.
 func (book *AddressBook) GetAvailableNodes() *NodeList {
 	return book.nodesCache.Load().(*NodeList)
@@ -320,10 +362,35 @@ func (book *AddressBook) NodesVersion() int64 {
 
 // unifyNodes sorts and removes duplicates from the given list of nodes.
 func unifyNodes(nodes []gen.Atom) []gen.Atom {
+	// Fast path: for small slices (common case where a process runs on 1-2 nodes),
+	// avoid map allocation by using a simple linear dedup.
+	if len(nodes) <= 4 {
+		sort.SliceStable(nodes, func(i, j int) bool { return nodes[i] < nodes[j] })
+		j := 0
+		for i, v := range nodes {
+			if i == 0 || v != nodes[i-1] {
+				nodes[j] = v
+				j++
+			}
+		}
+		return nodes[:j]
+	}
 	sort.SliceStable(nodes, func(i int, j int) bool {
 		return nodes[i] < nodes[j]
 	})
 	return uniqNodes(nodes)
+}
+
+// appendNodeIfAbsent appends node to the sorted, deduplicated slice only when
+// the node is not already present, avoiding the allocate-append-sort-dedup
+// cycle that unifyNodes(append(slice, node)) would perform.
+func appendNodeIfAbsent(nodes []gen.Atom, node gen.Atom) []gen.Atom {
+	for _, n := range nodes {
+		if n == node {
+			return nodes
+		}
+	}
+	return unifyNodes(append(nodes, node))
 }
 
 func sortNodes(n []gen.Atom) []gen.Atom {
@@ -438,8 +505,7 @@ func (query *bookQuery) Locate(processName gen.Atom) (node gen.Atom, err error) 
 			query.nodesVersion.Store(version)
 		}
 		if val, ok := query.processToNode.Load(processName); ok {
-			p := val.(cacheProcess)
-			if p.expireAt > time.Now().Unix() {
+			if p, ok := val.(cacheProcess); ok && p.expireAt > time.Now().Unix() {
 				return p.node, nil
 			}
 		}

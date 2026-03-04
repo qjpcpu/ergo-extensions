@@ -70,7 +70,28 @@ func (w *whereis) HandleMessage(from gen.PID, message any) error {
 		w.SendAfter(w.PID(), messageInspectProcess{}, delay)
 	case messageTopologyChange:
 		if e.ID == w.topologyChangeID {
-			w.handleTopologyChange(w.processCache.Load())
+			procs := w.processCache.Load()
+			// Batch lookup current directory assignments before ring update
+			names := make([]gen.Atom, len(procs))
+			for i, p := range procs {
+				names[i] = p.Name
+			}
+			oldOwners := w.book.PickDirectoryNodeBatch(names)
+			// Update ring with current membership
+			nodeList, _ := w.fetchAvailableBookNodes()
+			// Purge stale nodeVersions for nodes no longer in the cluster
+			if nodeList != nil {
+				for node := range w.nodeVersions {
+					if !nodeList.Exist(node) {
+						delete(w.nodeVersions, node)
+					}
+				}
+			}
+			// Refresh local address book entry
+			w.book.SetProcess(w.Node().Name(), procs...)
+			// Only sync shards affected by the ring change
+			w.selfVersion = w.selfVersion.Incr()
+			w.syncAffectedShards(procs, oldOwners)
 		}
 	case MessageProcessChanged:
 		return w.handleProcessChanged(e)
@@ -144,11 +165,11 @@ func (w *whereis) HandleCall(from gen.PID, ref gen.Ref, request any) (any, error
 func (w *whereis) HandleEvent(event gen.MessageEvent) error {
 	switch event.Message.(type) {
 	case events.EventNodeJoined, events.EventNodeLeft:
-		nodeList, _ := w.fetchAvailableBookNodes()
-		n := 1
-		if nodeList != nil {
-			n = nodeList.Len()
-		}
+		// Use cached node count for delay calculation to avoid acquiring
+		// a write lock (via fetchAvailableBookNodes) on every event.
+		// The actual ring update is deferred to messageTopologyChange,
+		// which is debounced by topologyChangeID.
+		n := max(1, w.book.GetAvailableNodes().Len())
 		// Stagger the sync based on cluster size to prevent sync storms.
 		// Base delay 100ms, max delay proportional to node count (10ms per node).
 		// Cap the max random delay at 20 seconds.
@@ -161,9 +182,20 @@ func (w *whereis) HandleEvent(event gen.MessageEvent) error {
 }
 
 func (w *whereis) registerToShards(msg MessageProcessChanged) {
+	// Batch lookup directory owners to acquire the lock only once
+	// instead of per-process, reducing lock overhead in large clusters.
+	names := make([]gen.Atom, 0, len(msg.UpProcess)+len(msg.DownProcess))
+	for _, p := range msg.UpProcess {
+		names = append(names, p.Name)
+	}
+	for _, p := range msg.DownProcess {
+		names = append(names, p.Name)
+	}
+	owners := w.book.PickDirectoryNodeBatch(names)
+
 	shards := make(map[gen.Atom]*MessageProcessChanged)
 	for _, p := range msg.UpProcess {
-		owner := w.book.PickDirectoryNode(p.Name)
+		owner := owners[p.Name]
 		if owner == "" {
 			continue
 		}
@@ -177,7 +209,7 @@ func (w *whereis) registerToShards(msg MessageProcessChanged) {
 		shards[owner].UpProcess = append(shards[owner].UpProcess, p)
 	}
 	for _, p := range msg.DownProcess {
-		owner := w.book.PickDirectoryNode(p.Name)
+		owner := owners[p.Name]
 		if owner == "" {
 			continue
 		}
@@ -205,7 +237,7 @@ func (w *whereis) inspectProcessList() error {
 	}
 
 	w.antiEntropyCounter++
-	if w.antiEntropyCounter >= 100 {
+	if w.antiEntropyCounter >= w.antiEntropyThreshold() {
 		w.antiEntropyCounter = 0
 		w.selfVersion = w.selfVersion.Incr()
 		w.book.SetProcess(w.Node().Name(), all...)
@@ -361,6 +393,54 @@ func (w *whereis) handleProcessChanged(e MessageProcessChanged) error {
 }
 
 func (w *whereis) Terminate(reason error) {
+}
+
+// antiEntropyThreshold returns the number of inspection cycles between
+// full anti-entropy syncs, scaled by cluster size. Larger clusters use
+// longer intervals to avoid excessive FullSync traffic.
+func (w *whereis) antiEntropyThreshold() int {
+	n := w.book.GetAvailableNodes().Len()
+	return min(max(100, n/2), 2000)
+}
+
+// syncAffectedShards sends FullSync only to directory nodes whose
+// ownership of at least one process changed due to ring rebalancing.
+// This avoids a broadcast storm when only a small portion of the hash
+// ring is affected by a topology change.
+func (w *whereis) syncAffectedShards(procs ProcessInfoList, oldOwners map[gen.Atom]gen.Atom) {
+	// Batch lookup new owners to acquire the lock only once.
+	names := make([]gen.Atom, len(procs))
+	for i, p := range procs {
+		names[i] = p.Name
+	}
+	newOwners := w.book.PickDirectoryNodeBatch(names)
+
+	shards := make(map[gen.Atom]*MessageProcessChanged)
+	affectedOwners := make(map[gen.Atom]bool)
+
+	for _, p := range procs {
+		newOwner := newOwners[p.Name]
+		if newOwner == "" {
+			continue
+		}
+		if _, ok := shards[newOwner]; !ok {
+			shards[newOwner] = &MessageProcessChanged{
+				Node:     w.Node().Name(),
+				Version:  w.selfVersion,
+				FullSync: true,
+			}
+		}
+		shards[newOwner].UpProcess = append(shards[newOwner].UpProcess, p)
+		if oldOwners[p.Name] != newOwner {
+			affectedOwners[newOwner] = true
+		}
+	}
+
+	for owner, msg := range shards {
+		if owner != w.Node().Name() && affectedOwners[owner] {
+			w.Send(gen.ProcessID{Node: owner, Name: WhereIsProcess}, *msg)
+		}
+	}
 }
 
 func (w *whereis) handleTopologyChange(localProcs ProcessInfoList) {

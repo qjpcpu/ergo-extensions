@@ -98,12 +98,14 @@ func TestCronJobs(t *testing.T) {
 }
 
 func containsJob(t *testing.T, n app.Node, jobName gen.Atom) bool {
-	res, err := n.CallLocal(string(system.CronJobProcess), "inspect")
+	res, err := n.ForwardCall(string(system.CronJobProcess), "inspect", app.ForwardNode(n.Name()))
 	if err != nil {
+		t.Logf("Failed to call cron process on node %s: %v", n.Name(), err)
 		return false
 	}
 	m, ok := res.(map[string]string)
 	if !ok {
+		t.Logf("Cron process returned unexpected type: %T", res)
 		return false
 	}
 	return contains(m["jobs"], string(jobName))

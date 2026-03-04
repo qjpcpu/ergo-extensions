@@ -58,7 +58,7 @@ import "github.com/qjpcpu/ergo-extensions/system"
     - Supports global process lookups via `IAddressBookQuery` (returned by `book.QueryBy(caller)`)
 - `app.StartSimpleNode`:
   - Starts an Ergo node and loads the `system.Supervisor` with a shared `IAddressBook`
-  - Returns an `app.Node` with helpers: `LocateProcess`, `ForwardCall`, `ForwardSend`, `ForwardSpawn`, `WaitPID`, etc.
+  - Returns an `app.Node` with helpers: `LocateProcess`, `ForwardCall`, `ForwardSend`, `WaitPID`, etc.
 
 ## Quick Start
 
@@ -90,7 +90,6 @@ n, err := app.StartSimpleNode(app.SimpleNodeOptions{
             Scope:         system.CronJobScopeCluster,
         },
     },
-    NodeForwardWorker: 8,
     SyncProcessInterval: time.Second * 3,
 })
 _ = n
@@ -167,7 +166,6 @@ picked := book.PickNode(gen.Atom("worker.A")) // pick based on consistent hashin
   - `LocateProcess(name gen.Atom) gen.Atom`
   - `ForwardCall(to string, msg any) (any, error)`
   - `ForwardSend(to string, msg any) error`
-  - `ForwardSpawn(fac gen.ProcessFactory, args ...any) error`
   - `WaitPID(pid gen.PID) error`
   - `AddressBook() IAddressBook`
 - Daemon orchestration:

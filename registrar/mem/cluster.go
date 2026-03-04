@@ -58,9 +58,11 @@ func (c *Cluster) AddRoutes(node gen.Atom, routes []gen.Route, onEvent func(any)
 	if node == "" {
 		return
 	}
+	var pendingEvents []func()
+
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if _, ok := c.routes[node]; ok {
+		c.mu.Unlock()
 		return
 	}
 	c.routes[node] = routes
@@ -68,20 +70,29 @@ func (c *Cluster) AddRoutes(node gen.Atom, routes []gen.Route, onEvent func(any)
 	c.nodes = append(c.nodes, node)
 	c.onEvent.Store(node, onEvent)
 	c.onEvent.Range(func(key, value any) bool {
-		event := events.EventNodeJoined{Name: node}
-		value.(func(any))(event)
+		sendEvent := value.(func(any))
+		pendingEvents = append(pendingEvents, func() {
+			sendEvent(events.EventNodeJoined{Name: node})
+		})
 		return true
 	})
-	c.updateLeadership()
+	pendingEvents = c.collectLeadershipEvents(pendingEvents)
+	c.mu.Unlock()
+
+	for _, fn := range pendingEvents {
+		fn()
+	}
 }
 
 func (c *Cluster) RemoveNode(node gen.Atom) {
 	if node == "" {
 		return
 	}
+	var pendingEvents []func()
+
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if _, ok := c.routes[node]; !ok {
+		c.mu.Unlock()
 		return
 	}
 	delete(c.routes, node)
@@ -93,35 +104,53 @@ func (c *Cluster) RemoveNode(node gen.Atom) {
 		}
 	}
 	c.onEvent.Range(func(key, value any) bool {
-		event := events.EventNodeLeft{Name: node}
-		value.(func(any))(event)
+		sendEvent := value.(func(any))
+		pendingEvents = append(pendingEvents, func() {
+			sendEvent(events.EventNodeLeft{Name: node})
+		})
 		return true
 	})
-	c.updateLeadership()
+	pendingEvents = c.collectLeadershipEvents(pendingEvents)
 	c.onEvent.Delete(node)
+	c.mu.Unlock()
+
+	for _, fn := range pendingEvents {
+		fn()
+	}
 }
 
-func (c *Cluster) updateLeadership() {
+// collectLeadershipEvents computes leadership changes and appends event
+// dispatch closures to pendingEvents. Must be called with c.mu held.
+func (c *Cluster) collectLeadershipEvents(pendingEvents []func()) []func() {
 	if len(c.nodes) == 0 {
 		if c.leader != "" {
-			if value, ok := c.onEvent.Load(c.leader); ok {
+			oldLeader := c.leader
+			if value, ok := c.onEvent.Load(oldLeader); ok {
 				sendEvent := value.(func(any))
-				sendEvent(events.EventNodeSwitchedToFollower{Name: c.leader})
+				pendingEvents = append(pendingEvents, func() {
+					sendEvent(events.EventNodeSwitchedToFollower{Name: oldLeader})
+				})
 			}
 			c.leader = ""
 		}
-		return
+		return pendingEvents
 	}
 	leader := c.nodes[0]
 	if leader != c.leader {
-		if value, ok := c.onEvent.Load(c.leader); ok {
+		oldLeader := c.leader
+		if value, ok := c.onEvent.Load(oldLeader); ok {
 			sendEvent := value.(func(any))
-			sendEvent(events.EventNodeSwitchedToFollower{Name: c.leader})
+			pendingEvents = append(pendingEvents, func() {
+				sendEvent(events.EventNodeSwitchedToFollower{Name: oldLeader})
+			})
 		}
 		if value, ok := c.onEvent.Load(leader); ok {
 			sendEvent := value.(func(any))
-			sendEvent(events.EventNodeSwitchedToLeader{Name: leader})
+			pendingEvents = append(pendingEvents, func() {
+				sendEvent(events.EventNodeSwitchedToLeader{Name: leader})
+			})
 		}
 		c.leader = leader
 	}
+	return pendingEvents
 }

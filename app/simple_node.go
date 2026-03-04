@@ -15,8 +15,7 @@ import (
 
 type nodeImpl struct {
 	gen.Node
-	route gen.Atom
-	book  system.IAddressBook
+	book system.IAddressBook
 }
 
 func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
@@ -59,11 +58,6 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 	}
 	options.Network.Cookie = str(opts.Cookie, "simple-app-cookie")
 	options.Network.InsecureSkipVerify = true
-	router := gen.Atom("app_routes")
-	opts.MemberSpecs = append(opts.MemberSpecs, gen.ApplicationMemberSpec{
-		Name:    router,
-		Factory: CreatePool(func() gen.ProcessBehavior { return &myworker{monitorPID: make(map[gen.PID]chan error), book: book} }, opts.NodeForwardWorker),
-	})
 	apps := []gen.ApplicationBehavior{newApp(book, opts)}
 	options.Applications = append(apps, opts.MoreApps...)
 
@@ -79,7 +73,7 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &nodeImpl{Node: node, route: router, book: book}, nil
+	return &nodeImpl{Node: node, book: book}, nil
 }
 
 func str(list ...string) string {
@@ -91,100 +85,125 @@ func str(list ...string) string {
 	return ""
 }
 
+func (n *nodeImpl) spawnTemp(fn func(*tempActor)) error {
+	_, err := n.Spawn(func() gen.ProcessBehavior {
+		return &tempActor{fn: fn, book: n.book}
+	}, gen.ProcessOptions{})
+	return err
+}
+
 func (n *nodeImpl) WaitPID(pid gen.PID) error {
 	ch := make(chan error, 1)
-	err := n.Send(n.route, messageWaitProcess{
-		PID: pid,
-		Ch:  ch,
-	})
+	_, err := n.Spawn(func() gen.ProcessBehavior {
+		return &monitorActor{
+			ch:  ch,
+			pid: pid,
+			setup: func(w *monitorActor) error {
+				return w.MonitorPID(pid)
+			},
+		}
+	}, gen.ProcessOptions{})
 	if err != nil {
 		return err
 	}
 	return <-ch
 }
 
-func (n *nodeImpl) ForwardSend(to string, msg any, opts ...CallOpts) error {
+func (n *nodeImpl) ForwardSend(to string, msg any, opts ...ForwardOpts) error {
 	ch := make(chan nodeResult, 1)
 	option := n.getOpts(opts...)
-	err := n.Send(n.route, messageNodeSend{
-		to:     to,
-		toNode: option.Node,
-		msg:    msg,
-		ch:     ch,
+	err := n.spawnTemp(func(w *tempActor) {
+		if option.Node != "" {
+			if option.Node == w.Node().Name() {
+				ch <- nodeResult{err: w.Send(gen.Atom(to), msg)}
+			} else {
+				ch <- nodeResult{err: w.SendImportant(gen.ProcessID{Node: option.Node, Name: gen.Atom(to)}, msg)}
+			}
+		} else {
+			p, locErr := w.book.QueryBy(w, system.QueryOption{}).Locate(gen.Atom(to))
+			if locErr != nil || p == "" || w.Node().Name() == p {
+				ch <- nodeResult{err: w.Send(gen.Atom(to), msg)}
+			} else {
+				ch <- nodeResult{err: w.SendImportant(gen.ProcessID{Node: p, Name: gen.Atom(to)}, msg)}
+			}
+		}
 	})
 	if err != nil {
 		return err
 	}
-	res := <-ch
-	if res.err != nil {
-		return res.err
-	}
-	return nil
+	return (<-ch).err
 }
 
-func (n *nodeImpl) CallLocal(to string, msg any, opts ...CallOpts) (any, error) {
+func (n *nodeImpl) ForwardCall(to string, msg any, opts ...ForwardOpts) (any, error) {
 	ch := make(chan nodeResult, 1)
 	option := n.getOpts(opts...)
-	err := n.Send(n.route, messageNodeCallLocal{
-		to:      to,
-		msg:     msg,
-		ch:      ch,
-		timeout: option.Timeout,
+	err := n.spawnTemp(func(w *tempActor) {
+		var res any
+		var callErr error
+		var p gen.Atom
+		if option.Node != "" {
+			p = option.Node
+		} else {
+			p, callErr = w.book.QueryBy(w, system.QueryOption{Timeout: option.Timeout}).Locate(gen.Atom(to))
+		}
+		if callErr != nil || p == "" || w.Node().Name() == p {
+			if option.Timeout > 0 {
+				res, callErr = w.CallWithTimeout(gen.Atom(to), msg, option.Timeout)
+			} else {
+				res, callErr = w.Call(gen.Atom(to), msg)
+			}
+		} else {
+			if option.Timeout > 0 {
+				res, callErr = w.CallWithTimeout(gen.ProcessID{Node: p, Name: gen.Atom(to)}, msg, option.Timeout)
+			} else {
+				res, callErr = w.CallImportant(gen.ProcessID{Node: p, Name: gen.Atom(to)}, msg)
+			}
+		}
+		ch <- nodeResult{response: res, err: callErr}
 	})
 	if err != nil {
 		return nil, err
 	}
 	res := <-ch
-	if res.err != nil {
-		return nil, res.err
-	}
-	return res.response, nil
-}
-
-func (n *nodeImpl) ForwardCall(to string, msg any, opts ...CallOpts) (any, error) {
-	ch := make(chan nodeResult, 1)
-	option := n.getOpts(opts...)
-	err := n.Send(n.route, messageNodeCall{
-		to:      to,
-		toNode:  option.Node,
-		msg:     msg,
-		ch:      ch,
-		timeout: option.Timeout,
-	})
-	if err != nil {
-		return nil, err
-	}
-	res := <-ch
-	if res.err != nil {
-		return nil, res.err
-	}
-	return res.response, nil
+	return res.response, res.err
 }
 
 func (n *nodeImpl) ForwardSpawnAndWait(fac gen.ProcessFactory, args ...any) error {
 	ch := make(chan error, 1)
-	err := n.Send(n.route, messageSpawnProcess{
-		Factory: fac,
-		Options: gen.ProcessOptions{LinkParent: true},
-		Args:    args,
-		Ch:      ch,
-	})
+	_, err := n.Spawn(func() gen.ProcessBehavior {
+		return &monitorActor{
+			ch: ch,
+			setup: func(w *monitorActor) error {
+				pid, err := w.Spawn(fac, gen.ProcessOptions{LinkParent: true}, args...)
+				if err != nil {
+					return err
+				}
+				w.pid = pid
+				if err := w.MonitorPID(pid); err != nil {
+					w.Node().Kill(pid)
+					return err
+				}
+				return nil
+			},
+		}
+	}, gen.ProcessOptions{})
 	if err != nil {
 		return err
 	}
 	return <-ch
 }
 
-func (n *nodeImpl) ForwardSpawn(fac gen.ProcessFactory, args ...any) error {
-	return n.Send(n.route, messageSpawnProcess{
-		Factory: fac,
-		Options: gen.ProcessOptions{LinkParent: true},
-		Args:    args,
-	})
-}
-
 func (n *nodeImpl) LocateProcess(process gen.Atom) gen.Atom {
-	res, err := n.CallLocal(string(system.WhereIsProcess), system.MessageLocate{Name: process}, CallTimeout(10))
+	owner := n.book.PickDirectoryNode(process)
+	if owner == "" {
+		return ""
+	}
+	res, err := n.ForwardCall(
+		string(system.WhereIsProcess),
+		system.MessageLocate{Name: process},
+		ForwardNode(owner),
+		ForwardTimeout(10),
+	)
 	if err != nil {
 		return ""
 	}
@@ -198,8 +217,8 @@ func (n *nodeImpl) AddressBook() system.IAddressBook {
 	return n.book
 }
 
-func (n *nodeImpl) getOpts(options ...CallOpts) *callopts {
-	o := new(callopts)
+func (n *nodeImpl) getOpts(options ...ForwardOpts) *forwardopts {
+	o := new(forwardopts)
 	for _, fn := range options {
 		fn(o)
 	}

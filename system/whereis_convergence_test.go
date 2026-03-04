@@ -39,7 +39,6 @@ func startNode(t *testing.T, cluster *mem.Cluster, name string) app.Node {
 		Port:                  0,
 		Cookie:                "whereis-test-cookie",
 		Registrar:             mem.CreateWithCluster(cluster),
-		NodeForwardWorker:     1,
 		SyncProcessInterval:   50 * time.Millisecond,
 		DefaultRequestTimeout: 3,
 	})

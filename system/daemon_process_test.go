@@ -90,7 +90,7 @@ func TestDaemonLeaderRecovery(t *testing.T) {
 	})
 
 	// Test HandleCall/Inspect
-	res, err := remainingNode.CallLocal(string(system.DaemonMonitorProcess), "inspect")
+	res, err := remainingNode.ForwardCall(string(system.DaemonMonitorProcess), "inspect", app.ForwardNode(remainingNode.Name()))
 	if err != nil {
 		t.Errorf("Daemon inspect failed: %v", err)
 	} else {

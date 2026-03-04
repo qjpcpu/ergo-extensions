@@ -79,8 +79,10 @@ func (w *daemon) HandleEvent(event gen.MessageEvent) error {
 			return nil
 		}
 	case events.EventNodeLeft:
-		w.recovered = make(map[gen.Atom]struct{})
-		w.launchAllAfter(time.Second * 60)
+		if w.isLeader {
+			w.recovered = make(map[gen.Atom]struct{})
+			w.launchAllAfter(time.Second * 10)
+		}
 	}
 	return nil
 }
