@@ -7,7 +7,7 @@ This repository provides a small set of building blocks to add distributed proce
 - `extensions_cron` — a cron-like scheduler that triggers messages on a node or across the cluster.
 - `AddressBook` — a thread-safe, eventually-consistent cache of nodes and their registered processes, with node picking via consistent hashing.
 
-Core components live under the `system` package and are designed to integrate with `ergo.services/ergo` and a registrar (Zookeeper via `github.com/qjpcpu/registrar`, or the built-in in-memory registrar used by `app.StartSimpleNode` when no registrar is provided). The `app` package provides a small helper to start a node with these components wired in.
+Core components live under the `system` package and are designed to integrate with `ergo.services/ergo` and a registrar (ZooKeeper via `github.com/qjpcpu/registrar/zk`, a custom registrar injected via `app.SimpleNodeOptions.Registrar`, or the built-in in-memory registrar used by `app.StartSimpleNode` when neither is provided). The `app` package provides a small helper to start a node with these components wired in.
 
 ## Features
 
@@ -21,9 +21,13 @@ Core components live under the `system` package and are designed to integrate wi
 ## Requirements
 
 - `ergo.services/ergo v1.999.320`
-- A network registrar; the default code expects Zookeeper via `github.com/qjpcpu/registrar`
+- A network registrar implementation (e.g. ZooKeeper via `github.com/qjpcpu/registrar/zk`).
 
-The module’s `go.mod` includes a `replace` directive to use `github.com/qjpcpu/registrar/zk` for the registrar.
+This repo does not rely on a `go.mod replace` for the registrar. Instead:
+
+- If `app.StartSimpleNode` is started with `SimpleNodeOptions.Endpoints` set, it creates a ZooKeeper registrar via `zk.Create`.
+- If `SimpleNodeOptions.Registrar` is provided (and `Endpoints` is empty), it uses that registrar.
+- Otherwise it falls back to the built-in in-memory registrar (`registrar/mem`) for local/single-node development.
 
 ## Install
 
@@ -73,7 +77,7 @@ spec := gen.ApplicationSpec{
 // Wire this application spec into your Ergo node environment/startup as usual.
 ```
 
-Or start a node with everything wired in (uses Zookeeper registrar when `Endpoints` is set, otherwise falls back to an in-memory single-node registrar):
+Or start a node with everything wired in (uses ZooKeeper registrar when `Endpoints` is set; otherwise uses `Registrar` when provided; otherwise falls back to an in-memory single-node registrar):
 
 ```go
 n, err := app.StartSimpleNode(app.SimpleNodeOptions{
@@ -183,12 +187,14 @@ picked := book.PickNode(gen.Atom("worker.A")) // pick based on consistent hashin
 
 ## Registrar & Events
 
-The code expects a working registrar from the Ergo network. With Zookeeper (`github.com/qjpcpu/registrar`), the following events are handled:
+The code expects a working registrar from the Ergo network. With ZooKeeper (`github.com/qjpcpu/registrar/zk`), the following events are handled:
 
 - Leadership changes: `EventNodeSwitchedToLeader`, `EventNodeSwitchedToFollower`
 - Membership changes: `EventNodeJoined`, `EventNodeLeft`
 
-`extensions_cron` will rebalance on joins/left; `extensions_daemon` will re-plan launches on left/failover and trigger recovery when this node becomes leader. `extensions_whereis` syncs periodically and does not depend on registrar events.
+`extensions_cron` will rebalance on joins/left; `extensions_daemon` will re-plan launches on left/failover and trigger recovery when this node becomes leader.
+
+`extensions_whereis` is primarily driven by periodic inspection + anti-entropy sync. It also listens to membership events (`EventNodeJoined`/`EventNodeLeft`) to debounce topology changes and refresh the available node list used by the hash rings, avoiding sync storms.
 
 ## Design Notes
 
@@ -213,4 +219,3 @@ The code expects a working registrar from the Ergo network. With Zookeeper (`git
 ## License
 
 MIT License. See `LICENSE` for details.
-
