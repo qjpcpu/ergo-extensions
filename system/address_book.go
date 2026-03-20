@@ -1,6 +1,7 @@
 package system
 
 import (
+	"fmt"
 	"math"
 	"sort"
 	"strings"
@@ -37,6 +38,101 @@ type IAddressBook interface {
 	GetAvailableNodes() *NodeList
 }
 
+// call represents an in-flight or completed function call.
+// Multiple goroutines can wait for the same call's result via the WaitGroup.
+type call[T any] struct {
+	wg  sync.WaitGroup
+	val T
+	err error
+}
+
+// singleFlightGroup ensures that only one function call for a given key executes at a time.
+// Concurrent calls with the same key will block and share the result of the first call.
+// This prevents the thundering herd problem and resource waste from duplicate work.
+//
+// Type parameter T is the result type of the function being executed.
+type singleFlightGroup[T any] struct {
+	mu sync.Mutex
+	m  map[string]*call[T]
+}
+
+// Do executes fn for the given key, ensuring only one execution happens at a time.
+// If multiple goroutines call Do concurrently with the same key, only the first call
+// executes fn; subsequent calls wait and receive the same result.
+//
+// If fn panics, the panic is recovered and returned as an error.
+func (g *singleFlightGroup[T]) Do(key string, fn func() (T, error)) (T, error) {
+	c := g.getOrCreateCall(key)
+	if c == nil {
+		// Already in progress, wait for existing call
+		return g.waitForExistingCall(key)
+	}
+	defer g.cleanupCall(key, c)
+
+	return g.executeCall(c, fn)
+}
+
+// getOrCreateCall attempts to create a new call for the key.
+// Returns nil if a call for this key already exists (meaning another goroutine
+// is already executing the function).
+func (g *singleFlightGroup[T]) getOrCreateCall(key string) *call[T] {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.m == nil {
+		g.m = make(map[string]*call[T])
+	}
+	if _, ok := g.m[key]; ok {
+		return nil // existing call found
+	}
+	c := new(call[T])
+	c.wg.Add(1)
+	g.m[key] = c
+	return c
+}
+
+// waitForExistingCall waits for the result of an existing in-flight call.
+// Should only be called when another goroutine has already created the call.
+func (g *singleFlightGroup[T]) waitForExistingCall(key string) (T, error) {
+	g.mu.Lock()
+	c, ok := g.m[key]
+	if ok {
+		c.wg.Add(1)
+	}
+	g.mu.Unlock()
+
+	if !ok {
+		var zero T
+		return zero, nil
+	}
+	defer c.wg.Done()
+	c.wg.Wait()
+	return c.val, c.err
+}
+
+// cleanupCall marks the call as complete and removes it from the group's map.
+// Called via defer to ensure cleanup happens regardless of success/failure.
+func (g *singleFlightGroup[T]) cleanupCall(key string, c *call[T]) {
+	c.wg.Done()
+
+	g.mu.Lock()
+	delete(g.m, key)
+	g.mu.Unlock()
+}
+
+// executeCall runs the function, capturing its result or any panic.
+// Panics are recovered and converted to errors to prevent process crashes.
+func (g *singleFlightGroup[T]) executeCall(c *call[T], fn func() (T, error)) (T, error) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.err = fmt.Errorf("panic in singleFlightGroup.Do: %v", r)
+		}
+	}()
+
+	c.val, c.err = fn()
+	return c.val, c.err
+}
+
 // AddressBook is a registry for all processes running on all nodes
 // in the cluster. It's used to locate processes by their registered names.
 type AddressBook struct {
@@ -46,8 +142,10 @@ type AddressBook struct {
 	nodeProcesses  map[gen.Atom]map[gen.Atom]ProcessInfo
 	ring           *consistent.Consistent // consistent hashing ring
 	dirRing        *consistent.Consistent // directory hashing ring
-	nodesCache     atomic.Value           // cache for available nodes to avoid frequent lock
+	nodesCache     atomic.Value                  // cache for available nodes to avoid frequent lock
 	nodesVersion   atomic.Int64
+	queryCache     sync.Map                     // map[gen.Atom]cacheProcess
+	flightGroup    singleFlightGroup[gen.Atom]  // prevent thundering herd on query
 }
 
 // NewAddressBook creates a new AddressBook
@@ -297,6 +395,14 @@ func (book *AddressBook) SetAvailableNodes(nodes *NodeList) error {
 				}
 			}
 			delete(book.nodeProcesses, item)
+
+			// Clean up global query cache for the offline node
+			book.queryCache.Range(func(key, value any) bool {
+				if p, ok := value.(cacheProcess); ok && p.node == item {
+					book.queryCache.Delete(key)
+				}
+				return true
+			})
 		}
 	}
 	if isChanged {
@@ -490,35 +596,50 @@ type bookQuery struct {
 	caller        ICaller
 	book          *AddressBook
 	option        QueryOption
-	nodesVersion  atomic.Int64
-	processToNode sync.Map
 }
 
 func (query *bookQuery) Locate(processName gen.Atom) (node gen.Atom, err error) {
 	if processName == "" {
-		return
+		return "", nil
 	}
-	setCache := func(n gen.Atom) {}
-	if ttl := query.option.CacheTTL; ttl > 0 {
-		if version := query.book.NodesVersion(); query.nodesVersion.Load() != version {
-			query.processToNode.Clear()
-			query.nodesVersion.Store(version)
-		}
-		if val, ok := query.processToNode.Load(processName); ok {
+
+	ttl := query.option.CacheTTL
+	if ttl > 0 {
+		if val, ok := query.book.queryCache.Load(processName); ok {
 			if p, ok := val.(cacheProcess); ok && p.expireAt > time.Now().Unix() {
 				return p.node, nil
 			}
 		}
-		setCache = func(n gen.Atom) {
-			query.processToNode.Store(processName, cacheProcess{node: n, expireAt: time.Now().Add(time.Second * time.Duration(ttl)).Unix()})
+	}
+
+	v, err := query.book.flightGroup.Do(string(processName), func() (gen.Atom, error) {
+		// Double check
+		if ttl > 0 {
+			if val, ok := query.book.queryCache.Load(processName); ok {
+				if p, ok := val.(cacheProcess); ok && p.expireAt > time.Now().Unix() {
+					return p.node, nil
+				}
+			}
 		}
-	}
-	node, err = query.locate(processName)
+
+		n, e := query.locate(processName)
+		if e != nil {
+			return "", e
+		}
+
+		if ttl > 0 && n != "" {
+			query.book.queryCache.Store(processName, cacheProcess{
+				node:     n,
+				expireAt: time.Now().Add(time.Second * time.Duration(ttl)).Unix(),
+			})
+		}
+		return n, nil
+	})
+
 	if err != nil {
-		return
+		return "", err
 	}
-	setCache(node)
-	return
+	return v, nil
 }
 
 func (query *bookQuery) locate(processName gen.Atom) (node gen.Atom, err error) {
