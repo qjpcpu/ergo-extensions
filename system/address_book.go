@@ -62,50 +62,37 @@ type singleFlightGroup[T any] struct {
 //
 // If fn panics, the panic is recovered and returned as an error.
 func (g *singleFlightGroup[T]) Do(key string, fn func() (T, error)) (T, error) {
-	c := g.getOrCreateCall(key)
-	if c == nil {
-		// Already in progress, wait for existing call
-		return g.waitForExistingCall(key)
+	c, created := g.getOrCreateCall(key)
+	if !created {
+		return g.waitForExistingCall(c)
 	}
 	defer g.cleanupCall(key, c)
 
 	return g.executeCall(c, fn)
 }
 
-// getOrCreateCall attempts to create a new call for the key.
-// Returns nil if a call for this key already exists (meaning another goroutine
-// is already executing the function).
-func (g *singleFlightGroup[T]) getOrCreateCall(key string) *call[T] {
+// getOrCreateCall returns the in-flight call for the key and whether the caller
+// created it. When created is false, the returned call must be waited on instead
+// of executing fn again.
+func (g *singleFlightGroup[T]) getOrCreateCall(key string) (*call[T], bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	if g.m == nil {
 		g.m = make(map[string]*call[T])
 	}
-	if _, ok := g.m[key]; ok {
-		return nil // existing call found
+	if c, ok := g.m[key]; ok {
+		return c, false
 	}
 	c := new(call[T])
 	c.wg.Add(1)
 	g.m[key] = c
-	return c
+	return c, true
 }
 
 // waitForExistingCall waits for the result of an existing in-flight call.
 // Should only be called when another goroutine has already created the call.
-func (g *singleFlightGroup[T]) waitForExistingCall(key string) (T, error) {
-	g.mu.Lock()
-	c, ok := g.m[key]
-	if ok {
-		c.wg.Add(1)
-	}
-	g.mu.Unlock()
-
-	if !ok {
-		var zero T
-		return zero, nil
-	}
-	defer c.wg.Done()
+func (g *singleFlightGroup[T]) waitForExistingCall(c *call[T]) (T, error) {
 	c.wg.Wait()
 	return c.val, c.err
 }

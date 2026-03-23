@@ -4,11 +4,88 @@ import (
 	"reflect"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"ergo.services/ergo/gen"
 )
+
+func TestSingleFlightGroupDoSharesResultWithConcurrentWaiters(t *testing.T) {
+	var group singleFlightGroup[int]
+	var calls atomic.Int32
+
+	type result struct {
+		value int
+		err   error
+	}
+
+	const waiters = 16
+	results := make(chan result, waiters+1)
+	release := make(chan struct{})
+	started := make(chan struct{})
+	startWaiters := make(chan struct{})
+
+	go func() {
+		value, err := group.Do("same-key", func() (int, error) {
+			calls.Add(1)
+			close(started)
+			<-release
+			return 42, nil
+		})
+		results <- result{value: value, err: err}
+	}()
+
+	<-started
+
+	var wg sync.WaitGroup
+	wg.Add(waiters)
+	for i := 0; i < waiters; i++ {
+		go func() {
+			defer wg.Done()
+			<-startWaiters
+			value, err := group.Do("same-key", func() (int, error) {
+				calls.Add(1)
+				return -1, nil
+			})
+			results <- result{value: value, err: err}
+		}()
+	}
+
+	close(startWaiters)
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	for i := 0; i < waiters+1; i++ {
+		select {
+		case res := <-results:
+			if res.err != nil {
+				t.Fatalf("Do returned error: %v", res.err)
+			}
+			if res.value != 42 {
+				t.Fatalf("Do returned unexpected value: %d", res.value)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("Do blocked while sharing in-flight result")
+		}
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("waiters did not finish")
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected fn to execute once, got %d", got)
+	}
+}
 
 func TestAddressBook_Basic(t *testing.T) {
 	book := NewAddressBook()
