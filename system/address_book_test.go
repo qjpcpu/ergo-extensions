@@ -11,6 +11,28 @@ import (
 	"ergo.services/ergo/gen"
 )
 
+type testNode struct {
+	gen.Node
+	name gen.Atom
+}
+
+func (n *testNode) Name() gen.Atom {
+	return n.name
+}
+
+type testCaller struct {
+	node     gen.Node
+	response gen.Atom
+}
+
+func (c *testCaller) Node() gen.Node {
+	return c.node
+}
+
+func (c *testCaller) CallWithTimeout(to any, request any, timeout int) (any, error) {
+	return c.response, nil
+}
+
 func TestSingleFlightGroupDoSharesResultWithConcurrentWaiters(t *testing.T) {
 	var group singleFlightGroup[int]
 	var calls atomic.Int32
@@ -449,6 +471,35 @@ func TestAddressBook_SetAvailableNodes_MultiNode(t *testing.T) {
 	}
 	if len(nodes) != 1 || nodes[0] != node2 {
 		t.Errorf("p1 should be only on node2, got %v", nodes)
+	}
+}
+
+func TestBookQueryDoesNotReturnStaleCachedResult(t *testing.T) {
+	book := NewAddressBook()
+	owner := gen.Atom("owner")
+	book.SetAvailableNodes(NewNodeList(owner))
+
+	caller := &testCaller{
+		node:     &testNode{name: gen.Atom("client")},
+		response: gen.Atom("node-a"),
+	}
+	query := newBookQuery(caller, book, QueryOption{CacheTTL: 60})
+
+	node, err := query.Locate(gen.Atom("proc.cache"))
+	if err != nil {
+		t.Fatalf("first locate failed: %v", err)
+	}
+	if node != "node-a" {
+		t.Fatalf("expected node-a, got %s", node)
+	}
+
+	caller.response = gen.Atom("node-b")
+	node, err = query.Locate(gen.Atom("proc.cache"))
+	if err != nil {
+		t.Fatalf("second locate failed: %v", err)
+	}
+	if node != "node-b" {
+		t.Fatalf("expected fresh result node-b, got %s", node)
 	}
 }
 

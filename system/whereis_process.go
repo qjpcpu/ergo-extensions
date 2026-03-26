@@ -71,12 +71,6 @@ func (w *whereis) HandleMessage(from gen.PID, message any) error {
 	case messageTopologyChange:
 		if e.ID == w.topologyChangeID {
 			procs := w.processCache.Load()
-			// Batch lookup current directory assignments before ring update
-			names := make([]gen.Atom, len(procs))
-			for i, p := range procs {
-				names[i] = p.Name
-			}
-			oldOwners := w.book.PickDirectoryNodeBatch(names)
 			// Update ring with current membership
 			nodeList, _ := w.fetchAvailableBookNodes()
 			// Purge stale nodeVersions for nodes no longer in the cluster
@@ -89,9 +83,10 @@ func (w *whereis) HandleMessage(from gen.PID, message any) error {
 			}
 			// Refresh local address book entry
 			w.book.SetProcess(w.Node().Name(), procs...)
-			// Only sync shards affected by the ring change
+			// Push authoritative shards to every current directory node so
+			// previous owners clear stale state after rebalancing.
 			w.selfVersion = w.selfVersion.Incr()
-			w.syncAffectedShards(procs, oldOwners)
+			w.syncDirectoryShards(procs)
 		}
 	case MessageProcessChanged:
 		return w.handleProcessChanged(e)
@@ -123,6 +118,10 @@ func (w *whereis) HandleMessage(from gen.PID, message any) error {
 			if p, ok := w.book.LocateLocal(e.Name); ok {
 				node = p
 			}
+		} else if owner != "" && e.Hops < 2 {
+			e.Hops++
+			w.Send(gen.ProcessID{Node: owner, Name: WhereIsProcess}, e)
+			return nil
 		}
 		if e.Ref.ID[0] == 0 && e.Ref.ID[1] == 0 && e.Ref.ID[2] == 0 {
 			// it's a Send request
@@ -403,41 +402,40 @@ func (w *whereis) antiEntropyThreshold() int {
 	return min(max(100, n/2), 2000)
 }
 
-// syncAffectedShards sends FullSync only to directory nodes whose
-// ownership of at least one process changed due to ring rebalancing.
-// This avoids a broadcast storm when only a small portion of the hash
-// ring is affected by a topology change.
-func (w *whereis) syncAffectedShards(procs ProcessInfoList, oldOwners map[gen.Atom]gen.Atom) {
-	// Batch lookup new owners to acquire the lock only once.
+// syncDirectoryShards sends an authoritative shard snapshot to every current
+// directory node. Empty shards are sent too, so previous owners clear stale
+// state after topology changes.
+func (w *whereis) syncDirectoryShards(procs ProcessInfoList) {
+	dirNodes := w.book.DirectoryNodes()
+	if len(dirNodes) == 0 {
+		return
+	}
+
 	names := make([]gen.Atom, len(procs))
 	for i, p := range procs {
 		names[i] = p.Name
 	}
-	newOwners := w.book.PickDirectoryNodeBatch(names)
+	owners := w.book.PickDirectoryNodeBatch(names)
 
 	shards := make(map[gen.Atom]*MessageProcessChanged)
-	affectedOwners := make(map[gen.Atom]bool)
-
-	for _, p := range procs {
-		newOwner := newOwners[p.Name]
-		if newOwner == "" {
-			continue
-		}
-		if _, ok := shards[newOwner]; !ok {
-			shards[newOwner] = &MessageProcessChanged{
-				Node:     w.Node().Name(),
-				Version:  w.selfVersion,
-				FullSync: true,
-			}
-		}
-		shards[newOwner].UpProcess = append(shards[newOwner].UpProcess, p)
-		if oldOwners[p.Name] != newOwner {
-			affectedOwners[newOwner] = true
+	for _, owner := range dirNodes {
+		shards[owner] = &MessageProcessChanged{
+			Node:     w.Node().Name(),
+			Version:  w.selfVersion,
+			FullSync: true,
 		}
 	}
 
+	for _, p := range procs {
+		owner := owners[p.Name]
+		if owner == "" {
+			continue
+		}
+		shards[owner].UpProcess = append(shards[owner].UpProcess, p)
+	}
+
 	for owner, msg := range shards {
-		if owner != w.Node().Name() && affectedOwners[owner] {
+		if owner != w.Node().Name() {
 			w.Send(gen.ProcessID{Node: owner, Name: WhereIsProcess}, *msg)
 		}
 	}

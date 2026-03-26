@@ -2,6 +2,7 @@ package mem
 
 import (
 	"ergo.services/ergo/gen"
+	"github.com/qjpcpu/registrar/constants"
 )
 
 type client struct {
@@ -96,7 +97,7 @@ func (c *client) Nodes() ([]gen.Atom, error) {
 }
 
 func (c *client) ConfigItem(item string) (any, error) {
-	if node := c.node; node != nil {
+	if item == constants.LeaderNodeConfigItem {
 		return c.cluster.GetLeader(), nil
 	}
 	return c.cluster.GetVersion(gen.Atom(item)), nil

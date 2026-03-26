@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"ergo.services/ergo/gen"
+	"github.com/qjpcpu/registrar/constants"
 )
 
 func TestCluster(t *testing.T) {
@@ -40,5 +41,30 @@ func TestCluster(t *testing.T) {
 
 	if c.GetVersion("node2") == -1 {
 		t.Error("version should be valid")
+	}
+}
+
+func TestClientConfigItem(t *testing.T) {
+	cluster := NewCluster()
+	cluster.AddRoutes("node1", []gen.Route{{Host: "h1"}}, func(e any) {})
+	cluster.AddRoutes("node2", []gen.Route{{Host: "h2"}}, func(e any) {})
+
+	client := &client{cluster: cluster}
+
+	leader, err := client.ConfigItem(constants.LeaderNodeConfigItem)
+	if err != nil {
+		t.Fatalf("leader ConfigItem failed: %v", err)
+	}
+	if leader != gen.Atom("node1") {
+		t.Fatalf("expected leader node1, got %v", leader)
+	}
+
+	version, err := client.ConfigItem("node2")
+	if err != nil {
+		t.Fatalf("version ConfigItem failed: %v", err)
+	}
+	v, ok := version.(int)
+	if !ok || v < 0 {
+		t.Fatalf("expected non-negative version for node2, got %v", version)
 	}
 }

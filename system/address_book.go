@@ -7,7 +7,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"ergo.services/ergo/gen"
 
@@ -19,7 +18,9 @@ import (
 type QueryOption struct {
 	// Timeout specifies the query timeout in seconds.
 	Timeout int
-	// CacheTTL specifies the cache time to live in seconds.
+	// CacheTTL reserves a caller-side cache window in seconds.
+	// Locate keeps correctness over reuse and does not retain cross-call
+	// positive cache entries.
 	CacheTTL int
 }
 
@@ -129,10 +130,9 @@ type AddressBook struct {
 	nodeProcesses  map[gen.Atom]map[gen.Atom]ProcessInfo
 	ring           *consistent.Consistent // consistent hashing ring
 	dirRing        *consistent.Consistent // directory hashing ring
-	nodesCache     atomic.Value                  // cache for available nodes to avoid frequent lock
+	nodesCache     atomic.Value           // cache for available nodes to avoid frequent lock
 	nodesVersion   atomic.Int64
-	queryCache     sync.Map                     // map[gen.Atom]cacheProcess
-	flightGroup    singleFlightGroup[gen.Atom]  // prevent thundering herd on query
+	flightGroup    singleFlightGroup[gen.Atom] // prevent thundering herd on query
 }
 
 // NewAddressBook creates a new AddressBook
@@ -383,13 +383,6 @@ func (book *AddressBook) SetAvailableNodes(nodes *NodeList) error {
 			}
 			delete(book.nodeProcesses, item)
 
-			// Clean up global query cache for the offline node
-			book.queryCache.Range(func(key, value any) bool {
-				if p, ok := value.(cacheProcess); ok && p.node == item {
-					book.queryCache.Delete(key)
-				}
-				return true
-			})
 		}
 	}
 	if isChanged {
@@ -432,6 +425,18 @@ func (book *AddressBook) PickDirectoryNodeBatch(processes []gen.Atom) map[gen.At
 		}
 	}
 	return result
+}
+
+func (book *AddressBook) DirectoryNodes() []gen.Atom {
+	book.mu.RLock()
+	defer book.mu.RUnlock()
+
+	members := book.dirRing.GetMembers()
+	nodes := make([]gen.Atom, 0, len(members))
+	for _, m := range members {
+		nodes = append(nodes, gen.Atom(m.String()))
+	}
+	return sortNodes(nodes)
 }
 
 // GetAvailableNodes returns a list of available nodes.
@@ -569,20 +574,15 @@ func newBookQuery(caller ICaller, book *AddressBook, option QueryOption) IAddres
 	return &bookQuery{caller: caller, book: book, option: option}
 }
 
-type cacheProcess struct {
-	node     gen.Atom
-	expireAt int64
-}
-
 type ICaller interface {
 	Node() gen.Node
 	CallWithTimeout(to any, request any, timeout int) (any, error)
 }
 
 type bookQuery struct {
-	caller        ICaller
-	book          *AddressBook
-	option        QueryOption
+	caller ICaller
+	book   *AddressBook
+	option QueryOption
 }
 
 func (query *bookQuery) Locate(processName gen.Atom) (node gen.Atom, err error) {
@@ -590,37 +590,8 @@ func (query *bookQuery) Locate(processName gen.Atom) (node gen.Atom, err error) 
 		return "", nil
 	}
 
-	ttl := query.option.CacheTTL
-	if ttl > 0 {
-		if val, ok := query.book.queryCache.Load(processName); ok {
-			if p, ok := val.(cacheProcess); ok && p.expireAt > time.Now().Unix() {
-				return p.node, nil
-			}
-		}
-	}
-
 	v, err := query.book.flightGroup.Do(string(processName), func() (gen.Atom, error) {
-		// Double check
-		if ttl > 0 {
-			if val, ok := query.book.queryCache.Load(processName); ok {
-				if p, ok := val.(cacheProcess); ok && p.expireAt > time.Now().Unix() {
-					return p.node, nil
-				}
-			}
-		}
-
-		n, e := query.locate(processName)
-		if e != nil {
-			return "", e
-		}
-
-		if ttl > 0 && n != "" {
-			query.book.queryCache.Store(processName, cacheProcess{
-				node:     n,
-				expireAt: time.Now().Add(time.Second * time.Duration(ttl)).Unix(),
-			})
-		}
-		return n, nil
+		return query.locate(processName)
 	})
 
 	if err != nil {

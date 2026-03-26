@@ -26,6 +26,7 @@ type (
 		Name gen.Atom
 		From gen.PID
 		Ref  gen.Ref
+		Hops uint8
 	}
 	ProcessVersion [2]int64
 	ProcessInfo    struct {

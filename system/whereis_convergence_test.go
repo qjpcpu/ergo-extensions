@@ -34,6 +34,11 @@ func (p *testProc) HandleMessage(from gen.PID, message any) error { return nil }
 func startNode(t *testing.T, cluster *mem.Cluster, name string) app.Node {
 	t.Helper()
 	name = uniqueNodeName(name)
+	return startNodeExact(t, cluster, name)
+}
+
+func startNodeExact(t *testing.T, cluster *mem.Cluster, name string) app.Node {
+	t.Helper()
 	n, err := app.StartSimpleNode(app.SimpleNodeOptions{
 		NodeName:              name,
 		Port:                  0,
@@ -321,5 +326,94 @@ func TestWhereisConvergesAfterManyLocalChanges(t *testing.T) {
 			}
 		}
 		return true
+	})
+}
+
+func TestWhereisClearsStaleOwnerStateAfterTopologyRebalance(t *testing.T) {
+	cluster := mem.NewCluster()
+
+	n1 := startNodeExact(t, cluster, "node-a@127.0.0.1")
+	n2 := startNodeExact(t, cluster, "node-b@127.0.0.1")
+	n3 := startNodeExact(t, cluster, "node-c@127.0.0.1")
+	n4 := startNodeExact(t, cluster, "node-d@127.0.0.1")
+	n5 := startNodeExact(t, cluster, "node-e@127.0.0.1")
+
+	waitUntil(t, 10*time.Second, func() bool {
+		return n1.AddressBook().GetAvailableNodes().Len() == 5 &&
+			n2.AddressBook().GetAvailableNodes().Len() == 5 &&
+			n3.AddressBook().GetAvailableNodes().Len() == 5 &&
+			n4.AddressBook().GetAvailableNodes().Len() == 5 &&
+			n5.AddressBook().GetAvailableNodes().Len() == 5
+	})
+
+	n6Name := "node-f@127.0.0.1"
+	n6 := startNodeExact(t, cluster, n6Name)
+
+	waitUntil(t, 10*time.Second, func() bool {
+		return n1.AddressBook().GetAvailableNodes().Len() == 6 &&
+			n6.AddressBook().GetAvailableNodes().Len() == 6
+	})
+
+	ownerOnSix := make(map[gen.Atom]gen.Atom)
+	for i := 0; i < 5000; i++ {
+		name := gen.Atom(fmt.Sprintf("proc.rebalance.%04d", i))
+		ownerOnSix[name] = n1.AddressBook().PickDirectoryNode(name)
+	}
+
+	n6.Stop()
+	_ = n6.WaitWithTimeout(3 * time.Second)
+
+	waitUntil(t, 10*time.Second, func() bool {
+		return n1.AddressBook().GetAvailableNodes().Len() == 5 &&
+			!n1.AddressBook().GetAvailableNodes().Exist(gen.Atom(n6Name))
+	})
+
+	var target gen.Atom
+	for i := 0; i < 5000; i++ {
+		name := gen.Atom(fmt.Sprintf("proc.rebalance.%04d", i))
+		if ownerOnFive := n1.AddressBook().PickDirectoryNode(name); ownerOnFive != "" && ownerOnFive != ownerOnSix[name] {
+			target = name
+			break
+		}
+	}
+	if target == "" {
+		t.Fatal("failed to find a process name whose directory owner changes across rebalance")
+	}
+
+	pid := spawnNamed(t, n1, target)
+	waitUntil(t, 30*time.Second, func() bool {
+		node, ok := locateNode(n2, target)
+		return ok && node == n1.Name()
+	})
+
+	n6 = startNodeExact(t, cluster, n6Name)
+
+	waitUntil(t, 10*time.Second, func() bool {
+		return n1.AddressBook().GetAvailableNodes().Len() == 6 &&
+			n1.AddressBook().PickDirectoryNode(target) == ownerOnSix[target]
+	})
+
+	waitUntil(t, 30*time.Second, func() bool {
+		node, ok := locateNode(n3, target)
+		return ok && node == n1.Name()
+	})
+
+	_ = n1.Kill(pid)
+	waitUntil(t, 30*time.Second, func() bool {
+		_, ok := locateNode(n4, target)
+		return !ok
+	})
+
+	n6.Stop()
+	_ = n6.WaitWithTimeout(3 * time.Second)
+
+	waitUntil(t, 10*time.Second, func() bool {
+		return n1.AddressBook().GetAvailableNodes().Len() == 5 &&
+			n1.AddressBook().PickDirectoryNode(target) != ownerOnSix[target]
+	})
+
+	waitUntil(t, 30*time.Second, func() bool {
+		_, ok := locateNode(n5, target)
+		return !ok
 	})
 }
