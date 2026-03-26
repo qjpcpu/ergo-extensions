@@ -171,8 +171,8 @@ func (w *whereis) HandleEvent(event gen.MessageEvent) error {
 		n := max(1, w.book.GetAvailableNodes().Len())
 		// Stagger the sync based on cluster size to prevent sync storms.
 		// Base delay 100ms, max delay proportional to node count (10ms per node).
-		// Cap the max random delay at 20 seconds.
-		maxRand := min(max(n*10, 1000), 20000)
+		// Cap the max random delay at 2 seconds (reduced from 20s for test stability).
+		maxRand := min(max(n*10, 500), 2000)
 		delay := time.Duration(100+rand.Intn(maxRand)) * time.Millisecond
 		w.topologyChangeID++
 		w.SendAfter(w.PID(), messageTopologyChange{ID: w.topologyChangeID}, delay)

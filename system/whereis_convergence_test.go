@@ -97,6 +97,15 @@ func TestWhereisConvergesOnJoin(t *testing.T) {
 	n1 := startNode(t, cluster, "node-a@127.0.0.1")
 	n2 := startNode(t, cluster, "node-b@127.0.0.1")
 
+	// Wait for nodes to discover each other before spawning processes
+	waitUntil(t, 10*time.Second, func() bool {
+		nodes1 := n1.AddressBook().GetAvailableNodes()
+		nodes2 := n2.AddressBook().GetAvailableNodes()
+		return nodes1.Len() == 2 && nodes2.Len() == 2 &&
+			nodes1.Exist(n1.Name()) && nodes1.Exist(n2.Name()) &&
+			nodes2.Exist(n1.Name()) && nodes2.Exist(n2.Name())
+	})
+
 	nameA := gen.Atom("proc.A")
 	_ = spawnNamed(t, n1, nameA)
 
@@ -189,18 +198,28 @@ func TestWhereisDuplicateNameOldestWins(t *testing.T) {
 	n2 := startNode(t, cluster, "node-b@127.0.0.1")
 	n3 := startNode(t, cluster, "node-c@127.0.0.1")
 
+	// Wait for nodes to discover each other
+	waitUntil(t, 10*time.Second, func() bool {
+		return n1.AddressBook().GetAvailableNodes().Len() == 3 &&
+			n2.AddressBook().GetAvailableNodes().Len() == 3 &&
+			n3.AddressBook().GetAvailableNodes().Len() == 3
+	})
+
 	dup := gen.Atom("proc.dup.oldest")
 	pid2 := spawnNamed(t, n2, dup)
 	time.Sleep(1200 * time.Millisecond)
 	pid3 := spawnNamed(t, n3, dup)
 
-	waitUntil(t, 60*time.Second, func() bool {
+	// Add a small delay to allow directory owner to stabilize
+	time.Sleep(200 * time.Millisecond)
+
+	waitUntil(t, 30*time.Second, func() bool { // Reduced timeout - if it takes longer, there's likely an issue
 		node, ok := locateNode(n1, dup)
 		return ok && node == n2.Name()
 	})
 
 	_ = n2.Kill(pid2)
-	waitUntil(t, 60*time.Second, func() bool {
+	waitUntil(t, 30*time.Second, func() bool { // Reduced timeout
 		node, ok := locateNode(n1, dup)
 		return ok && node == n3.Name()
 	})

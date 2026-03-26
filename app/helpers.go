@@ -1,8 +1,6 @@
 package app
 
 import (
-	"ergo.services/ergo/act"
-	"ergo.services/ergo/gen"
 	"ergo.services/ergo/lib"
 )
 
@@ -58,26 +56,4 @@ func (q *simpleQueue[T]) Range(fn func(T) bool) {
 
 func (q *simpleQueue[T]) Len() int {
 	return int(q.impl.Len())
-}
-
-type IActor interface {
-	gen.Process
-	act.ActorBehavior
-	Init(args ...any) error
-	HandleCall(from gen.PID, ref gen.Ref, request any) (any, error)
-	HandleMessage(from gen.PID, message any) error
-	HandleInspect(from gen.PID, item ...string) map[string]string
-	HandleLog(message gen.MessageLog) error
-	HandleEvent(message gen.MessageEvent) error
-	Terminate(reason error)
-}
-
-type IMetaActor interface {
-	gen.MetaProcess
-	Init(meta gen.MetaProcess) error
-	Start() error
-	HandleMessage(from gen.PID, message any) error
-	HandleCall(from gen.PID, ref gen.Ref, request any) (any, error)
-	Terminate(reason error)
-	HandleInspect(from gen.PID, item ...string) map[string]string
 }
