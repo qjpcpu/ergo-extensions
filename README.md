@@ -1,33 +1,15 @@
 # Ergo Extensions (system)
 
-This repository provides a small set of building blocks to add distributed process discovery and daemon orchestration to an Ergo-based cluster. It ships a supervisor that wires together:
+This repository provides a small set of building blocks to add distributed process discovery and daemon orchestration to an Ergo-based cluster. The `system` package contains the main runtime processes, and the `app` package provides helpers to start a node with them wired in.
 
-- `extensions_whereis` — a process that periodically inspects local processes and maintains a distributed sharded directory for process discovery.
-- `extensions_daemon` — a process that (on the elected leader) recovers and launches daemon processes across nodes using consistent hashing.
-- `extensions_cron` — a sharded cron scheduler that incrementally scans owned shards and triggers due jobs in batches.
-- `AddressBook` — a thread-safe, eventually-consistent cache of nodes and their registered processes, with node picking via consistent hashing.
-
-Core components live under the `system` package and are designed to integrate with `ergo.services/ergo` and a registrar (ZooKeeper via `github.com/qjpcpu/registrar/zk`, a custom registrar injected via `app.SimpleNodeOptions.Registrar`, or the built-in in-memory registrar used by `app.StartSimpleNode` when neither is provided). The `app` package provides a small helper to start a node with these components wired in.
-
-## Features
-
-- Distributed process discovery and naming via a shared address book
-- Periodic local inspection and cluster-wide sync of process snapshots
-- Leader-driven daemon recovery and remote spawn requests
-- Sharded cron scheduling with stable placement and incremental loading
-- Consistent hashing (`xxhash` + `buraksezer/consistent`) for stable node selection
-- Simple APIs to register daemon launchers and spawn named processes
+For a shorter architecture reference, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Requirements
 
 - `ergo.services/ergo v1.999.320`
 - A network registrar implementation (e.g. ZooKeeper via `github.com/qjpcpu/registrar/zk`).
 
-This repo does not rely on a `go.mod replace` for the registrar. Instead:
-
-- If `app.StartSimpleNode` is started with `SimpleNodeOptions.Endpoints` set, it creates a ZooKeeper registrar via `zk.Create`.
-- If `SimpleNodeOptions.Registrar` is provided (and `Endpoints` is empty), it uses that registrar.
-- Otherwise it falls back to the built-in in-memory registrar (`registrar/mem`) for local/single-node development.
+`app.StartSimpleNode` uses ZooKeeper when `SimpleNodeOptions.Endpoints` is set, a custom registrar when `SimpleNodeOptions.Registrar` is provided, and the built-in in-memory registrar otherwise.
 
 ## Install
 
@@ -40,33 +22,6 @@ Import the system package:
 ```go
 import "github.com/qjpcpu/ergo-extensions/system"
 ```
-
-## Architecture
-
-- `Supervisor` (`extensions_sup`) starts three children:
-  - `WhereIsProcess` (`extensions_whereis`):
-    - Inspects local processes periodically (default: every 3 seconds)
-    - Maintains PID→Name and Name→PID maps
-    - Stores a snapshot (`ProcessInfoList`) in-memory and updates the local `AddressBook`
-    - Distributes process location information across nodes using a sharded directory model
-    - Answers calls: `MessageLocate{Name}` → node, `MessageGetAddressBook{}` → `MessageAddressBook{Book IAddressBook}`
-  - `DaemonMonitorProcess` (`extensions_daemon`):
-    - Subscribes to registrar events for leader election and membership changes
-    - On leader, scans registered `Launcher` recovery iterators and launches daemons to selected nodes
-    - Sends remote spawn requests when target node is not local
-  - `CronJobProcess` (`extensions_cron`):
-    - Owns logical cron shards via consistent hashing
-    - Loads jobs incrementally from a `cron.JobProvider`
-    - Persists lease/checkpoint/dispatch state through a `cron.KVStore`
-    - Triggers due jobs from local time slots instead of registering one entry per job
-    - Keeps cron-specific state semantics internal, so integrations only implement provider and state KV primitives
-  - `AddressBook`:
-    - Tracks available nodes and per-node registered processes
-    - Picks a node for a process name using a consistent hashing ring (PartitionCount: 10240, ReplicationFactor: 40)
-    - Supports global process lookups via `IAddressBookQuery` (returned by `book.QueryBy(caller)`)
-- `app.StartSimpleNode`:
-  - Starts an Ergo node and loads the `system.Supervisor` with a shared `IAddressBook`
-  - Returns an `app.Node` with helpers: `LocateProcess`, `ForwardCall`, `ForwardSend`, `WaitPID`, etc.
 
 ## Quick Start
 
@@ -170,70 +125,19 @@ book := respAny.(system.MessageAddressBook).Book
 picked := book.PickNode(gen.Atom("worker.A")) // pick based on consistent hashing
 ```
 
-## Public API (selected)
+## Selected Entry Points
 
-- Constants:
-  - `system.Supervisor`, `system.WhereIsProcess`, `system.DaemonMonitorProcess`, `system.CronJobProcess`
-- Cron scheduling:
-  - `cron.JobSpec`
-  - `cron.JobProvider`
-  - `cron.KVStore`
-  - `cron.NewStaticSource(shardCount, jobs...)`
-  - `cron.NewMemoryKVStore()`
-  - `cron.NewManagedSource(provider, store)`
-- Supervisor helpers:
-  - `system.ApplicationMemberSpec(opts system.ApplicationMemberSpecOptions) gen.ApplicationMemberSpec`
-  - `system.FactorySystemSup(opts system.ApplicationMemberSpecOptions) gen.ProcessFactory`
-- SimpleNode helpers (`app.Node`):
-  - `LocateProcess(name gen.Atom) gen.Atom`
-  - `ForwardCall(to string, msg any) (any, error)`
-  - `ForwardSend(to string, msg any) error`
-  - `WaitPID(pid gen.PID) error`
-  - `AddressBook() IAddressBook`
-- Daemon orchestration:
-  - `system.RegisterLauncher(name gen.Atom, launcher system.Launcher) error`
-  - `system.NewSpawner(parent gen.Process, launcher gen.Atom) system.Spawner`
-  - `Spawner.SpawnRegister(processName gen.Atom, args ...any) (gen.PID, error)`
-  - `system.SingletonDaemon(name gen.Atom, args []any) system.DaemonIteratorFactory`
-  - `Launcher{ Factory, Option, RecoveryScanner }`
-  - `DaemonProcess{ ProcessName gen.Atom, Args []any }`
-- Discovery & address book:
-  - Call `extensions_whereis` with `MessageLocate{Name gen.Atom}` → `gen.Atom` (node)
-  - Call `extensions_whereis` with `MessageGetAddressBook{}` → `MessageAddressBook{Book IAddressBook}`
-  - `IAddressBook` provides: `PickNode`, `GetAvailableNodes`, `QueryBy(caller, opts)` → `IAddressBookQuery`
-  - `IAddressBookQuery` provides: `Locate(processName)` → `gen.Atom` (node)
-
-## Registrar & Events
-
-The code expects a working registrar from the Ergo network. With ZooKeeper (`github.com/qjpcpu/registrar/zk`), the following events are handled:
-
-- Leadership changes: `EventNodeSwitchedToLeader`, `EventNodeSwitchedToFollower`
-- Membership changes: `EventNodeJoined`, `EventNodeLeft`
-
-`extensions_cron` will rebalance shard ownership on joins/left; `extensions_daemon` will re-plan launches on left/failover and trigger recovery when this node becomes leader.
-
-`extensions_whereis` is primarily driven by periodic inspection + anti-entropy sync. It also listens to membership events (`EventNodeJoined`/`EventNodeLeft`) to debounce topology changes and refresh the available node list used by the hash rings, avoiding sync storms.
-
-## Design Notes
-
-- Consistency: the `AddressBook` is eventually consistent; broadcasts retry on failures.
-- Locate semantics: if multiple nodes report the same process name, `LocateLocal` picks the oldest instance; ties are deterministic.
-- Hashing: consistent hashing ring uses `xxhash` and `buraksezer/consistent` to spread process names across nodes.
-- Scheduling: `whereis` inspects periodically (default: 3s); `extensions_daemon` schedules recovery with small delays to absorb churn.
-- Cron state: job data and scheduling state are split. Providers expose job snapshots and watches; KV stores back lease/checkpoint/dispatch records.
-- Safety: remote spawns are issued via `SendImportant` to target nodes.
+- Supervisor: `system.ApplicationMemberSpec`, `system.FactorySystemSup`
+- WhereIs: `system.WhereIsProcess`, `MessageLocate`, `MessageGetAddressBook`
+- Address book: `IAddressBook`, `IAddressBookQuery`, `app.Node.LocateProcess`
+- Daemon orchestration: `system.RegisterLauncher`, `system.NewSpawner`, `system.SingletonDaemon`
+- Cron scheduling: `cron.JobSpec`, `cron.JobProvider`, `cron.KVStore`, `cron.NewManagedSource`
 
 ## Limitations
 
 - `MessageLocate` returns a node, not a PID; ask the address book or the node itself for details.
 - Recovery scanners are user-supplied; ensure they are idempotent and resilient.
 - Broadcasts are best-effort; transient network issues may delay convergence.
-
-## Development
-
-- Code lives in `system/` and `app/`
-- No external binaries; integrate directly with your Ergo application
-- Linting/formatting follow your project’s standards
 
 ## License
 
