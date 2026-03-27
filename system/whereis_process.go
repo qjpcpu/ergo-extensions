@@ -30,6 +30,11 @@ type whereis struct {
 	inspectInterval    time.Duration
 	antiEntropyCounter int
 	topologyChangeID   int64
+	sendFailureLogAt   map[gen.Atom]time.Time
+	selfNode           gen.Atom
+	nowFn              func() time.Time
+	sendProcessChanged func(gen.ProcessID, MessageProcessChanged) error
+	logSendFailureFn   func(gen.Atom, string, error)
 }
 
 func factoryWhereIs(book *AddressBook, inspectInterval time.Duration) gen.ProcessFactory {
@@ -38,16 +43,69 @@ func factoryWhereIs(book *AddressBook, inspectInterval time.Duration) gen.Proces
 	}
 	return func() gen.ProcessBehavior {
 		return &whereis{
-			book:            book,
-			pidToName:       make(map[gen.PID]gen.Atom),
-			nameToPID:       make(map[gen.Atom]gen.PID),
-			nameToBirthAt:   make(map[gen.Atom]int64),
-			processCache:    NewAtomicValue[ProcessInfoList](),
-			selfVersion:     NewVersion(),
-			nodeVersions:    make(map[gen.Atom]ProcessVersion),
-			inspectInterval: inspectInterval,
+			book:             book,
+			pidToName:        make(map[gen.PID]gen.Atom),
+			nameToPID:        make(map[gen.Atom]gen.PID),
+			nameToBirthAt:    make(map[gen.Atom]int64),
+			processCache:     NewAtomicValue[ProcessInfoList](),
+			selfVersion:      NewVersion(),
+			nodeVersions:     make(map[gen.Atom]ProcessVersion),
+			inspectInterval:  inspectInterval,
+			sendFailureLogAt: make(map[gen.Atom]time.Time),
+			nowFn:            func() time.Time { return time.Now().UTC() },
 		}
 	}
+}
+
+func (w *whereis) selfNodeName() gen.Atom {
+	if w.selfNode != "" {
+		return w.selfNode
+	}
+	return w.Node().Name()
+}
+
+func (w *whereis) now() time.Time {
+	if w.nowFn != nil {
+		return w.nowFn()
+	}
+	return time.Now().UTC()
+}
+
+func (w *whereis) sendProcessChangedMessage(pid gen.ProcessID, msg MessageProcessChanged) error {
+	if w.sendProcessChanged != nil {
+		return w.sendProcessChanged(pid, msg)
+	}
+	return w.Send(pid, msg)
+}
+
+func (w *whereis) shouldLogSendFailure(owner gen.Atom, now time.Time) bool {
+	if w.sendFailureLogAt == nil {
+		w.sendFailureLogAt = make(map[gen.Atom]time.Time)
+	}
+	last, ok := w.sendFailureLogAt[owner]
+	if ok && now.Sub(last) < 30*time.Second {
+		return false
+	}
+	w.sendFailureLogAt[owner] = now
+	return true
+}
+
+func (w *whereis) clearSendFailure(owner gen.Atom) {
+	if w.sendFailureLogAt == nil {
+		return
+	}
+	delete(w.sendFailureLogAt, owner)
+}
+
+func (w *whereis) logSendFailure(owner gen.Atom, kind string, err error) {
+	if !w.shouldLogSendFailure(owner, w.now()) {
+		return
+	}
+	if w.logSendFailureFn != nil {
+		w.logSendFailureFn(owner, kind, err)
+		return
+	}
+	w.Log().Warning("whereis %s send to %s failed on %s: %v", kind, owner, w.selfNodeName(), err)
 }
 
 func (w *whereis) Init(args ...any) error {
@@ -83,7 +141,7 @@ func (w *whereis) HandleMessage(from gen.PID, message any) error {
 				}
 			}
 			// Refresh local address book entry
-			w.book.SetProcess(w.Node().Name(), procs...)
+			w.book.SetProcess(w.selfNodeName(), procs...)
 			// Push authoritative shards to every current directory node so
 			// previous owners clear stale state after rebalancing.
 			w.selfVersion = w.selfVersion.Incr()
@@ -96,7 +154,7 @@ func (w *whereis) HandleMessage(from gen.PID, message any) error {
 			return nil
 		}
 		owner := w.book.PickDirectoryNode(e.Name)
-		if owner == w.Node().Name() {
+		if owner == w.selfNodeName() {
 			if p, ok := w.book.LocateLocal(e.Name); ok {
 				w.Send(from, MessageLocateResult{Name: e.Name, Node: p})
 				return nil
@@ -115,7 +173,7 @@ func (w *whereis) HandleMessage(from gen.PID, message any) error {
 	case MessageForwardLocate:
 		var node gen.Atom
 		owner := w.book.PickDirectoryNode(e.Name)
-		if owner == w.Node().Name() {
+		if owner == w.selfNodeName() {
 			if p, ok := w.book.LocateLocal(e.Name); ok {
 				node = p
 			}
@@ -141,7 +199,7 @@ func (w *whereis) HandleCall(from gen.PID, ref gen.Ref, request any) (any, error
 			return gen.Atom(""), nil
 		}
 		owner := w.book.PickDirectoryNode(e.Name)
-		if owner == w.Node().Name() {
+		if owner == w.selfNodeName() {
 			if p, ok := w.book.LocateLocal(e.Name); ok {
 				return p, nil
 			}
@@ -175,8 +233,7 @@ func (w *whereis) HandleEvent(event gen.MessageEvent) error {
 		// Cap the max random delay at 2 seconds (reduced from 20s for test stability).
 		maxRand := min(max(n*10, 500), 2000)
 		delay := time.Duration(100+rand.Intn(maxRand)) * time.Millisecond
-		w.topologyChangeID++
-		w.SendAfter(w.PID(), messageTopologyChange{ID: w.topologyChangeID}, delay)
+		w.scheduleTopologyDebounce(delay)
 	}
 	return nil
 }
@@ -201,7 +258,7 @@ func (w *whereis) registerToShards(msg MessageProcessChanged) {
 		}
 		if _, ok := shards[owner]; !ok {
 			shards[owner] = &MessageProcessChanged{
-				Node:     w.Node().Name(),
+				Node:     w.selfNodeName(),
 				Version:  msg.Version,
 				FullSync: msg.FullSync,
 			}
@@ -215,7 +272,7 @@ func (w *whereis) registerToShards(msg MessageProcessChanged) {
 		}
 		if _, ok := shards[owner]; !ok {
 			shards[owner] = &MessageProcessChanged{
-				Node:     w.Node().Name(),
+				Node:     w.selfNodeName(),
 				Version:  msg.Version,
 				FullSync: msg.FullSync,
 			}
@@ -224,10 +281,12 @@ func (w *whereis) registerToShards(msg MessageProcessChanged) {
 	}
 
 	for owner, shardMsg := range shards {
-		if owner != w.Node().Name() {
-			if err := w.Send(gen.ProcessID{Node: owner, Name: WhereIsProcess}, *shardMsg); err != nil {
-				w.scheduleTopologyResync(500 * time.Millisecond)
+		if owner != w.selfNodeName() {
+			if err := w.sendProcessChangedMessage(gen.ProcessID{Node: owner, Name: WhereIsProcess}, *shardMsg); err != nil {
+				w.logSendFailure(owner, "incremental shard sync", err)
+				continue
 			}
+			w.clearSendFailure(owner)
 		}
 	}
 }
@@ -242,14 +301,14 @@ func (w *whereis) inspectProcessList() error {
 	if w.antiEntropyCounter >= w.antiEntropyThreshold() {
 		w.antiEntropyCounter = 0
 		w.selfVersion = w.selfVersion.Incr()
-		w.book.SetProcess(w.Node().Name(), all...)
+		w.book.SetProcess(w.selfNodeName(), all...)
 		w.handleTopologyChange(all)
 	} else if len(up) > 0 || len(down) > 0 {
-		w.book.AddProcess(w.Node().Name(), up...)
-		w.book.RemoveProcess(w.Node().Name(), down...)
+		w.book.AddProcess(w.selfNodeName(), up...)
+		w.book.RemoveProcess(w.selfNodeName(), down...)
 		w.selfVersion = w.selfVersion.Incr()
 		w.registerToShards(MessageProcessChanged{
-			Node:        w.Node().Name(),
+			Node:        w.selfNodeName(),
 			UpProcess:   up,
 			DownProcess: down,
 			Version:     w.selfVersion,
@@ -367,7 +426,7 @@ func (w *whereis) fetchAvailableBookNodes() (*NodeList, error) {
 	if err != nil {
 		return nil, err
 	}
-	nodeList := NewNodeList(sortNodes(uniqNodes(append(nodes, w.Node().Name())))...)
+	nodeList := NewNodeList(sortNodes(uniqNodes(append(nodes, w.selfNodeName())))...)
 	w.book.SetAvailableNodes(nodeList)
 	return nodeList, nil
 }
@@ -423,7 +482,7 @@ func (w *whereis) syncDirectoryShards(procs ProcessInfoList) {
 	shards := make(map[gen.Atom]*MessageProcessChanged)
 	for _, owner := range dirNodes {
 		shards[owner] = &MessageProcessChanged{
-			Node:     w.Node().Name(),
+			Node:     w.selfNodeName(),
 			Version:  w.selfVersion,
 			FullSync: true,
 		}
@@ -438,17 +497,19 @@ func (w *whereis) syncDirectoryShards(procs ProcessInfoList) {
 	}
 
 	for owner, msg := range shards {
-		if owner != w.Node().Name() {
-			if err := w.Send(gen.ProcessID{Node: owner, Name: WhereIsProcess}, *msg); err != nil {
-				w.scheduleTopologyResync(500 * time.Millisecond)
+		if owner != w.selfNodeName() {
+			if err := w.sendProcessChangedMessage(gen.ProcessID{Node: owner, Name: WhereIsProcess}, *msg); err != nil {
+				w.logSendFailure(owner, "topology full sync", err)
+				continue
 			}
+			w.clearSendFailure(owner)
 		}
 	}
 }
 
 func (w *whereis) handleTopologyChange(localProcs ProcessInfoList) {
 	msg := MessageProcessChanged{
-		Node:      w.Node().Name(),
+		Node:      w.selfNodeName(),
 		UpProcess: localProcs,
 		Version:   w.selfVersion,
 		FullSync:  true,
@@ -456,7 +517,7 @@ func (w *whereis) handleTopologyChange(localProcs ProcessInfoList) {
 	w.registerToShards(msg)
 }
 
-func (w *whereis) scheduleTopologyResync(delay time.Duration) {
+func (w *whereis) scheduleTopologyDebounce(delay time.Duration) {
 	w.topologyChangeID++
 	w.SendAfter(w.PID(), messageTopologyChange{ID: w.topologyChangeID}, delay)
 }
