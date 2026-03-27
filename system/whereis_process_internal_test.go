@@ -9,6 +9,60 @@ import (
 	"ergo.services/ergo/gen"
 )
 
+type failingRegistrar struct {
+	nodesErr error
+}
+
+func (r *failingRegistrar) Register(node gen.NodeRegistrar, routes gen.RegisterRoutes) (gen.StaticRoutes, error) {
+	return gen.StaticRoutes{}, nil
+}
+
+func (r *failingRegistrar) Resolver() gen.Resolver {
+	return nil
+}
+
+func (r *failingRegistrar) RegisterProxy(to gen.Atom) error {
+	return gen.ErrUnsupported
+}
+
+func (r *failingRegistrar) UnregisterProxy(to gen.Atom) error {
+	return gen.ErrUnsupported
+}
+
+func (r *failingRegistrar) RegisterApplicationRoute(route gen.ApplicationRoute) error {
+	return gen.ErrUnsupported
+}
+
+func (r *failingRegistrar) UnregisterApplicationRoute(name gen.Atom) error {
+	return gen.ErrUnsupported
+}
+
+func (r *failingRegistrar) Nodes() ([]gen.Atom, error) {
+	return nil, r.nodesErr
+}
+
+func (r *failingRegistrar) Config(items ...string) (map[string]any, error) {
+	return nil, gen.ErrUnsupported
+}
+
+func (r *failingRegistrar) ConfigItem(item string) (any, error) {
+	return nil, gen.ErrUnsupported
+}
+
+func (r *failingRegistrar) Event() (gen.Event, error) {
+	return gen.Event{}, gen.ErrUnsupported
+}
+
+func (r *failingRegistrar) Info() gen.RegistrarInfo {
+	return gen.RegistrarInfo{}
+}
+
+func (r *failingRegistrar) Terminate() {}
+
+func (r *failingRegistrar) Version() gen.Version {
+	return gen.Version{}
+}
+
 func findRemoteDirectoryProcess(t *testing.T, book *AddressBook, self gen.Atom) gen.Atom {
 	t.Helper()
 	for i := 0; i < 1024; i++ {
@@ -112,5 +166,29 @@ func TestWhereisShouldLogSendFailureThrottlesPerOwner(t *testing.T) {
 	w.clearSendFailure(owner)
 	if !w.shouldLogSendFailure(owner, now.Add(32*time.Second)) {
 		t.Fatal("expected cleared owner to log immediately")
+	}
+}
+
+func TestWhereisFetchAvailableBookNodesReturnsRegistrarError(t *testing.T) {
+	wantErr := errors.New("nodes unavailable")
+	book := NewAddressBook()
+	w := &whereis{
+		book:      book,
+		selfNode:  gen.Atom("node-a@127.0.0.1"),
+		registrar: &failingRegistrar{nodesErr: wantErr},
+	}
+
+	nodes, err := w.fetchAvailableBookNodes()
+	if err == nil {
+		t.Fatal("expected error from registrar nodes")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected %v, got %v", wantErr, err)
+	}
+	if nodes != nil {
+		t.Fatalf("expected nil nodes, got %#v", nodes)
+	}
+	if got := book.GetAvailableNodes().Len(); got != 0 {
+		t.Fatalf("expected empty available nodes cache, got %d", got)
 	}
 }

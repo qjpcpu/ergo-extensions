@@ -416,7 +416,9 @@ func (w *whereis) setup() error {
 			return err
 		}
 		// Initial fetch of available nodes
-		w.fetchAvailableBookNodes()
+		if _, err := w.fetchAvailableBookNodes(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
