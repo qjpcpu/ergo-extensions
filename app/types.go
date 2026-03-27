@@ -5,6 +5,7 @@ import (
 
 	"ergo.services/ergo/gen"
 	"github.com/qjpcpu/ergo-extensions/system"
+	cronpkg "github.com/qjpcpu/ergo-extensions/system/cron"
 	"github.com/qjpcpu/registrar/zk"
 )
 
@@ -23,7 +24,9 @@ type Node interface {
 	AddressBook() system.IAddressBook
 }
 
-type CronJob = system.CronJob
+type CronJob = cronpkg.JobSpec
+type CronSource = cronpkg.Source
+type CronSchedulerOptions = cronpkg.SchedulerOptions
 
 type SimpleNodeOptions struct {
 	zk.Options        // ZooKeeper registrar options.
@@ -37,7 +40,8 @@ type SimpleNodeOptions struct {
 	MemberSpecs           []gen.ApplicationMemberSpec // Additional application members to start.
 	LogLevel              gen.LogLevel                // Node log level.
 	DefaultLogOptions     gen.DefaultLoggerOptions    // Default logger configuration.
-	CronJobs              []CronJob                   // Cron jobs for `system.CronJobProcess`.
+	CronSource            CronSource                  // Managed cron source composed of a job provider and a state KV store.
+	CronSchedulerOptions  CronSchedulerOptions        // Cron scheduler options.
 	DefaultRequestTimeout int                         // Default request timeout (seconds).
 	SyncProcessInterval   time.Duration               // Whereis sync interval for pulling remote changes.
 	Registrar             gen.Registrar               // Custom registrar implementation (used if Endpoints is empty).

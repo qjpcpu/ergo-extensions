@@ -95,7 +95,9 @@ func nodeMin(a, b gen.Atom) gen.Atom {
 func TestWhereisConvergesOnJoin(t *testing.T) {
 	cluster := mem.NewCluster()
 	n1 := startNode(t, cluster, "node-a@127.0.0.1")
+	defer n1.Stop()
 	n2 := startNode(t, cluster, "node-b@127.0.0.1")
+	defer n2.Stop()
 
 	// Wait for nodes to discover each other before spawning processes
 	waitUntil(t, 10*time.Second, func() bool {
@@ -126,7 +128,9 @@ func TestWhereisConvergesOnJoin(t *testing.T) {
 func TestWhereisRemovesProcessesOnNodeLeave(t *testing.T) {
 	cluster := mem.NewCluster()
 	n1 := startNode(t, cluster, "node-a@127.0.0.1")
+	defer n1.Stop()
 	n2 := startNode(t, cluster, "node-b@127.0.0.1")
+	defer n2.Stop()
 
 	name := gen.Atom("proc.leave")
 	_ = spawnNamed(t, n2, name)
@@ -154,8 +158,11 @@ func TestWhereisRemovesProcessesOnNodeLeave(t *testing.T) {
 func TestWhereisDuplicateNameDeterministicWinnerAndFailover(t *testing.T) {
 	cluster := mem.NewCluster()
 	n1 := startNode(t, cluster, "node-a@127.0.0.1")
+	defer n1.Stop()
 	n2 := startNode(t, cluster, "node-b@127.0.0.1")
+	defer n2.Stop()
 	n3 := startNode(t, cluster, "node-c@127.0.0.1")
+	defer n3.Stop()
 
 	dup := gen.Atom("proc.dup")
 	waitUntil(t, 10*time.Second, func() bool {
@@ -195,8 +202,11 @@ func TestWhereisDuplicateNameDeterministicWinnerAndFailover(t *testing.T) {
 func TestWhereisDuplicateNameOldestWins(t *testing.T) {
 	cluster := mem.NewCluster()
 	n1 := startNode(t, cluster, "node-a@127.0.0.1")
+	defer n1.Stop()
 	n2 := startNode(t, cluster, "node-b@127.0.0.1")
+	defer n2.Stop()
 	n3 := startNode(t, cluster, "node-c@127.0.0.1")
+	defer n3.Stop()
 
 	// Wait for nodes to discover each other
 	waitUntil(t, 10*time.Second, func() bool {
@@ -230,8 +240,11 @@ func TestWhereisDuplicateNameOldestWins(t *testing.T) {
 func TestWhereisDuplicateNameTieBreakStable(t *testing.T) {
 	cluster := mem.NewCluster()
 	n1 := startNode(t, cluster, "node-a@127.0.0.1")
+	defer n1.Stop()
 	n2 := startNode(t, cluster, "node-b@127.0.0.1")
+	defer n2.Stop()
 	n3 := startNode(t, cluster, "node-c@127.0.0.1")
+	defer n3.Stop()
 
 	dup := gen.Atom("proc.dup.tie")
 	winner := nodeMin(n2.Name(), n3.Name())
@@ -304,7 +317,9 @@ func TestWhereisDuplicateNameTieBreakStable(t *testing.T) {
 func TestWhereisConvergesAfterManyLocalChanges(t *testing.T) {
 	cluster := mem.NewCluster()
 	n1 := startNode(t, cluster, "node-a@127.0.0.1")
+	defer n1.Stop()
 	n2 := startNode(t, cluster, "node-b@127.0.0.1")
+	defer n2.Stop()
 
 	waitUntil(t, 5*time.Second, func() bool {
 		n1Nodes := n1.AddressBook().GetAvailableNodes()
@@ -352,10 +367,15 @@ func TestWhereisClearsStaleOwnerStateAfterTopologyRebalance(t *testing.T) {
 	cluster := mem.NewCluster()
 
 	n1 := startNodeExact(t, cluster, "node-a@127.0.0.1")
+	defer n1.Stop()
 	n2 := startNodeExact(t, cluster, "node-b@127.0.0.1")
+	defer n2.Stop()
 	n3 := startNodeExact(t, cluster, "node-c@127.0.0.1")
+	defer n3.Stop()
 	n4 := startNodeExact(t, cluster, "node-d@127.0.0.1")
+	defer n4.Stop()
 	n5 := startNodeExact(t, cluster, "node-e@127.0.0.1")
+	defer n5.Stop()
 
 	waitUntil(t, 10*time.Second, func() bool {
 		return n1.AddressBook().GetAvailableNodes().Len() == 5 &&
@@ -367,6 +387,7 @@ func TestWhereisClearsStaleOwnerStateAfterTopologyRebalance(t *testing.T) {
 
 	n6Name := "node-f@127.0.0.1"
 	n6 := startNodeExact(t, cluster, n6Name)
+	defer n6.Stop()
 
 	waitUntil(t, 10*time.Second, func() bool {
 		return n1.AddressBook().GetAvailableNodes().Len() == 6 &&
@@ -406,6 +427,7 @@ func TestWhereisClearsStaleOwnerStateAfterTopologyRebalance(t *testing.T) {
 	})
 
 	n6 = startNodeExact(t, cluster, n6Name)
+	defer n6.Stop()
 
 	waitUntil(t, 10*time.Second, func() bool {
 		return n1.AddressBook().GetAvailableNodes().Len() == 6 &&

@@ -62,6 +62,7 @@ func (w *whereis) HandleMessage(from gen.PID, message any) error {
 			w.SendAfter(w.PID(), messageInit{}, time.Second)
 			return nil
 		}
+		w.inspectProcessList()
 		delay := w.inspectInterval + time.Duration(rand.Intn(int(w.inspectInterval/10)+1))
 		w.SendAfter(w.PID(), messageInspectProcess{}, delay)
 	case messageInspectProcess:
@@ -224,7 +225,9 @@ func (w *whereis) registerToShards(msg MessageProcessChanged) {
 
 	for owner, shardMsg := range shards {
 		if owner != w.Node().Name() {
-			w.Send(gen.ProcessID{Node: owner, Name: WhereIsProcess}, *shardMsg)
+			if err := w.Send(gen.ProcessID{Node: owner, Name: WhereIsProcess}, *shardMsg); err != nil {
+				w.scheduleTopologyResync(500 * time.Millisecond)
+			}
 		}
 	}
 }
@@ -436,7 +439,9 @@ func (w *whereis) syncDirectoryShards(procs ProcessInfoList) {
 
 	for owner, msg := range shards {
 		if owner != w.Node().Name() {
-			w.Send(gen.ProcessID{Node: owner, Name: WhereIsProcess}, *msg)
+			if err := w.Send(gen.ProcessID{Node: owner, Name: WhereIsProcess}, *msg); err != nil {
+				w.scheduleTopologyResync(500 * time.Millisecond)
+			}
 		}
 	}
 }
@@ -449,4 +454,9 @@ func (w *whereis) handleTopologyChange(localProcs ProcessInfoList) {
 		FullSync:  true,
 	}
 	w.registerToShards(msg)
+}
+
+func (w *whereis) scheduleTopologyResync(delay time.Duration) {
+	w.topologyChangeID++
+	w.SendAfter(w.PID(), messageTopologyChange{ID: w.topologyChangeID}, delay)
 }

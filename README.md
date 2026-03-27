@@ -4,7 +4,7 @@ This repository provides a small set of building blocks to add distributed proce
 
 - `extensions_whereis` — a process that periodically inspects local processes and maintains a distributed sharded directory for process discovery.
 - `extensions_daemon` — a process that (on the elected leader) recovers and launches daemon processes across nodes using consistent hashing.
-- `extensions_cron` — a cron-like scheduler that triggers messages on a node or across the cluster.
+- `extensions_cron` — a sharded cron scheduler that incrementally scans owned shards and triggers due jobs in batches.
 - `AddressBook` — a thread-safe, eventually-consistent cache of nodes and their registered processes, with node picking via consistent hashing.
 
 Core components live under the `system` package and are designed to integrate with `ergo.services/ergo` and a registrar (ZooKeeper via `github.com/qjpcpu/registrar/zk`, a custom registrar injected via `app.SimpleNodeOptions.Registrar`, or the built-in in-memory registrar used by `app.StartSimpleNode` when neither is provided). The `app` package provides a small helper to start a node with these components wired in.
@@ -14,7 +14,7 @@ Core components live under the `system` package and are designed to integrate wi
 - Distributed process discovery and naming via a shared address book
 - Periodic local inspection and cluster-wide sync of process snapshots
 - Leader-driven daemon recovery and remote spawn requests
-- Node- or cluster-scoped cron jobs (`extensions_cron`) with stable placement
+- Sharded cron scheduling with stable placement and incremental loading
 - Consistent hashing (`xxhash` + `buraksezer/consistent`) for stable node selection
 - Simple APIs to register daemon launchers and spawn named processes
 
@@ -55,7 +55,11 @@ import "github.com/qjpcpu/ergo-extensions/system"
     - On leader, scans registered `Launcher` recovery iterators and launches daemons to selected nodes
     - Sends remote spawn requests when target node is not local
   - `CronJobProcess` (`extensions_cron`):
-    - Triggers cron jobs either on a single node or cluster-wide
+    - Owns logical cron shards via consistent hashing
+    - Loads jobs incrementally from a `cron.JobProvider`
+    - Persists lease/checkpoint/dispatch state through a `cron.KVStore`
+    - Triggers due jobs from local time slots instead of registering one entry per job
+    - Keeps cron-specific state semantics internal, so integrations only implement provider and state KV primitives
   - `AddressBook`:
     - Tracks available nodes and per-node registered processes
     - Picks a node for a process name using a consistent hashing ring (PartitionCount: 10240, ReplicationFactor: 40)
@@ -80,19 +84,26 @@ spec := gen.ApplicationSpec{
 Or start a node with everything wired in (uses ZooKeeper registrar when `Endpoints` is set; otherwise uses `Registrar` when provided; otherwise falls back to an in-memory single-node registrar):
 
 ```go
+provider := cron.NewStaticSource(128,
+    cron.JobSpec{
+        ID:             "job.ping",
+        ShardKey:       "job.ping",
+        Schedule:       "* * * * *",
+        Location:       cron.LocationUTC,
+        TriggerProcess: gen.Atom("ping"),
+    },
+)
+store := cron.NewMemoryKVStore()
+source := cron.NewManagedSource(provider, store)
+
 n, err := app.StartSimpleNode(app.SimpleNodeOptions{
     NodeName: "node-1",
     Options: zk.Options{
         Endpoints: []string{"127.0.0.1:2181"},
     },
-    CronJobs: []app.CronJob{
-        {
-            Name:          gen.Atom("job.ping"),
-            Spec:          "* * * * *",
-            Location:      system.CronJobLocationUTC,
-            TriggerProcess: gen.Atom("ping"),
-            Scope:         system.CronJobScopeCluster,
-        },
+    CronSource: source,
+    CronSchedulerOptions: cron.SchedulerOptions{
+        ShardCount: 128,
     },
     SyncProcessInterval: time.Second * 3,
 })
@@ -163,6 +174,13 @@ picked := book.PickNode(gen.Atom("worker.A")) // pick based on consistent hashin
 
 - Constants:
   - `system.Supervisor`, `system.WhereIsProcess`, `system.DaemonMonitorProcess`, `system.CronJobProcess`
+- Cron scheduling:
+  - `cron.JobSpec`
+  - `cron.JobProvider`
+  - `cron.KVStore`
+  - `cron.NewStaticSource(shardCount, jobs...)`
+  - `cron.NewMemoryKVStore()`
+  - `cron.NewManagedSource(provider, store)`
 - Supervisor helpers:
   - `system.ApplicationMemberSpec(opts system.ApplicationMemberSpecOptions) gen.ApplicationMemberSpec`
   - `system.FactorySystemSup(opts system.ApplicationMemberSpecOptions) gen.ProcessFactory`
@@ -192,7 +210,7 @@ The code expects a working registrar from the Ergo network. With ZooKeeper (`git
 - Leadership changes: `EventNodeSwitchedToLeader`, `EventNodeSwitchedToFollower`
 - Membership changes: `EventNodeJoined`, `EventNodeLeft`
 
-`extensions_cron` will rebalance on joins/left; `extensions_daemon` will re-plan launches on left/failover and trigger recovery when this node becomes leader.
+`extensions_cron` will rebalance shard ownership on joins/left; `extensions_daemon` will re-plan launches on left/failover and trigger recovery when this node becomes leader.
 
 `extensions_whereis` is primarily driven by periodic inspection + anti-entropy sync. It also listens to membership events (`EventNodeJoined`/`EventNodeLeft`) to debounce topology changes and refresh the available node list used by the hash rings, avoiding sync storms.
 
@@ -202,6 +220,7 @@ The code expects a working registrar from the Ergo network. With ZooKeeper (`git
 - Locate semantics: if multiple nodes report the same process name, `LocateLocal` picks the oldest instance; ties are deterministic.
 - Hashing: consistent hashing ring uses `xxhash` and `buraksezer/consistent` to spread process names across nodes.
 - Scheduling: `whereis` inspects periodically (default: 3s); `extensions_daemon` schedules recovery with small delays to absorb churn.
+- Cron state: job data and scheduling state are split. Providers expose job snapshots and watches; KV stores back lease/checkpoint/dispatch records.
 - Safety: remote spawns are issued via `SendImportant` to target nodes.
 
 ## Limitations

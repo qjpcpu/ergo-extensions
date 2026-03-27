@@ -20,7 +20,8 @@ func newApp(book *system.AddressBook, opts SimpleNodeOptions) *simpleApp {
 func (app *simpleApp) Load(node gen.Node, args ...any) (gen.ApplicationSpec, error) {
 	var members []gen.ApplicationMemberSpec
 	opts := system.ApplicationMemberSpecOptions{
-		CronJobs:                app.opts.CronJobs,
+		CronSource:              app.opts.CronSource,
+		CronSchedulerOptions:    app.opts.CronSchedulerOptions,
 		SyncAddressBookInterval: app.opts.SyncProcessInterval,
 		AddressBook:             app.book,
 	}

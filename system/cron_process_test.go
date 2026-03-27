@@ -1,46 +1,51 @@
 package system_test
 
 import (
-	"strings"
+	"strconv"
 	"testing"
 	"time"
 
 	"ergo.services/ergo/gen"
+	"github.com/qjpcpu/ergo-extensions/app"
 	"github.com/qjpcpu/ergo-extensions/registrar/mem"
 	"github.com/qjpcpu/ergo-extensions/system"
-	"github.com/qjpcpu/ergo-extensions/app"
+	cronpkg "github.com/qjpcpu/ergo-extensions/system/cron"
 )
 
-func TestCronJobs(t *testing.T) {
+func TestCronShardsAssignedToSingleNode(t *testing.T) {
 	cluster := mem.NewCluster()
+	const shardCount = 32
 
-	localJobName := gen.Atom("local_job")
-	clusterJobName := gen.Atom("cluster_job")
-	triggerProc := gen.Atom("trigger_proc")
-
-	jobs := []system.CronJob{
-		{
-			Name:           localJobName,
-			Spec:           "* * * * *",
-			TriggerProcess: triggerProc,
-			Scope:          system.CronJobScopeNode,
+	source := cronpkg.NewStaticSource(shardCount,
+		cronpkg.JobSpec{
+			ID:             "job-a",
+			ShardKey:       "job-a",
+			Schedule:       "* * * * *",
+			Location:       cronpkg.LocationUTC,
+			TriggerProcess: gen.Atom("trigger_proc"),
 		},
-		{
-			Name:           clusterJobName,
-			Spec:           "* * * * *",
-			TriggerProcess: triggerProc,
-			Scope:          system.CronJobScopeCluster,
+		cronpkg.JobSpec{
+			ID:             "job-b",
+			ShardKey:       "job-b",
+			Schedule:       "* * * * *",
+			Location:       cronpkg.LocationUTC,
+			TriggerProcess: gen.Atom("trigger_proc"),
 		},
-	}
+	)
+	store := cronpkg.NewMemoryKVStore()
 
-	// Helper to start node with cron jobs
 	startCronNode := func(name string) app.Node {
 		name = uniqueNodeName(name)
 		n, err := app.StartSimpleNode(app.SimpleNodeOptions{
-			NodeName:            name,
-			Cookie:              "cron-test-cookie",
-			Registrar:           mem.CreateWithCluster(cluster),
-			CronJobs:            jobs,
+			NodeName:   name,
+			Cookie:     "cron-test-cookie",
+			Registrar:  mem.CreateWithCluster(cluster),
+			CronSource: cronpkg.NewManagedSource(source, store),
+			CronSchedulerOptions: cronpkg.SchedulerOptions{
+				ShardCount:     shardCount,
+				RebalanceDelay: 200 * time.Millisecond,
+				InitDelay:      50 * time.Millisecond,
+			},
 			SyncProcessInterval: 100 * time.Millisecond,
 		})
 		if err != nil {
@@ -53,64 +58,37 @@ func TestCronJobs(t *testing.T) {
 	n1 := startCronNode("node-a@127.0.0.1")
 	n2 := startCronNode("node-b@127.0.0.1")
 
-	// Wait for initialization (3s delay in cron_process.go + jitter)
-	time.Sleep(12 * time.Second)
-
-	// Check local jobs: should be on both nodes
-	checkJob := func(n app.Node, jobName gen.Atom, expected bool) {
-		t.Helper()
-		found := containsJob(t, n, jobName)
-		// The inspect returns a JSON array of started jobs
-		if expected {
-			if !found {
-				t.Errorf("node %s should have job %s", n.Name(), jobName)
-			}
-		} else {
-			if found {
-				t.Errorf("node %s should NOT have job %s", n.Name(), jobName)
-			}
-		}
-	}
-
-	checkJob(n1, localJobName, true)
-	checkJob(n2, localJobName, true)
-
-	// Check cluster job: should be on exactly one node
-	waitUntil(t, 20*time.Second, func() bool {
-		on1 := containsJob(t, n1, clusterJobName)
-		on2 := containsJob(t, n2, clusterJobName)
-		return (on1 && !on2) || (!on1 && on2)
+	waitUntil(t, 8*time.Second, func() bool {
+		return loadedJobs(t, n1)+loadedJobs(t, n2) == 2
 	})
 
-	// Add node 3, cluster job might migrate
 	n3 := startCronNode("node-c@127.0.0.1")
-	
-	waitUntil(t, 30*time.Second, func() bool {
-		on1 := containsJob(t, n1, clusterJobName)
-		on2 := containsJob(t, n2, clusterJobName)
-		on3 := containsJob(t, n3, clusterJobName)
-		count := 0
-		if on1 { count++ }
-		if on2 { count++ }
-		if on3 { count++ }
-		return count == 1
+	waitUntil(t, 8*time.Second, func() bool {
+		total := loadedJobs(t, n1) + loadedJobs(t, n2) + loadedJobs(t, n3)
+		return total == 2
 	})
 }
 
-func containsJob(t *testing.T, n app.Node, jobName gen.Atom) bool {
+func loadedJobs(t *testing.T, n app.Node) int {
+	t.Helper()
 	res, err := n.ForwardCall(string(system.CronJobProcess), "inspect", app.ForwardNode(n.Name()))
 	if err != nil {
-		t.Logf("Failed to call cron process on node %s: %v", n.Name(), err)
-		return false
+		t.Fatalf("inspect cron process on node %s: %v", n.Name(), err)
 	}
-	m, ok := res.(map[string]string)
+	stats, ok := res.(map[string]string)
 	if !ok {
-		t.Logf("Cron process returned unexpected type: %T", res)
-		return false
+		t.Fatalf("unexpected inspect payload: %T", res)
 	}
-	return contains(m["jobs"], string(jobName))
+	value, err := strconv.Atoi(trimJSON(stats["loaded_jobs"]))
+	if err != nil {
+		t.Fatalf("parse loaded_jobs: %v", err)
+	}
+	return value
 }
 
-func contains(jsonArr string, item string) bool {
-	return strings.Contains(jsonArr, "\""+item+"\"")
+func trimJSON(v string) string {
+	if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
+		return v[1 : len(v)-1]
+	}
+	return v
 }

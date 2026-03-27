@@ -5,13 +5,15 @@ import (
 
 	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
+	cronpkg "github.com/qjpcpu/ergo-extensions/system/cron"
 )
 
 const Supervisor = gen.Atom("extensions_sup")
 
 type ApplicationMemberSpecOptions struct {
 	AddressBook             *AddressBook
-	CronJobs                []CronJob
+	CronSource              cronpkg.Source
+	CronSchedulerOptions    cronpkg.SchedulerOptions
 	SyncAddressBookInterval time.Duration
 }
 
@@ -25,7 +27,8 @@ func ApplicationMemberSpec(opts ApplicationMemberSpecOptions) gen.ApplicationMem
 func FactorySystemSup(opts ApplicationMemberSpecOptions) gen.ProcessFactory {
 	return func() gen.ProcessBehavior {
 		sup := &systemSup{
-			cron:                opts.CronJobs,
+			cronSource:          opts.CronSource,
+			cronOptions:         opts.CronSchedulerOptions,
 			syncProcessInterval: opts.SyncAddressBookInterval,
 		}
 		if opts.AddressBook != nil {
@@ -40,7 +43,8 @@ func FactorySystemSup(opts ApplicationMemberSpecOptions) gen.ProcessFactory {
 type systemSup struct {
 	act.Supervisor
 	book                *AddressBook
-	cron                []CronJob
+	cronSource          cronpkg.Source
+	cronOptions         cronpkg.SchedulerOptions
 	syncProcessInterval time.Duration
 }
 
@@ -64,7 +68,7 @@ func (sup *systemSup) Init(args ...any) (act.SupervisorSpec, error) {
 		},
 		{
 			Name:    CronJobProcess,
-			Factory: factoryCron(sup.cron),
+			Factory: cronpkg.Factory(sup.cronSource, sup.cronOptions),
 		},
 	}
 
