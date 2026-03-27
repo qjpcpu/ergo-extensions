@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"sync"
 	"time"
 
 	"ergo.services/ergo/act"
@@ -29,6 +31,12 @@ type pendingDispatch struct {
 	scheduledAt time.Time
 	dispatchKey string
 	slot        int64
+}
+
+type shardLoadResult struct {
+	shard   uint32
+	runtime *shardRuntime
+	err     error
 }
 
 type Process struct {
@@ -213,15 +221,53 @@ func (p *Process) rebalance() error {
 		p.stopShardWatch(runtime)
 		delete(p.owned, shard)
 	}
+	missing := make([]uint32, 0, len(desired))
 	for shard := range desired {
 		if _, ok := p.owned[shard]; ok {
 			continue
 		}
-		if err := p.loadShard(shard); err != nil {
-			return err
+		missing = append(missing, shard)
+	}
+	sort.Slice(missing, func(i, j int) bool { return missing[i] < missing[j] })
+	if len(missing) == 0 {
+		return nil
+	}
+	if p.options.ScanConcurrency <= 1 || len(missing) == 1 {
+		for _, shard := range missing {
+			if err := p.loadShard(shard); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	base := time.Now().UTC()
+	logger := p.Log()
+	plans := make(map[uint32]int64, len(missing))
+	for _, shard := range missing {
+		p.nextGeneration++
+		plans[shard] = p.nextGeneration
+	}
+	results := loadShardResults(missing, p.options.ScanConcurrency, func(shard uint32) shardLoadResult {
+		runtime, err := p.prepareShardRuntime(shard, plans[shard], base, logger)
+		return shardLoadResult{shard: shard, runtime: runtime, err: err}
+	})
+
+	var firstErr error
+	for _, result := range results {
+		if result.err != nil {
+			if firstErr == nil {
+				firstErr = result.err
+			}
+			continue
+		}
+		if err := p.commitShardRuntime(result.runtime); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
-	return nil
+	return firstErr
 }
 
 func (p *Process) refreshRing(nodes []gen.Atom) error {
@@ -249,23 +295,30 @@ func (p *Process) refreshRing(nodes []gen.Atom) error {
 
 func (p *Process) loadShard(shard uint32) error {
 	p.nextGeneration++
-	runtime := newShardRuntime(shard, p.nextGeneration)
-	base := time.Now().UTC()
+	runtime, err := p.prepareShardRuntime(shard, p.nextGeneration, time.Now().UTC(), p.Log())
+	if err != nil {
+		return err
+	}
+	return p.commitShardRuntime(runtime)
+}
+
+func (p *Process) prepareShardRuntime(shard uint32, generation int64, base time.Time, logger gen.Log) (*shardRuntime, error) {
+	runtime := newShardRuntime(shard, generation)
 	runtime.loadedAt = base
 	provider := p.provider()
 	if provider == nil {
-		return errors.New("cron scheduler missing job provider")
+		return nil, errors.New("cron scheduler missing job provider")
 	}
 	backend := p.backend()
 	if backend == nil {
-		return errors.New("cron scheduler missing KV store")
+		return nil, errors.New("cron scheduler missing KV store")
 	}
 	lease, err := backend.AcquireShardLease(context.Background(), shard, p.Node().Name(), p.options.LeaseTTL)
 	if err != nil {
-		return fmt.Errorf("acquire lease for shard %d: %w", shard, err)
+		return nil, fmt.Errorf("acquire lease for shard %d: %w", shard, err)
 	}
 	if !lease.Acquired || lease.Owner != p.Node().Name() {
-		return fmt.Errorf("shard %d lease owned by %s", shard, lease.Owner)
+		return nil, fmt.Errorf("shard %d lease owned by %s", shard, lease.Owner)
 	}
 	runtime.lease = lease
 
@@ -277,16 +330,16 @@ func (p *Process) loadShard(shard uint32) error {
 			Limit:  p.options.ScanPageSize,
 		})
 		if err != nil {
-			return fmt.Errorf("scan shard %d: %w", shard, err)
+			return nil, fmt.Errorf("scan shard %d: %w", shard, err)
 		}
 		for _, jobSpec := range result.Jobs {
 			job, err := compileJob(jobSpec)
 			if err != nil {
-				p.Log().Error("compile cron job %s failed: %v", jobSpec.ID, err)
+				logger.Error("compile cron job %s failed: %v", jobSpec.ID, err)
 				continue
 			}
 			if err := runtime.Upsert(job, base, p.options.TickResolution); err != nil {
-				return err
+				return nil, err
 			}
 		}
 		if result.Done {
@@ -300,7 +353,7 @@ func (p *Process) loadShard(shard uint32) error {
 	currentSlot := slotKey(base, p.options.TickResolution)
 	checkpoint, err := backend.GetShardCheckpoint(context.Background(), shard)
 	if err != nil {
-		return fmt.Errorf("get checkpoint for shard %d: %w", shard, err)
+		return nil, fmt.Errorf("get checkpoint for shard %d: %w", shard, err)
 	}
 	if checkpoint.Valid {
 		runtime.checkpoint = checkpoint.Slot
@@ -308,17 +361,53 @@ func (p *Process) loadShard(shard uint32) error {
 		runtime.checkpoint = currentSlot - 1
 	}
 	if err := p.replayShard(runtime, runtime.checkpoint+1, currentSlot); err != nil {
-		return err
+		return nil, err
 	}
+	return runtime, nil
+}
 
-	p.owned[shard] = runtime
-
+func (p *Process) commitShardRuntime(runtime *shardRuntime) error {
+	if runtime == nil {
+		return nil
+	}
+	p.owned[runtime.id] = runtime
 	if err := p.startShardWatch(runtime); err != nil {
-		delete(p.owned, shard)
+		delete(p.owned, runtime.id)
 		return err
 	}
 	runtime.Activate()
 	return nil
+}
+
+func loadShardResults(shards []uint32, concurrency int, fn func(uint32) shardLoadResult) []shardLoadResult {
+	if len(shards) == 0 {
+		return nil
+	}
+	if concurrency <= 1 || len(shards) == 1 {
+		results := make([]shardLoadResult, len(shards))
+		for i, shard := range shards {
+			results[i] = fn(shard)
+		}
+		return results
+	}
+	if concurrency > len(shards) {
+		concurrency = len(shards)
+	}
+
+	results := make([]shardLoadResult, len(shards))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, concurrency)
+	for i, shard := range shards {
+		wg.Add(1)
+		go func(index int, shard uint32) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			results[index] = fn(shard)
+		}(i, shard)
+	}
+	wg.Wait()
+	return results
 }
 
 func (p *Process) startShardWatch(runtime *shardRuntime) error {

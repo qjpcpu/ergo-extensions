@@ -2,6 +2,8 @@ package cron
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -141,5 +143,41 @@ func TestFlushPendingRetainsBacklogAndFailedJobs(t *testing.T) {
 	}
 	if len(records) != 1 || records[0].State != DispatchStateAcked {
 		t.Fatalf("expected acked dispatch for job-2, got %+v", records)
+	}
+}
+
+func TestLoadShardResultsRunsConcurrentLoads(t *testing.T) {
+	shards := []uint32{1, 2, 3, 4}
+	var active int32
+	var maxActive int32
+	var entered sync.WaitGroup
+	entered.Add(len(shards))
+	release := make(chan struct{})
+	done := make(chan []shardLoadResult, 1)
+	go func() {
+		done <- loadShardResults(shards, 4, func(shard uint32) shardLoadResult {
+			current := atomic.AddInt32(&active, 1)
+			defer atomic.AddInt32(&active, -1)
+			for {
+				prev := atomic.LoadInt32(&maxActive)
+				if current <= prev || atomic.CompareAndSwapInt32(&maxActive, prev, current) {
+					break
+				}
+			}
+			entered.Done()
+			<-release
+			return shardLoadResult{shard: shard}
+		})
+	}()
+
+	entered.Wait()
+	close(release)
+	results := <-done
+
+	if len(results) != len(shards) {
+		t.Fatalf("unexpected results size: got %d want %d", len(results), len(shards))
+	}
+	if maxActive <= 1 {
+		t.Fatalf("expected concurrent loads, max active=%d", maxActive)
 	}
 }
