@@ -1,4 +1,4 @@
-package system
+package whereis
 
 import (
 	"math/rand"
@@ -7,37 +7,42 @@ import (
 
 	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
+	core "github.com/qjpcpu/ergo-extensions/system/internal/core"
 	"github.com/qjpcpu/registrar/events"
 )
 
-const (
-	WhereIsProcess = gen.Atom("extensions_whereis")
-)
+const ProcessName = gen.Atom("extensions_whereis")
+
+type messageInit struct{}
+type messageInspectProcess struct{}
+type messageTopologyChange struct {
+	ID int64
+}
 
 type whereis struct {
 	act.Actor
-	book      *AddressBook
+	book      *core.AddressBook
 	registrar gen.Registrar
 
-	selfVersion  ProcessVersion
-	nodeVersions map[gen.Atom]ProcessVersion
+	selfVersion  core.ProcessVersion
+	nodeVersions map[gen.Atom]core.ProcessVersion
 
 	pidToName     map[gen.PID]gen.Atom
 	nameToBirthAt map[gen.Atom]int64
 	nameToPID     map[gen.Atom]gen.PID
 	// only includes named processes
-	processCache       *AtomicValue[ProcessInfoList]
+	processCache       *core.AtomicValue[core.ProcessInfoList]
 	inspectInterval    time.Duration
 	antiEntropyCounter int
 	topologyChangeID   int64
 	sendFailureLogAt   map[gen.Atom]time.Time
 	selfNode           gen.Atom
 	nowFn              func() time.Time
-	sendProcessChanged func(gen.ProcessID, MessageProcessChanged) error
+	sendProcessChanged func(gen.ProcessID, core.MessageProcessChanged) error
 	logSendFailureFn   func(gen.Atom, string, error)
 }
 
-func factoryWhereIs(book *AddressBook, inspectInterval time.Duration) gen.ProcessFactory {
+func Factory(book *core.AddressBook, inspectInterval time.Duration) gen.ProcessFactory {
 	if inspectInterval == 0 {
 		inspectInterval = time.Second * 3
 	}
@@ -47,9 +52,9 @@ func factoryWhereIs(book *AddressBook, inspectInterval time.Duration) gen.Proces
 			pidToName:        make(map[gen.PID]gen.Atom),
 			nameToPID:        make(map[gen.Atom]gen.PID),
 			nameToBirthAt:    make(map[gen.Atom]int64),
-			processCache:     NewAtomicValue[ProcessInfoList](),
-			selfVersion:      NewVersion(),
-			nodeVersions:     make(map[gen.Atom]ProcessVersion),
+			processCache:     core.NewAtomicValue[core.ProcessInfoList](),
+			selfVersion:      core.NewVersion(),
+			nodeVersions:     make(map[gen.Atom]core.ProcessVersion),
 			inspectInterval:  inspectInterval,
 			sendFailureLogAt: make(map[gen.Atom]time.Time),
 			nowFn:            func() time.Time { return time.Now().UTC() },
@@ -71,7 +76,7 @@ func (w *whereis) now() time.Time {
 	return time.Now().UTC()
 }
 
-func (w *whereis) sendProcessChangedMessage(pid gen.ProcessID, msg MessageProcessChanged) error {
+func (w *whereis) sendProcessChangedMessage(pid gen.ProcessID, msg core.MessageProcessChanged) error {
 	if w.sendProcessChanged != nil {
 		return w.sendProcessChanged(pid, msg)
 	}
@@ -147,30 +152,30 @@ func (w *whereis) HandleMessage(from gen.PID, message any) error {
 			w.selfVersion = w.selfVersion.Incr()
 			w.syncDirectoryShards(procs)
 		}
-	case MessageProcessChanged:
+	case core.MessageProcessChanged:
 		return w.handleProcessChanged(e)
-	case MessageLocate:
+	case core.MessageLocate:
 		if e.Name == "" {
 			return nil
 		}
 		owner := w.book.PickDirectoryNode(e.Name)
 		if owner == w.selfNodeName() {
 			if p, ok := w.book.LocateLocal(e.Name); ok {
-				w.Send(from, MessageLocateResult{Name: e.Name, Node: p})
+				w.Send(from, core.MessageLocateResult{Name: e.Name, Node: p})
 				return nil
 			}
-			w.Send(from, MessageLocateResult{Name: e.Name})
+			w.Send(from, core.MessageLocateResult{Name: e.Name})
 			return nil
 		}
 		if owner == "" {
-			w.Send(from, MessageLocateResult{Name: e.Name})
+			w.Send(from, core.MessageLocateResult{Name: e.Name})
 			return nil
 		}
-		w.Send(gen.ProcessID{Node: owner, Name: WhereIsProcess}, MessageForwardLocate{
+		w.Send(gen.ProcessID{Node: owner, Name: ProcessName}, core.MessageForwardLocate{
 			Name: e.Name,
 			From: from,
 		})
-	case MessageForwardLocate:
+	case core.MessageForwardLocate:
 		var node gen.Atom
 		owner := w.book.PickDirectoryNode(e.Name)
 		if owner == w.selfNodeName() {
@@ -179,12 +184,12 @@ func (w *whereis) HandleMessage(from gen.PID, message any) error {
 			}
 		} else if owner != "" && e.Hops < 2 {
 			e.Hops++
-			w.Send(gen.ProcessID{Node: owner, Name: WhereIsProcess}, e)
+			w.Send(gen.ProcessID{Node: owner, Name: ProcessName}, e)
 			return nil
 		}
 		if e.Ref.ID[0] == 0 && e.Ref.ID[1] == 0 && e.Ref.ID[2] == 0 {
 			// it's a Send request
-			w.Send(e.From, MessageLocateResult{Name: e.Name, Node: node})
+			w.Send(e.From, core.MessageLocateResult{Name: e.Name, Node: node})
 		} else {
 			w.SendResponse(e.From, e.Ref, node)
 		}
@@ -194,7 +199,7 @@ func (w *whereis) HandleMessage(from gen.PID, message any) error {
 
 func (w *whereis) HandleCall(from gen.PID, ref gen.Ref, request any) (any, error) {
 	switch e := request.(type) {
-	case MessageLocate:
+	case core.MessageLocate:
 		if e.Name == "" {
 			return gen.Atom(""), nil
 		}
@@ -208,14 +213,14 @@ func (w *whereis) HandleCall(from gen.PID, ref gen.Ref, request any) (any, error
 		if owner == "" {
 			return gen.Atom(""), nil
 		}
-		w.Send(gen.ProcessID{Node: owner, Name: WhereIsProcess}, MessageForwardLocate{
+		w.Send(gen.ProcessID{Node: owner, Name: ProcessName}, core.MessageForwardLocate{
 			Name: e.Name,
 			From: from,
 			Ref:  ref,
 		})
 		return nil, nil
-	case MessageGetAddressBook:
-		return MessageAddressBook{Book: w.book, Owner: w.PID()}, nil
+	case core.MessageGetAddressBook:
+		return core.MessageAddressBook{Book: w.book, Owner: w.PID()}, nil
 	}
 	return w.PID(), nil
 }
@@ -238,7 +243,7 @@ func (w *whereis) HandleEvent(event gen.MessageEvent) error {
 	return nil
 }
 
-func (w *whereis) registerToShards(msg MessageProcessChanged) {
+func (w *whereis) registerToShards(msg core.MessageProcessChanged) {
 	// Batch lookup directory owners to acquire the lock only once
 	// instead of per-process, reducing lock overhead in large clusters.
 	names := make([]gen.Atom, 0, len(msg.UpProcess)+len(msg.DownProcess))
@@ -250,14 +255,14 @@ func (w *whereis) registerToShards(msg MessageProcessChanged) {
 	}
 	owners := w.book.PickDirectoryNodeBatch(names)
 
-	shards := make(map[gen.Atom]*MessageProcessChanged)
+	shards := make(map[gen.Atom]*core.MessageProcessChanged)
 	for _, p := range msg.UpProcess {
 		owner := owners[p.Name]
 		if owner == "" {
 			continue
 		}
 		if _, ok := shards[owner]; !ok {
-			shards[owner] = &MessageProcessChanged{
+			shards[owner] = &core.MessageProcessChanged{
 				Node:     w.selfNodeName(),
 				Version:  msg.Version,
 				FullSync: msg.FullSync,
@@ -271,7 +276,7 @@ func (w *whereis) registerToShards(msg MessageProcessChanged) {
 			continue
 		}
 		if _, ok := shards[owner]; !ok {
-			shards[owner] = &MessageProcessChanged{
+			shards[owner] = &core.MessageProcessChanged{
 				Node:     w.selfNodeName(),
 				Version:  msg.Version,
 				FullSync: msg.FullSync,
@@ -282,7 +287,7 @@ func (w *whereis) registerToShards(msg MessageProcessChanged) {
 
 	for owner, shardMsg := range shards {
 		if owner != w.selfNodeName() {
-			if err := w.sendProcessChangedMessage(gen.ProcessID{Node: owner, Name: WhereIsProcess}, *shardMsg); err != nil {
+			if err := w.sendProcessChangedMessage(gen.ProcessID{Node: owner, Name: ProcessName}, *shardMsg); err != nil {
 				w.logSendFailure(owner, "incremental shard sync", err)
 				continue
 			}
@@ -307,7 +312,7 @@ func (w *whereis) inspectProcessList() error {
 		w.book.AddProcess(w.selfNodeName(), up...)
 		w.book.RemoveProcess(w.selfNodeName(), down...)
 		w.selfVersion = w.selfVersion.Incr()
-		w.registerToShards(MessageProcessChanged{
+		w.registerToShards(core.MessageProcessChanged{
 			Node:        w.selfNodeName(),
 			UpProcess:   up,
 			DownProcess: down,
@@ -320,7 +325,7 @@ func (w *whereis) inspectProcessList() error {
 // collectProcessList gets all processes from the current node,
 // finds the newly started and recently stopped processes,
 // updates the internal cache, and returns incremental and full process lists.
-func (w *whereis) collectProcessList() (up, down, all ProcessInfoList, err error) {
+func (w *whereis) collectProcessList() (up, down, all core.ProcessInfoList, err error) {
 	// Get the list of all running process PIDs on the current node.
 	pidList, err := w.Node().ProcessList()
 	if err != nil {
@@ -354,7 +359,7 @@ func (w *whereis) collectProcessList() (up, down, all ProcessInfoList, err error
 		// Ensure we only delete the entry if the PID matches,
 		// avoiding issues with stale/reused process names.
 		if name != "" && w.nameToPID[name] == pid {
-			down = append(down, ProcessInfo{
+			down = append(down, core.ProcessInfo{
 				Name:    name,
 				PID:     pid,
 				Node:    node.Name(),
@@ -374,7 +379,7 @@ func (w *whereis) collectProcessList() (up, down, all ProcessInfoList, err error
 				birthAt := time.Now().Unix() - info.Uptime
 				w.nameToPID[info.Name] = pid
 				w.nameToBirthAt[info.Name] = birthAt
-				up = append(up, ProcessInfo{
+				up = append(up, core.ProcessInfo{
 					Name:    info.Name,
 					PID:     pid,
 					Node:    node.Name(),
@@ -385,9 +390,9 @@ func (w *whereis) collectProcessList() (up, down, all ProcessInfoList, err error
 	}
 
 	// Rebuild the full process list from the updated nameToPID map.
-	all = make(ProcessInfoList, 0, len(w.nameToPID))
+	all = make(core.ProcessInfoList, 0, len(w.nameToPID))
 	for name, pid := range w.nameToPID {
-		all = append(all, ProcessInfo{
+		all = append(all, core.ProcessInfo{
 			Name:    name,
 			PID:     pid,
 			Node:    node.Name(),
@@ -423,12 +428,12 @@ func (w *whereis) setup() error {
 	return nil
 }
 
-func (w *whereis) fetchAvailableBookNodes() (*NodeList, error) {
+func (w *whereis) fetchAvailableBookNodes() (*core.NodeList, error) {
 	nodes, err := w.registrar.Nodes()
 	if err != nil {
 		return nil, err
 	}
-	nodeList := NewNodeList(sortNodes(uniqNodes(append(nodes, w.selfNodeName())))...)
+	nodeList := core.NewNodeList(core.SortNodes(core.UniqNodes(append(nodes, w.selfNodeName())))...)
 	w.book.SetAvailableNodes(nodeList)
 	return nodeList, nil
 }
@@ -441,7 +446,7 @@ func (w *whereis) HandleInspect(from gen.PID, item ...string) map[string]string 
 	return stats
 }
 
-func (w *whereis) handleProcessChanged(e MessageProcessChanged) error {
+func (w *whereis) handleProcessChanged(e core.MessageProcessChanged) error {
 	if version, ok := w.nodeVersions[e.Node]; ok && version.GreaterThanOrEq(e.Version) {
 		return nil
 	}
@@ -469,7 +474,7 @@ func (w *whereis) antiEntropyThreshold() int {
 // syncDirectoryShards sends an authoritative shard snapshot to every current
 // directory node. Empty shards are sent too, so previous owners clear stale
 // state after topology changes.
-func (w *whereis) syncDirectoryShards(procs ProcessInfoList) {
+func (w *whereis) syncDirectoryShards(procs core.ProcessInfoList) {
 	dirNodes := w.book.DirectoryNodes()
 	if len(dirNodes) == 0 {
 		return
@@ -481,9 +486,9 @@ func (w *whereis) syncDirectoryShards(procs ProcessInfoList) {
 	}
 	owners := w.book.PickDirectoryNodeBatch(names)
 
-	shards := make(map[gen.Atom]*MessageProcessChanged)
+	shards := make(map[gen.Atom]*core.MessageProcessChanged)
 	for _, owner := range dirNodes {
-		shards[owner] = &MessageProcessChanged{
+		shards[owner] = &core.MessageProcessChanged{
 			Node:     w.selfNodeName(),
 			Version:  w.selfVersion,
 			FullSync: true,
@@ -500,7 +505,7 @@ func (w *whereis) syncDirectoryShards(procs ProcessInfoList) {
 
 	for owner, msg := range shards {
 		if owner != w.selfNodeName() {
-			if err := w.sendProcessChangedMessage(gen.ProcessID{Node: owner, Name: WhereIsProcess}, *msg); err != nil {
+			if err := w.sendProcessChangedMessage(gen.ProcessID{Node: owner, Name: ProcessName}, *msg); err != nil {
 				w.logSendFailure(owner, "topology full sync", err)
 				continue
 			}
@@ -509,8 +514,8 @@ func (w *whereis) syncDirectoryShards(procs ProcessInfoList) {
 	}
 }
 
-func (w *whereis) handleTopologyChange(localProcs ProcessInfoList) {
-	msg := MessageProcessChanged{
+func (w *whereis) handleTopologyChange(localProcs core.ProcessInfoList) {
+	msg := core.MessageProcessChanged{
 		Node:      w.selfNodeName(),
 		UpProcess: localProcs,
 		Version:   w.selfVersion,

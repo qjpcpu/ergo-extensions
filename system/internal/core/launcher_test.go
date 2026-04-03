@@ -1,4 +1,4 @@
-package system
+package core
 
 import (
 	"testing"
@@ -24,8 +24,8 @@ func TestLauncherRegistration(t *testing.T) {
 	if !ok {
 		t.Fatalf("failed to get launcher")
 	}
-	if l.name != name {
-		t.Errorf("expected name %s, got %s", name, l.name)
+	if l.Name != name {
+		t.Errorf("expected name %s, got %s", name, l.Name)
 	}
 
 	// Test invalid register

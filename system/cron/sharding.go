@@ -15,10 +15,13 @@ func (h hasher) Sum64(data []byte) uint64 {
 	return xxhash.Sum64(data)
 }
 
-type ringMember string
+type ringMember struct {
+	id   string
+	node gen.Atom
+}
 
 func (m ringMember) String() string {
-	return string(m)
+	return m.id
 }
 
 func makeRing(members ...consistent.Member) *consistent.Consistent {
@@ -45,6 +48,9 @@ func shardOwner(ring *consistent.Consistent, shard uint32) gen.Atom {
 	member := ring.LocateKey(shardToken(shard))
 	if member == nil {
 		return ""
+	}
+	if tagged, ok := member.(ringMember); ok {
+		return tagged.node
 	}
 	return gen.Atom(member.String())
 }

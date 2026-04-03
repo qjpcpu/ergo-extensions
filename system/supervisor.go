@@ -6,6 +6,8 @@ import (
 	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
 	cronpkg "github.com/qjpcpu/ergo-extensions/system/cron"
+	"github.com/qjpcpu/ergo-extensions/system/daemon"
+	"github.com/qjpcpu/ergo-extensions/system/whereis"
 )
 
 const Supervisor = gen.Atom("extensions_sup")
@@ -60,11 +62,11 @@ func (sup *systemSup) Init(args ...any) (act.SupervisorSpec, error) {
 	spec.Children = []act.SupervisorChildSpec{
 		{
 			Name:    WhereIsProcess,
-			Factory: factoryWhereIs(book, sup.syncProcessInterval),
+			Factory: whereis.Factory(book, sup.syncProcessInterval),
 		},
 		{
 			Name:    DaemonMonitorProcess,
-			Factory: factoryDaemon(book),
+			Factory: daemon.Factory(book),
 		},
 		{
 			Name:    CronJobProcess,

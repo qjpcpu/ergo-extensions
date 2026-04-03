@@ -132,6 +132,7 @@ type SchedulerOptions struct {
 	EnableBatchTrigger bool
 	InitDelay          time.Duration
 	LeaseTTL           time.Duration
+	OwnerRingSalt      string
 }
 
 func (o SchedulerOptions) WithDefaults() SchedulerOptions {
@@ -161,6 +162,9 @@ func (o SchedulerOptions) WithDefaults() SchedulerOptions {
 	}
 	if o.LeaseTTL <= 0 {
 		o.LeaseTTL = 10 * time.Second
+	}
+	if o.OwnerRingSalt == "" {
+		o.OwnerRingSalt = "extensions_cron_owner"
 	}
 	return o
 }

@@ -1,6 +1,7 @@
-package system
+package core
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -13,6 +14,10 @@ import (
 	"github.com/buraksezer/consistent"
 	"github.com/cespare/xxhash"
 )
+
+var ErrNoAvailableNodes = errors.New("no available nodes")
+
+const WhereIsProcess = gen.Atom("extensions_whereis")
 
 // QueryOption defines the options for process lookup.
 type QueryOption struct {
@@ -36,6 +41,7 @@ type IAddressBook interface {
 	QueryBy(caller gen.Process, option QueryOption) IAddressBookQuery
 	PickNode(process gen.Atom) gen.Atom
 	PickDirectoryNode(process gen.Atom) gen.Atom
+	LocateLocal(process gen.Atom) (gen.Atom, bool)
 	GetAvailableNodes() *NodeList
 }
 
@@ -500,6 +506,10 @@ func sortNodes(n []gen.Atom) []gen.Atom {
 	return nodes
 }
 
+func SortNodes(n []gen.Atom) []gen.Atom {
+	return sortNodes(n)
+}
+
 func uniqNodes(nodes []gen.Atom) []gen.Atom {
 	dup := make(map[gen.Atom]struct{})
 	var del int
@@ -513,6 +523,10 @@ func uniqNodes(nodes []gen.Atom) []gen.Atom {
 	}
 	nodes = nodes[:len(nodes)-del]
 	return nodes
+}
+
+func UniqNodes(nodes []gen.Atom) []gen.Atom {
+	return uniqNodes(nodes)
 }
 
 // removeNode removes a node from the given list of nodes.

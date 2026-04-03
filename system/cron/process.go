@@ -55,8 +55,8 @@ type Process struct {
 }
 
 type consistentState struct {
-	prevNodes map[gen.Atom]struct{}
-	ring      *consistent.Consistent
+	prevMembers map[gen.Atom]ringMember
+	ring        *consistent.Consistent
 }
 
 func Factory(source Source, options SchedulerOptions) gen.ProcessFactory {
@@ -67,8 +67,8 @@ func Factory(source Source, options SchedulerOptions) gen.ProcessFactory {
 			options: opts,
 			trigger: LocalTrigger{Batch: opts.EnableBatchTrigger},
 			ring: &consistentState{
-				prevNodes: make(map[gen.Atom]struct{}),
-				ring:      makeRing(),
+				prevMembers: make(map[gen.Atom]ringMember),
+				ring:        makeRing(),
 			},
 			owned: make(map[uint32]*shardRuntime),
 		}
@@ -271,26 +271,35 @@ func (p *Process) rebalance() error {
 }
 
 func (p *Process) refreshRing(nodes []gen.Atom) error {
-	nodesMap := make(map[gen.Atom]struct{}, len(nodes)+1)
+	members := make(map[gen.Atom]ringMember, len(nodes)+1)
 	for _, node := range nodes {
-		nodesMap[node] = struct{}{}
-		if _, ok := p.ring.prevNodes[node]; !ok {
-			p.ring.ring.Add(ringMember(node))
+		member := p.ownerRingMember(node)
+		members[node] = member
+		if _, ok := p.ring.prevMembers[node]; !ok {
+			p.ring.ring.Add(member)
 		}
 	}
 	self := p.Node().Name()
-	nodesMap[self] = struct{}{}
-	if _, ok := p.ring.prevNodes[self]; !ok {
-		p.ring.ring.Add(ringMember(self))
+	member := p.ownerRingMember(self)
+	members[self] = member
+	if _, ok := p.ring.prevMembers[self]; !ok {
+		p.ring.ring.Add(member)
 	}
-	for node := range p.ring.prevNodes {
-		if _, ok := nodesMap[node]; ok {
+	for node, member := range p.ring.prevMembers {
+		if _, ok := members[node]; ok {
 			continue
 		}
-		p.ring.ring.Remove(string(node))
+		p.ring.ring.Remove(member.String())
 	}
-	p.ring.prevNodes = nodesMap
+	p.ring.prevMembers = members
 	return nil
+}
+
+func (p *Process) ownerRingMember(node gen.Atom) ringMember {
+	return ringMember{
+		id:   p.options.OwnerRingSalt + ":" + string(node),
+		node: node,
+	}
 }
 
 func (p *Process) loadShard(shard uint32) error {
@@ -551,11 +560,15 @@ func (p *Process) flushPending() {
 		}
 		rest = append(rest, item)
 	}
+
+	const maxPendingCapacity = 100000
+	logger := p.safeLogger()
+	rest = trimPendingQueue(logger, rest, maxPendingCapacity)
 	if len(dispatch) > 0 {
 		backend := p.backend()
 		if backend == nil {
-			p.Log().Error("cron scheduler missing KV store")
-			p.pending = append(rest, dispatchedItems...)
+			safeError(logger, "cron scheduler missing KV store")
+			p.pending = trimPendingQueue(logger, append(rest, dispatchedItems...), maxPendingCapacity)
 			return
 		}
 		failed, err := p.trigger.Fire(p, dispatch)
@@ -618,14 +631,64 @@ func (p *Process) flushPending() {
 			}
 		}
 		if err != nil {
-			p.Log().Error("dispatch cron jobs failed: %v", err)
+			safeError(logger, "dispatch cron jobs failed: %v", err)
 		}
 	}
-	p.pending = rest
+	p.pending = trimPendingQueue(logger, rest, maxPendingCapacity)
+}
+
+func (p *Process) safeLogger() (logger gen.Log) {
+	defer func() {
+		if recover() != nil {
+			logger = nil
+		}
+	}()
+	return p.Log()
+}
+
+func trimPendingQueue(logger gen.Log, pending []pendingDispatch, maxPendingCapacity int) []pendingDispatch {
+	if len(pending) <= maxPendingCapacity {
+		return pending
+	}
+	dropCount := len(pending) - maxPendingCapacity
+	safeWarning(logger, "cron pending dispatch queue exceeded limit, dropping %d oldest entries", dropCount)
+	return pending[len(pending)-maxPendingCapacity:]
+}
+
+func safeWarning(logger gen.Log, format string, args ...any) {
+	if logger == nil {
+		return
+	}
+	defer func() {
+		_ = recover()
+	}()
+	logger.Warning(format, args...)
+}
+
+func safeError(logger gen.Log, format string, args ...any) {
+	if logger == nil {
+		return
+	}
+	defer func() {
+		_ = recover()
+	}()
+	logger.Error(format, args...)
 }
 
 func (p *Process) refreshShardLeases() error {
+	// Only renew leases that are close to expiration to reduce KV operations.
+	// If we renewed every tick for all shards with many shards and short tick resolution,
+	// this would create unnecessary KV traffic.
+	now := time.Now().UTC()
 	for shard, runtime := range p.owned {
+		// Check if lease needs renewal: renew if less than 1/3 of TTL remains
+		ttl := p.options.LeaseTTL
+		remaining := runtime.lease.ExpiresAt.Sub(now)
+		if remaining > ttl/3 {
+			// Still plenty of time left on the lease, skip renewal this tick
+			continue
+		}
+
 		backend := p.backend()
 		if backend == nil {
 			return errors.New("cron scheduler missing KV store")
@@ -719,13 +782,19 @@ func (p *Process) advanceCheckpoint(runtime *shardRuntime) error {
 	if backend == nil {
 		return errors.New("cron scheduler missing KV store")
 	}
+	var lastErr error
 	for {
 		next := runtime.checkpoint + 1
 		if _, ok := runtime.completedSlots[next]; !ok {
-			return nil
+			// No more completed slots to advance, return last error (if any)
+			return lastErr
 		}
 		if err := backend.AdvanceShardCheckpoint(context.Background(), runtime.id, owner, runtime.lease.Epoch, next); err != nil {
-			return err
+			// Log the error but continue advancing any other completed slots we can.
+			// Don't stop entirely on the first failure - progress what we can and try again next tick.
+			p.Log().Error("advance checkpoint for shard %d slot %d failed: %v", runtime.id, next, err)
+			lastErr = err
+			return lastErr
 		}
 		delete(runtime.completedSlots, next)
 		runtime.checkpoint = next

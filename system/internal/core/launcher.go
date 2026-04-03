@@ -1,4 +1,4 @@
-package system
+package core
 
 import (
 	"fmt"
@@ -14,7 +14,7 @@ func RegisterLauncher(name gen.Atom, launcher Launcher) error {
 	if launcher.Factory == nil {
 		return fmt.Errorf("invalid launcher %s", name)
 	}
-	launcher.name = name
+	launcher.Name = name
 	launchers.Store(name, launcher)
 	return nil
 }
@@ -30,6 +30,12 @@ func GetLauncher(name gen.Atom) (Launcher, bool) {
 // UnregisterLauncher unregisters a launcher by its name.
 func UnregisterLauncher(name gen.Atom) {
 	launchers.Delete(name)
+}
+
+func RangeLaunchers(fn func(name gen.Atom, launcher Launcher) bool) {
+	launchers.Range(func(key, value any) bool {
+		return fn(key.(gen.Atom), value.(Launcher))
+	})
 }
 
 func NewSpawner(parent gen.Process, launcher gen.Atom) Spawner {
@@ -66,7 +72,7 @@ type Launcher struct {
 	// RecoveryScanner is an optional function that scans for daemons to recover.
 	RecoveryScanner DaemonIteratorFactory // optional
 
-	name gen.Atom
+	Name gen.Atom
 }
 
 type DaemonIteratorFactory func() DaemonIterator

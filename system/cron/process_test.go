@@ -2,12 +2,14 @@ package cron
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"ergo.services/ergo/gen"
+	core "github.com/qjpcpu/ergo-extensions/system/internal/core"
 )
 
 type stubTrigger struct {
@@ -179,5 +181,77 @@ func TestLoadShardResultsRunsConcurrentLoads(t *testing.T) {
 	}
 	if maxActive <= 1 {
 		t.Fatalf("expected concurrent loads, max active=%d", maxActive)
+	}
+}
+
+func TestCronOwnerRingIsDecoupledFromDirectoryRing(t *testing.T) {
+	nodes := []gen.Atom{
+		"node-a@127.0.0.1",
+		"node-b@127.0.0.1",
+		"node-c@127.0.0.1",
+		"node-d@127.0.0.1",
+		"node-e@127.0.0.1",
+	}
+
+	book := core.NewAddressBook()
+	if err := book.SetAvailableNodes(core.NewNodeList(nodes...)); err != nil {
+		t.Fatalf("set available nodes: %v", err)
+	}
+
+	process := &Process{
+		options: SchedulerOptions{}.WithDefaults(),
+		ring: &consistentState{
+			prevMembers: make(map[gen.Atom]ringMember),
+			ring:        makeRing(),
+		},
+	}
+	for _, node := range nodes {
+		member := process.ownerRingMember(node)
+		process.ring.ring.Add(member)
+		process.ring.prevMembers[node] = member
+	}
+
+	matches := 0
+	total := 256
+	for i := 0; i < total; i++ {
+		token := "cron-shard:" + strconv.Itoa(i)
+		dirOwner := book.PickDirectoryNode(gen.Atom(token))
+		cronOwner := shardOwner(process.ring.ring, uint32(i))
+		if dirOwner == cronOwner {
+			matches++
+		}
+	}
+
+	if matches >= total/2 {
+		t.Fatalf("expected cron owner ring to diverge from directory ring, matches=%d total=%d", matches, total)
+	}
+}
+
+func TestFlushPendingCapsRetriedQueue(t *testing.T) {
+	const maxPendingCapacity = 100000
+	pending := make([]pendingDispatch, maxPendingCapacity+1)
+	for i := range pending {
+		pending[i] = pendingDispatch{
+			job: &CompiledJob{Spec: JobSpec{ID: strconv.Itoa(i)}},
+		}
+	}
+
+	process := &Process{
+		options: SchedulerOptions{
+			MaxDispatchPerTick: maxPendingCapacity * 2,
+		}.WithDefaults(),
+		pending: pending,
+	}
+
+	process.flushPending()
+
+	if got := len(process.pending); got != maxPendingCapacity {
+		t.Fatalf("unexpected pending size after cap: got %d want %d", got, maxPendingCapacity)
+	}
+	if got := process.pending[0].job.Spec.ID; got != "1" {
+		t.Fatalf("expected oldest pending item to be dropped, got head job %q", got)
+	}
+	if got := process.pending[len(process.pending)-1].job.Spec.ID; got != strconv.Itoa(maxPendingCapacity) {
+		t.Fatalf("expected newest pending item to remain, got tail job %q", got)
 	}
 }

@@ -1,4 +1,4 @@
-package system
+package core
 
 import (
 	"fmt"
@@ -13,6 +13,10 @@ type (
 	messageInspectProcess struct{}
 	messageTopologyChange struct {
 		ID int64
+	}
+	messageDaemonLaunchTimeout struct {
+		Name  gen.Atom
+		Epoch int64
 	}
 	messageScheduleCron struct{}
 	MessageLocate       struct {
@@ -53,9 +57,23 @@ type (
 		Book  IAddressBook
 	}
 	MessageLaunchAllDaemon struct{}
+	MessageEnsureDaemon    struct {
+		Launcher gen.Atom
+		Process  DaemonProcess
+		Attempt  int
+	}
 	MessageLaunchOneDaemon struct {
 		Launcher gen.Atom
 		Process  DaemonProcess
+		Owner    gen.Atom
+		Epoch    int64
+	}
+	MessageDaemonLaunchResult struct {
+		Name  gen.Atom
+		Node  gen.Atom
+		Epoch int64
+		State gen.Atom
+		Err   string
 	}
 )
 
@@ -70,7 +88,9 @@ func init() {
 		MessageForwardLocate{},
 		MessageLaunchAllDaemon{},
 		DaemonProcess{},
+		MessageEnsureDaemon{},
 		MessageLaunchOneDaemon{},
+		MessageDaemonLaunchResult{},
 	}
 
 	for _, t := range types {

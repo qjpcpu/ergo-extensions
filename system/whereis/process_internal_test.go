@@ -1,4 +1,4 @@
-package system
+package whereis
 
 import (
 	"errors"
@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"ergo.services/ergo/gen"
+	core "github.com/qjpcpu/ergo-extensions/system/internal/core"
 )
 
 type failingRegistrar struct {
@@ -63,7 +64,7 @@ func (r *failingRegistrar) Version() gen.Version {
 	return gen.Version{}
 }
 
-func findRemoteDirectoryProcess(t *testing.T, book *AddressBook, self gen.Atom) gen.Atom {
+func findRemoteDirectoryProcess(t *testing.T, book *core.AddressBook, self gen.Atom) gen.Atom {
 	t.Helper()
 	for i := 0; i < 1024; i++ {
 		name := gen.Atom(fmt.Sprintf("proc.remote.%d", i))
@@ -77,10 +78,10 @@ func findRemoteDirectoryProcess(t *testing.T, book *AddressBook, self gen.Atom) 
 }
 
 func TestRegisterToShardsSendFailureDoesNotScheduleTopologyDebounce(t *testing.T) {
-	book := NewAddressBook()
+	book := core.NewAddressBook()
 	self := gen.Atom("node-a@127.0.0.1")
 	remote := gen.Atom("node-b@127.0.0.1")
-	if err := book.SetAvailableNodes(NewNodeList(self, remote)); err != nil {
+	if err := book.SetAvailableNodes(core.NewNodeList(self, remote)); err != nil {
 		t.Fatalf("set available nodes: %v", err)
 	}
 	name := findRemoteDirectoryProcess(t, book, self)
@@ -92,17 +93,17 @@ func TestRegisterToShardsSendFailureDoesNotScheduleTopologyDebounce(t *testing.T
 		sendFailureLogAt: make(map[gen.Atom]time.Time),
 		nowFn:            func() time.Time { return time.Date(2026, 3, 27, 20, 0, 0, 0, time.UTC) },
 		logSendFailureFn: func(gen.Atom, string, error) {},
-		sendProcessChanged: func(pid gen.ProcessID, msg MessageProcessChanged) error {
+		sendProcessChanged: func(pid gen.ProcessID, msg core.MessageProcessChanged) error {
 			sendCalls++
 			return errors.New("boom")
 		},
 	}
 	w.topologyChangeID = 7
 
-	w.registerToShards(MessageProcessChanged{
+	w.registerToShards(core.MessageProcessChanged{
 		Node:      self,
-		UpProcess: []ProcessInfo{{Name: name, Node: self}},
-		Version:   NewVersion(),
+		UpProcess: []core.ProcessInfo{{Name: name, Node: self}},
+		Version:   core.NewVersion(),
 	})
 
 	if sendCalls != 1 {
@@ -114,10 +115,10 @@ func TestRegisterToShardsSendFailureDoesNotScheduleTopologyDebounce(t *testing.T
 }
 
 func TestSyncDirectoryShardsSendFailureDoesNotScheduleTopologyDebounce(t *testing.T) {
-	book := NewAddressBook()
+	book := core.NewAddressBook()
 	self := gen.Atom("node-a@127.0.0.1")
 	remote := gen.Atom("node-b@127.0.0.1")
-	if err := book.SetAvailableNodes(NewNodeList(self, remote)); err != nil {
+	if err := book.SetAvailableNodes(core.NewNodeList(self, remote)); err != nil {
 		t.Fatalf("set available nodes: %v", err)
 	}
 	name := findRemoteDirectoryProcess(t, book, self)
@@ -129,15 +130,15 @@ func TestSyncDirectoryShardsSendFailureDoesNotScheduleTopologyDebounce(t *testin
 		sendFailureLogAt: make(map[gen.Atom]time.Time),
 		nowFn:            func() time.Time { return time.Date(2026, 3, 27, 20, 0, 0, 0, time.UTC) },
 		logSendFailureFn: func(gen.Atom, string, error) {},
-		sendProcessChanged: func(pid gen.ProcessID, msg MessageProcessChanged) error {
+		sendProcessChanged: func(pid gen.ProcessID, msg core.MessageProcessChanged) error {
 			sendCalls++
 			return errors.New("boom")
 		},
 	}
 	w.topologyChangeID = 11
-	w.selfVersion = NewVersion()
+	w.selfVersion = core.NewVersion()
 
-	w.syncDirectoryShards(ProcessInfoList{{Name: name, Node: self}})
+	w.syncDirectoryShards(core.ProcessInfoList{{Name: name, Node: self}})
 
 	if sendCalls != 1 {
 		t.Fatalf("expected one failed full sync send, got %d", sendCalls)
@@ -171,7 +172,7 @@ func TestWhereisShouldLogSendFailureThrottlesPerOwner(t *testing.T) {
 
 func TestWhereisFetchAvailableBookNodesReturnsRegistrarError(t *testing.T) {
 	wantErr := errors.New("nodes unavailable")
-	book := NewAddressBook()
+	book := core.NewAddressBook()
 	w := &whereis{
 		book:      book,
 		selfNode:  gen.Atom("node-a@127.0.0.1"),
