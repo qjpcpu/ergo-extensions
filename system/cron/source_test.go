@@ -8,6 +8,20 @@ import (
 	"ergo.services/ergo/gen"
 )
 
+type flakyReadKVStore struct {
+	*MemoryKVStore
+	missKey   string
+	missCount int
+}
+
+func (s *flakyReadKVStore) Get(ctx context.Context, key string) (KVEntry, error) {
+	if key == s.missKey && s.missCount > 0 {
+		s.missCount--
+		return KVEntry{}, nil
+	}
+	return s.MemoryKVStore.Get(ctx, key)
+}
+
 func TestStaticSourceScanShards(t *testing.T) {
 	const shardCount = 16
 	source := NewStaticSource(shardCount,
@@ -101,5 +115,46 @@ func TestStaticSourceDispatchLifecycle(t *testing.T) {
 	}
 	if !checkpoint.Valid || checkpoint.Slot != 42 {
 		t.Fatalf("unexpected checkpoint: %+v", checkpoint)
+	}
+}
+
+func TestClaimDispatchesTreatsTransientMissingReadAsPending(t *testing.T) {
+	store := &flakyReadKVStore{MemoryKVStore: NewMemoryKVStore()}
+	backend := newStateBackend(store)
+	owner := gen.Atom("node@local")
+
+	lease, err := backend.AcquireShardLease(context.Background(), 3, owner, 5*time.Second)
+	if err != nil {
+		t.Fatalf("acquire lease: %v", err)
+	}
+
+	scheduledAt := time.Date(2026, 3, 27, 10, 5, 0, 0, time.UTC)
+	key := dispatchStateKey(3, dispatchKey(3, "job-1", scheduledAt))
+	store.missKey = key
+	store.missCount = 1
+
+	_, err = backend.ClaimDispatches(context.Background(), 3, owner, lease.Epoch, []DispatchClaim{{
+		JobID:       "job-1",
+		ScheduledAt: scheduledAt,
+	}})
+	if err != nil {
+		t.Fatalf("seed dispatch claim: %v", err)
+	}
+
+	records, err := backend.ClaimDispatches(context.Background(), 3, owner, lease.Epoch, []DispatchClaim{{
+		JobID:       "job-1",
+		ScheduledAt: scheduledAt,
+	}})
+	if err != nil {
+		t.Fatalf("claim dispatch with transient missing read: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(records))
+	}
+	if records[0].State != DispatchStatePending {
+		t.Fatalf("expected pending record, got %+v", records[0])
+	}
+	if records[0].JobID != "job-1" {
+		t.Fatalf("unexpected job id: %+v", records[0])
 	}
 }

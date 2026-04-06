@@ -206,6 +206,17 @@ func (b *stateBackend) ClaimDispatches(ctx context.Context, shard uint32, owner 
 		if err != nil {
 			return nil, err
 		}
+		if !entry.Found {
+			records = append(records, DispatchRecord{
+				Key:         key,
+				JobID:       claim.JobID,
+				ScheduledAt: claim.ScheduledAt.UTC(),
+				State:       DispatchStatePending,
+				Owner:       owner,
+				Epoch:       epoch,
+			})
+			continue
+		}
 		record, err := unmarshalDispatch(entry.Value)
 		if err != nil {
 			return nil, err

@@ -109,6 +109,21 @@ func TestSingleFlightGroupDoSharesResultWithConcurrentWaiters(t *testing.T) {
 	}
 }
 
+func TestSingleFlightGroupDoReturnsRecoveredPanicToFirstCaller(t *testing.T) {
+	var group singleFlightGroup[int]
+
+	value, err := group.Do("panic-key", func() (int, error) {
+		panic("boom")
+	})
+
+	if err == nil {
+		t.Fatal("expected recovered panic error")
+	}
+	if value != 0 {
+		t.Fatalf("expected zero value after panic, got %d", value)
+	}
+}
+
 func TestAddressBook_Basic(t *testing.T) {
 	book := NewAddressBook()
 	node1 := gen.Atom("node1")

@@ -116,15 +116,17 @@ func (g *singleFlightGroup[T]) cleanupCall(key string, c *call[T]) {
 
 // executeCall runs the function, capturing its result or any panic.
 // Panics are recovered and converted to errors to prevent process crashes.
-func (g *singleFlightGroup[T]) executeCall(c *call[T], fn func() (T, error)) (T, error) {
+func (g *singleFlightGroup[T]) executeCall(c *call[T], fn func() (T, error)) (val T, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			c.err = fmt.Errorf("panic in singleFlightGroup.Do: %v", r)
+			err = fmt.Errorf("panic in singleFlightGroup.Do: %v", r)
 		}
+		c.val = val
+		c.err = err
 	}()
 
-	c.val, c.err = fn()
-	return c.val, c.err
+	val, err = fn()
+	return val, err
 }
 
 // AddressBook is a registry for all processes running on all nodes

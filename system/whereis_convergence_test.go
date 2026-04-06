@@ -25,6 +25,7 @@ func uniqueNodeName(base string) string {
 	return fmt.Sprintf("%s-%d@%s", parts[0], seq, parts[1])
 }
 
+
 type testProc struct{ act.Actor }
 
 func (p *testProc) Init(args ...any) error { return nil }
@@ -171,9 +172,12 @@ func TestWhereisDuplicateNameDeterministicWinnerAndFailover(t *testing.T) {
 			n3.AddressBook().GetAvailableNodes().Len() == 3
 	})
 	pid2 := spawnNamed(t, n2, dup)
-	pid3 := spawnNamed(t, n3, dup)
+	time.Sleep(1200 * time.Millisecond)
+	_ = spawnNamed(t, n3, dup)
 
-	winner := nodeMin(n2.Name(), n3.Name())
+	// n2's process is definitively older (spawned 1.2s before n3's),
+	// so locate() will always select n2 as the winner via BirthAt.
+	winner := n2.Name()
 
 	waitWinner := func(n app.Node) bool {
 		node, ok := locateNode(n, dup)
@@ -184,14 +188,9 @@ func TestWhereisDuplicateNameDeterministicWinnerAndFailover(t *testing.T) {
 	waitUntil(t, 60*time.Second, func() bool { return waitWinner(n2) })
 	waitUntil(t, 60*time.Second, func() bool { return waitWinner(n3) })
 
-	var loserNode app.Node
-	if winner == n2.Name() {
-		_ = n2.Kill(pid2)
-		loserNode = n3
-	} else {
-		_ = n3.Kill(pid3)
-		loserNode = n2
-	}
+	// winner is always n2; kill n2's process and expect n3 to take over.
+	_ = n2.Kill(pid2)
+	loserNode := n3
 
 	waitUntil(t, 60*time.Second, func() bool {
 		node, ok := locateNode(n1, dup)

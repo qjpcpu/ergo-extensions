@@ -98,8 +98,8 @@ func (w *watchActor) drain() error {
 				return err
 			}
 		default:
-			_, _ = w.SendAfter(w.PID(), messageWatchPoll{}, watchPollInterval)
-			return nil
+			_, err := w.SendAfter(w.PID(), messageWatchPoll{}, watchPollInterval)
+			return err
 		}
 	}
 }
