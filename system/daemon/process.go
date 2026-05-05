@@ -231,7 +231,8 @@ func (w *daemon) recoverDaemon(launcher core.Launcher) error {
 			break
 		}
 		if len(processList) == 0 && hasMore {
-			w.Log().Warning("launcher %s fetch empty process list but hasMore=true", launcher.Name)
+			w.Log().Error("launcher %s fetch empty process list but hasMore=true", launcher.Name)
+			break
 		}
 	}
 	return retErr
@@ -507,7 +508,9 @@ func (w *daemonLaunchWorker) HandleMessage(from gen.PID, message any) error {
 	}
 
 	if w.request.Owner != "" {
-		_ = w.SendImportant(gen.ProcessID{Name: ProcessName, Node: w.request.Owner}, result)
+		if err := w.SendImportant(gen.ProcessID{Name: ProcessName, Node: w.request.Owner}, result); err != nil {
+			w.Log().Warning("send launch result for %s to %s failed: %v", result.Name, w.request.Owner, err)
+		}
 	}
 	return gen.TerminateReasonNormal
 }

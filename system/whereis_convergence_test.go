@@ -25,7 +25,6 @@ func uniqueNodeName(base string) string {
 	return fmt.Sprintf("%s-%d@%s", parts[0], seq, parts[1])
 }
 
-
 type testProc struct{ act.Actor }
 
 func (p *testProc) Init(args ...any) error { return nil }
@@ -41,12 +40,11 @@ func startNode(t *testing.T, cluster *mem.Cluster, name string) app.Node {
 func startNodeExact(t *testing.T, cluster *mem.Cluster, name string) app.Node {
 	t.Helper()
 	n, err := app.StartSimpleNode(app.SimpleNodeOptions{
-		NodeName:              name,
-		Port:                  0,
-		Cookie:                "whereis-test-cookie",
-		Registrar:             mem.CreateWithCluster(cluster),
-		SyncProcessInterval:   50 * time.Millisecond,
-		DefaultRequestTimeout: 3,
+		NodeName:            name,
+		Port:                0,
+		Cookie:              "whereis-test-cookie",
+		Registrar:           mem.CreateWithCluster(cluster),
+		SyncProcessInterval: 50 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("start node %s: %v", name, err)

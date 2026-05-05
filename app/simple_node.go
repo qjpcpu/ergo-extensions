@@ -42,11 +42,6 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 	} else {
 		options.Network.Registrar = mem.Create()
 	}
-	if opts.DefaultRequestTimeout == 0 {
-		gen.DefaultRequestTimeout = 30
-	} else {
-		gen.DefaultRequestTimeout = opts.DefaultRequestTimeout
-	}
 	options.Network.Acceptors = []gen.AcceptorOptions{
 		{
 			Host:      "0.0.0.0",
@@ -121,7 +116,11 @@ func (n *nodeImpl) ForwardSend(to string, msg any, opts ...ForwardOpts) error {
 			}
 		} else {
 			p, locErr := w.book.QueryBy(w, system.QueryOption{}).Locate(gen.Atom(to))
-			if locErr != nil || p == "" || w.Node().Name() == p {
+			if locErr != nil {
+				ch <- nodeResult{err: locErr}
+			} else if p == "" {
+				ch <- nodeResult{err: gen.ErrProcessUnknown}
+			} else if w.Node().Name() == p {
 				ch <- nodeResult{err: w.Send(gen.Atom(to), msg)}
 			} else {
 				ch <- nodeResult{err: w.SendImportant(gen.ProcessID{Node: p, Name: gen.Atom(to)}, msg)}
@@ -146,7 +145,15 @@ func (n *nodeImpl) ForwardCall(to string, msg any, opts ...ForwardOpts) (any, er
 		} else {
 			p, callErr = w.book.QueryBy(w, system.QueryOption{Timeout: option.Timeout}).Locate(gen.Atom(to))
 		}
-		if callErr != nil || p == "" || w.Node().Name() == p {
+		if callErr != nil {
+			ch <- nodeResult{err: callErr}
+			return
+		}
+		if p == "" {
+			ch <- nodeResult{err: gen.ErrProcessUnknown}
+			return
+		}
+		if w.Node().Name() == p {
 			if option.Timeout > 0 {
 				res, callErr = w.CallWithTimeout(gen.Atom(to), msg, option.Timeout)
 			} else {

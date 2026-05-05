@@ -21,8 +21,11 @@ func (n *testNode) Name() gen.Atom {
 }
 
 type testCaller struct {
-	node     gen.Node
-	response gen.Atom
+	node       gen.Node
+	response   gen.Atom
+	lastTarget any
+	lastReq    any
+	lastTO     int
 }
 
 func (c *testCaller) Node() gen.Node {
@@ -30,6 +33,9 @@ func (c *testCaller) Node() gen.Node {
 }
 
 func (c *testCaller) CallWithTimeout(to any, request any, timeout int) (any, error) {
+	c.lastTarget = to
+	c.lastReq = request
+	c.lastTO = timeout
 	return c.response, nil
 }
 
@@ -515,6 +521,44 @@ func TestBookQueryDoesNotReturnStaleCachedResult(t *testing.T) {
 	}
 	if node != "node-b" {
 		t.Fatalf("expected fresh result node-b, got %s", node)
+	}
+}
+
+func TestBookQueryRespectsNonZeroTimeout(t *testing.T) {
+	book := NewAddressBook()
+	owner := gen.Atom("owner")
+	book.SetAvailableNodes(NewNodeList(owner))
+
+	caller := &testCaller{
+		node:     &testNode{name: gen.Atom("client")},
+		response: gen.Atom("node-a"),
+	}
+	query := newBookQuery(caller, book, QueryOption{Timeout: 1})
+
+	if _, err := query.Locate(gen.Atom("proc.timeout")); err != nil {
+		t.Fatalf("locate failed: %v", err)
+	}
+	if caller.lastTO != 1 {
+		t.Fatalf("expected timeout 1, got %d", caller.lastTO)
+	}
+}
+
+func TestBookQueryUsesDefaultTimeoutWhenZero(t *testing.T) {
+	book := NewAddressBook()
+	owner := gen.Atom("owner")
+	book.SetAvailableNodes(NewNodeList(owner))
+
+	caller := &testCaller{
+		node:     &testNode{name: gen.Atom("client")},
+		response: gen.Atom("node-a"),
+	}
+	query := newBookQuery(caller, book, QueryOption{})
+
+	if _, err := query.Locate(gen.Atom("proc.timeout.default")); err != nil {
+		t.Fatalf("locate failed: %v", err)
+	}
+	if caller.lastTO != 10 {
+		t.Fatalf("expected default timeout 10, got %d", caller.lastTO)
 	}
 }
 

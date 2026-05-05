@@ -627,10 +627,14 @@ func (query *bookQuery) locate(processName gen.Atom) (node gen.Atom, err error) 
 		}
 		return "", nil
 	}
+	timeout := query.option.Timeout
+	if timeout == 0 {
+		timeout = 10
+	}
 	res, err := query.caller.CallWithTimeout(
 		gen.ProcessID{Name: WhereIsProcess, Node: owner},
 		MessageLocate{Name: processName},
-		max(10, query.option.Timeout),
+		timeout,
 	)
 	if err != nil {
 		return "", err
