@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
 	"github.com/qjpcpu/ergo-extensions/registrar/mem"
 	"github.com/qjpcpu/ergo-extensions/system"
@@ -95,6 +96,73 @@ func TestForwardSendUnknownProcessDoesNotFallbackLocal(t *testing.T) {
 	}
 }
 
+func TestWaitPIDUsesRouteActor(t *testing.T) {
+	cluster := mem.NewCluster()
+	node, err := StartSimpleNode(SimpleNodeOptions{
+		NodeName:  "node-waitpid@localhost",
+		Port:      11005,
+		Cookie:    "test-cookie",
+		Registrar: mem.CreateWithCluster(cluster),
+	})
+	if err != nil {
+		t.Fatalf("failed to start node: %v", err)
+	}
+	defer node.Stop()
+	waitForAddressBook(t, node)
+
+	pid, err := node.Spawn(func() gen.ProcessBehavior { return &waitableActor{} }, gen.ProcessOptions{})
+	if err != nil {
+		t.Fatalf("failed to spawn actor: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- node.WaitPID(pid)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	if err := node.Send(pid, "stop"); err != nil {
+		t.Fatalf("failed to stop actor: %v", err)
+	}
+
+	if err := <-done; err != nil {
+		t.Fatalf("WaitPID failed: %v", err)
+	}
+}
+
+func TestForwardSpawnAndWaitUsesRouteActor(t *testing.T) {
+	cluster := mem.NewCluster()
+	node, err := StartSimpleNode(SimpleNodeOptions{
+		NodeName:  "node-spawnwait@localhost",
+		Port:      11006,
+		Cookie:    "test-cookie",
+		Registrar: mem.CreateWithCluster(cluster),
+	})
+	if err != nil {
+		t.Fatalf("failed to start node: %v", err)
+	}
+	defer node.Stop()
+	waitForAddressBook(t, node)
+
+	started := make(chan gen.PID, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- node.ForwardSpawnAndWait(func() gen.ProcessBehavior {
+			return &waitableActor{started: started}
+		})
+	}()
+
+	pid := <-started
+	time.Sleep(100 * time.Millisecond)
+	if err := node.Send(pid, "stop"); err != nil {
+		t.Fatalf("failed to stop spawned actor: %v", err)
+	}
+
+	if err := <-done; err != nil {
+		t.Fatalf("ForwardSpawnAndWait failed: %v", err)
+	}
+}
+
 func waitForAddressBook(t *testing.T, node Node) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
@@ -105,4 +173,23 @@ func waitForAddressBook(t *testing.T, node Node) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("address book did not initialize")
+}
+
+type waitableActor struct {
+	act.Actor
+	started chan gen.PID
+}
+
+func (a *waitableActor) Init(args ...any) error {
+	if a.started != nil {
+		a.started <- a.PID()
+	}
+	return nil
+}
+
+func (a *waitableActor) HandleMessage(from gen.PID, message any) error {
+	if msg, ok := message.(string); ok && msg == "stop" {
+		return gen.TerminateReasonNormal
+	}
+	return nil
 }

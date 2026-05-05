@@ -6,14 +6,16 @@ import (
 )
 
 type simpleApp struct {
-	book *system.AddressBook
-	opts SimpleNodeOptions
+	book  *system.AddressBook
+	hints *routeHintCache
+	opts  SimpleNodeOptions
 }
 
 func newApp(book *system.AddressBook, opts SimpleNodeOptions) *simpleApp {
 	return &simpleApp{
-		book: book,
-		opts: opts,
+		book:  book,
+		hints: newRouteHintCache(opts.SyncProcessInterval),
+		opts:  opts,
 	}
 }
 
@@ -25,10 +27,8 @@ func (app *simpleApp) Load(node gen.Node, args ...any) (gen.ApplicationSpec, err
 		SyncAddressBookInterval: app.opts.SyncProcessInterval,
 		AddressBook:             app.book,
 	}
-	members = append([]gen.ApplicationMemberSpec{
-		system.ApplicationMemberSpec(opts)},
-		app.opts.MemberSpecs...,
-	)
+	members = append(members, system.ApplicationMemberSpec(opts), app.routeMemberSpec())
+	members = append(members, app.opts.MemberSpecs...)
 	return gen.ApplicationSpec{
 		Name:        "simple_app",
 		Description: "Simple application",
@@ -40,3 +40,12 @@ func (app *simpleApp) Load(node gen.Node, args ...any) (gen.ApplicationSpec, err
 
 func (app *simpleApp) Start(mode gen.ApplicationMode) {}
 func (app *simpleApp) Terminate(reason error)         {}
+
+func (app *simpleApp) routeMemberSpec() gen.ApplicationMemberSpec {
+	return gen.ApplicationMemberSpec{
+		Name: routeProcessName,
+		Factory: CreatePool(func() gen.ProcessBehavior {
+			return newRouteActor(app.book, app.hints)
+		}, app.opts.NodeForwardWorker),
+	}
+}

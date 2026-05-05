@@ -38,6 +38,7 @@ type SimpleNodeOptions struct {
 	Cookie               string                      // Cluster cookie (must match across nodes).
 	MoreApps             []gen.ApplicationBehavior   // Extra applications to start on the node.
 	MemberSpecs          []gen.ApplicationMemberSpec // Additional application members to start.
+	NodeForwardWorker    int64                       // Worker count for forwarding calls/sends. Defaults to 128 to keep hot forwarding paths from stalling on slow lookups or remote calls.
 	LogLevel             gen.LogLevel                // Node log level.
 	DefaultLogOptions    gen.DefaultLoggerOptions    // Default logger configuration.
 	CronSource           CronSource                  // Managed cron source composed of a job provider and a state KV store.

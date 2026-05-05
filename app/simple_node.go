@@ -15,7 +15,8 @@ import (
 
 type nodeImpl struct {
 	gen.Node
-	book system.IAddressBook
+	route gen.Atom
+	book  system.IAddressBook
 }
 
 func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
@@ -68,7 +69,7 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &nodeImpl{Node: node, book: book}, nil
+	return &nodeImpl{Node: node, route: routeProcessName, book: book}, nil
 }
 
 func str(list ...string) string {
@@ -80,24 +81,12 @@ func str(list ...string) string {
 	return ""
 }
 
-func (n *nodeImpl) spawnTemp(fn func(*tempActor)) error {
-	_, err := n.Spawn(func() gen.ProcessBehavior {
-		return &tempActor{fn: fn, book: n.book}
-	}, gen.ProcessOptions{})
-	return err
-}
-
 func (n *nodeImpl) WaitPID(pid gen.PID) error {
 	ch := make(chan error, 1)
-	_, err := n.Spawn(func() gen.ProcessBehavior {
-		return &monitorActor{
-			ch:  ch,
-			pid: pid,
-			setup: func(w *monitorActor) error {
-				return w.MonitorPID(pid)
-			},
-		}
-	}, gen.ProcessOptions{})
+	err := n.Send(n.route, messageWaitProcess{
+		PID: pid,
+		Ch:  ch,
+	})
 	if err != nil {
 		return err
 	}
@@ -107,25 +96,11 @@ func (n *nodeImpl) WaitPID(pid gen.PID) error {
 func (n *nodeImpl) ForwardSend(to string, msg any, opts ...ForwardOpts) error {
 	ch := make(chan nodeResult, 1)
 	option := n.getOpts(opts...)
-	err := n.spawnTemp(func(w *tempActor) {
-		if option.Node != "" {
-			if option.Node == w.Node().Name() {
-				ch <- nodeResult{err: w.Send(gen.Atom(to), msg)}
-			} else {
-				ch <- nodeResult{err: w.SendImportant(gen.ProcessID{Node: option.Node, Name: gen.Atom(to)}, msg)}
-			}
-		} else {
-			p, locErr := w.book.QueryBy(w, system.QueryOption{}).Locate(gen.Atom(to))
-			if locErr != nil {
-				ch <- nodeResult{err: locErr}
-			} else if p == "" {
-				ch <- nodeResult{err: gen.ErrProcessUnknown}
-			} else if w.Node().Name() == p {
-				ch <- nodeResult{err: w.Send(gen.Atom(to), msg)}
-			} else {
-				ch <- nodeResult{err: w.SendImportant(gen.ProcessID{Node: p, Name: gen.Atom(to)}, msg)}
-			}
-		}
+	err := n.Send(n.route, messageNodeSend{
+		to:     to,
+		toNode: option.Node,
+		msg:    msg,
+		ch:     ch,
 	})
 	if err != nil {
 		return err
@@ -136,37 +111,12 @@ func (n *nodeImpl) ForwardSend(to string, msg any, opts ...ForwardOpts) error {
 func (n *nodeImpl) ForwardCall(to string, msg any, opts ...ForwardOpts) (any, error) {
 	ch := make(chan nodeResult, 1)
 	option := n.getOpts(opts...)
-	err := n.spawnTemp(func(w *tempActor) {
-		var res any
-		var callErr error
-		var p gen.Atom
-		if option.Node != "" {
-			p = option.Node
-		} else {
-			p, callErr = w.book.QueryBy(w, system.QueryOption{Timeout: option.Timeout}).Locate(gen.Atom(to))
-		}
-		if callErr != nil {
-			ch <- nodeResult{err: callErr}
-			return
-		}
-		if p == "" {
-			ch <- nodeResult{err: gen.ErrProcessUnknown}
-			return
-		}
-		if w.Node().Name() == p {
-			if option.Timeout > 0 {
-				res, callErr = w.CallWithTimeout(gen.Atom(to), msg, option.Timeout)
-			} else {
-				res, callErr = w.Call(gen.Atom(to), msg)
-			}
-		} else {
-			if option.Timeout > 0 {
-				res, callErr = w.CallWithTimeout(gen.ProcessID{Node: p, Name: gen.Atom(to)}, msg, option.Timeout)
-			} else {
-				res, callErr = w.CallImportant(gen.ProcessID{Node: p, Name: gen.Atom(to)}, msg)
-			}
-		}
-		ch <- nodeResult{response: res, err: callErr}
+	err := n.Send(n.route, messageNodeCall{
+		to:      to,
+		toNode:  option.Node,
+		msg:     msg,
+		timeout: option.Timeout,
+		ch:      ch,
 	})
 	if err != nil {
 		return nil, err
@@ -177,23 +127,12 @@ func (n *nodeImpl) ForwardCall(to string, msg any, opts ...ForwardOpts) (any, er
 
 func (n *nodeImpl) ForwardSpawnAndWait(fac gen.ProcessFactory, args ...any) error {
 	ch := make(chan error, 1)
-	_, err := n.Spawn(func() gen.ProcessBehavior {
-		return &monitorActor{
-			ch: ch,
-			setup: func(w *monitorActor) error {
-				pid, err := w.Spawn(fac, gen.ProcessOptions{LinkParent: true}, args...)
-				if err != nil {
-					return err
-				}
-				w.pid = pid
-				if err := w.MonitorPID(pid); err != nil {
-					w.Node().Kill(pid)
-					return err
-				}
-				return nil
-			},
-		}
-	}, gen.ProcessOptions{})
+	err := n.Send(n.route, messageSpawnProcess{
+		Factory: fac,
+		Options: gen.ProcessOptions{LinkParent: true},
+		Args:    args,
+		Ch:      ch,
+	})
 	if err != nil {
 		return err
 	}

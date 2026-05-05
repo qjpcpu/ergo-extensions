@@ -133,6 +133,13 @@ picked := book.PickNode(gen.Atom("worker.A")) // pick based on consistent hashin
 - Daemon orchestration: `system.RegisterLauncher`, `system.NewSpawner`, `system.SingletonDaemon`
 - Cron scheduling: `cron.JobSpec`, `cron.JobProvider`, `cron.KVStore`, `cron.NewManagedSource`
 
+## Forwarding Notes
+
+- `app.SimpleNodeOptions.NodeForwardWorker` controls the size of the shared route worker pool used by `ForwardSend`, `ForwardCall`, `WaitPID`, and `ForwardSpawnAndWait`.
+- The default is `128` so high-frequency forwarding does not serialize behind a small worker pool when directory lookups or remote delivery checks are slow.
+- `ForwardSend` keeps a short-lived route hint cache. A successful send can extend the hint a little, but cache misses or send failures fall back to `Locate` so stale routes do not live forever.
+- Lower the worker count only if you want to reduce background concurrency and the forwarding path is not a throughput bottleneck.
+
 ## Limitations
 
 - `MessageLocate` returns a node, not a PID; ask the address book or the node itself for details.
