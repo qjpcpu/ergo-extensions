@@ -33,6 +33,7 @@ type SimpleNodeOptions struct {
 	NodeName   string // Node name.
 	// Optional
 	Port                 uint16                      // Listen port, default to 11144
+	AcceptorNetFamily    string                      // Acceptor network family, default to tcp. Supported values: tcp, tcp4, tcp6.
 	AdvertiseHost        string                      // Publicly accessible hostname or IP address of the node.
 	AdvertisePort        uint16                      // Publicly accessible port of the node.
 	Cookie               string                      // Cluster cookie (must match across nodes).

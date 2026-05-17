@@ -21,6 +21,11 @@ type nodeImpl struct {
 
 func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 	book := system.NewAddressBook()
+	netFamily, err := acceptorNetFamily(opts.AcceptorNetFamily)
+	if err != nil {
+		return nil, err
+	}
+	acceptorHost := acceptorHost(netFamily)
 	if opts.NodeName == "" {
 		host, err := os.Hostname()
 		if err != nil {
@@ -45,11 +50,11 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 	}
 	options.Network.Acceptors = []gen.AcceptorOptions{
 		{
-			Host:      "0.0.0.0",
+			Host:      acceptorHost,
 			Port:      opts.Port,
 			RouteHost: opts.AdvertiseHost,
 			RoutePort: opts.AdvertisePort,
-			TCP:       "tcp",
+			TCP:       netFamily,
 		},
 	}
 	options.Network.Cookie = str(opts.Cookie, "simple-app-cookie")
@@ -70,6 +75,25 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 		return nil, err
 	}
 	return &nodeImpl{Node: node, route: routeProcessName, book: book}, nil
+}
+
+func acceptorNetFamily(value string) (string, error) {
+	if value == "" {
+		return "tcp", nil
+	}
+	switch value {
+	case "tcp", "tcp4", "tcp6":
+		return value, nil
+	default:
+		return "", fmt.Errorf("invalid AcceptorNetFamily %q: supported values are tcp, tcp4, tcp6", value)
+	}
+}
+
+func acceptorHost(netFamily string) string {
+	if netFamily == "tcp6" {
+		return "::"
+	}
+	return "0.0.0.0"
 }
 
 func str(list ...string) string {
