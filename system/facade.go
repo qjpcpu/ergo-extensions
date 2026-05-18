@@ -8,8 +8,9 @@ import (
 )
 
 const (
-	WhereIsProcess       = whereis.ProcessName
-	DaemonMonitorProcess = daemon.ProcessName
+	WhereIsProcess          = whereis.ProcessName
+	PlacementMonitorProcess = whereis.PlacementMonitorProcessName
+	DaemonMonitorProcess    = daemon.ProcessName
 )
 
 var ErrNoAvailableNodes = daemon.ErrNoAvailableNodes
@@ -32,6 +33,8 @@ type (
 	ProcessInfoList             = core.ProcessInfoList
 	MessageLocate               = core.MessageLocate
 	MessageLocateResult         = core.MessageLocateResult
+	MonitorPlacement            = core.MonitorPlacement
+	DuplicatePlacement          = core.DuplicatePlacement
 	MessageForwardLocate        = core.MessageForwardLocate
 	MessageProcessChanged       = core.MessageProcessChanged
 	MessageGetAddressBook       = core.MessageGetAddressBook

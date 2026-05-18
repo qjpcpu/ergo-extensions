@@ -32,20 +32,21 @@ type SimpleNodeOptions struct {
 	zk.Options        // ZooKeeper registrar options.
 	NodeName   string // Node name.
 	// Optional
-	Port                 uint16                      // Listen port, default to 11144
-	AcceptorNetFamily    string                      // Acceptor network family, default to tcp. Supported values: tcp, tcp4, tcp6.
-	AdvertiseHost        string                      // Publicly accessible hostname or IP address of the node.
-	AdvertisePort        uint16                      // Publicly accessible port of the node.
-	Cookie               string                      // Cluster cookie (must match across nodes).
-	MoreApps             []gen.ApplicationBehavior   // Extra applications to start on the node.
-	MemberSpecs          []gen.ApplicationMemberSpec // Additional application members to start.
-	NodeForwardWorker    int64                       // Worker count for forwarding calls/sends. Defaults to 128 to keep hot forwarding paths from stalling on slow lookups or remote calls.
-	LogLevel             gen.LogLevel                // Node log level.
-	DefaultLogOptions    gen.DefaultLoggerOptions    // Default logger configuration.
-	CronSource           CronSource                  // Managed cron source composed of a job provider and a state KV store.
-	CronSchedulerOptions CronSchedulerOptions        // Cron scheduler options.
-	SyncProcessInterval  time.Duration               // Whereis sync interval for pulling remote changes.
-	Registrar            gen.Registrar               // Custom registrar implementation (used if Endpoints is empty).
+	Port                     uint16                      // Listen port, default to 11144
+	AcceptorNetFamily        string                      // Acceptor network family, default to tcp. Supported values: tcp, tcp4, tcp6.
+	AdvertiseHost            string                      // Publicly accessible hostname or IP address of the node.
+	AdvertisePort            uint16                      // Publicly accessible port of the node.
+	Cookie                   string                      // Cluster cookie (must match across nodes).
+	MoreApps                 []gen.ApplicationBehavior   // Extra applications to start on the node.
+	MemberSpecs              []gen.ApplicationMemberSpec // Additional application members to start.
+	NodeForwardWorker        int64                       // Worker count for forwarding calls/sends. Defaults to 128 to keep hot forwarding paths from stalling on slow lookups or remote calls.
+	LogLevel                 gen.LogLevel                // Node log level.
+	DefaultLogOptions        gen.DefaultLoggerOptions    // Default logger configuration.
+	CronSource               CronSource                  // Managed cron source composed of a job provider and a state KV store.
+	CronSchedulerOptions     CronSchedulerOptions        // Cron scheduler options.
+	SyncProcessInterval      time.Duration               // Whereis sync interval for pulling remote changes.
+	PlacementMonitorInterval time.Duration               // Placement monitor interval for duplicate named process notifications.
+	Registrar                gen.Registrar               // Custom registrar implementation (used if Endpoints is empty).
 }
 
 type ForwardOpts func(*forwardopts)

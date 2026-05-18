@@ -13,10 +13,11 @@ import (
 const Supervisor = gen.Atom("extensions_sup")
 
 type ApplicationMemberSpecOptions struct {
-	AddressBook             *AddressBook
-	CronSource              cronpkg.Source
-	CronSchedulerOptions    cronpkg.SchedulerOptions
-	SyncAddressBookInterval time.Duration
+	AddressBook              *AddressBook
+	CronSource               cronpkg.Source
+	CronSchedulerOptions     cronpkg.SchedulerOptions
+	SyncAddressBookInterval  time.Duration
+	PlacementMonitorInterval time.Duration
 }
 
 func ApplicationMemberSpec(opts ApplicationMemberSpecOptions) gen.ApplicationMemberSpec {
@@ -29,9 +30,10 @@ func ApplicationMemberSpec(opts ApplicationMemberSpecOptions) gen.ApplicationMem
 func FactorySystemSup(opts ApplicationMemberSpecOptions) gen.ProcessFactory {
 	return func() gen.ProcessBehavior {
 		sup := &systemSup{
-			cronSource:          opts.CronSource,
-			cronOptions:         opts.CronSchedulerOptions,
-			syncProcessInterval: opts.SyncAddressBookInterval,
+			cronSource:               opts.CronSource,
+			cronOptions:              opts.CronSchedulerOptions,
+			syncProcessInterval:      opts.SyncAddressBookInterval,
+			placementMonitorInterval: opts.PlacementMonitorInterval,
 		}
 		if opts.AddressBook != nil {
 			sup.book = opts.AddressBook
@@ -44,10 +46,11 @@ func FactorySystemSup(opts ApplicationMemberSpecOptions) gen.ProcessFactory {
 
 type systemSup struct {
 	act.Supervisor
-	book                *AddressBook
-	cronSource          cronpkg.Source
-	cronOptions         cronpkg.SchedulerOptions
-	syncProcessInterval time.Duration
+	book                     *AddressBook
+	cronSource               cronpkg.Source
+	cronOptions              cronpkg.SchedulerOptions
+	syncProcessInterval      time.Duration
+	placementMonitorInterval time.Duration
 }
 
 func (sup *systemSup) Init(args ...any) (act.SupervisorSpec, error) {
@@ -67,6 +70,10 @@ func (sup *systemSup) Init(args ...any) (act.SupervisorSpec, error) {
 		{
 			Name:    DaemonMonitorProcess,
 			Factory: daemon.Factory(book),
+		},
+		{
+			Name:    PlacementMonitorProcess,
+			Factory: whereis.MonitorPlacementFactory(sup.placementMonitorInterval),
 		},
 		{
 			Name:    CronJobProcess,

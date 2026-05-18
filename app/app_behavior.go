@@ -22,10 +22,11 @@ func newApp(book *system.AddressBook, opts SimpleNodeOptions) *simpleApp {
 func (app *simpleApp) Load(node gen.Node, args ...any) (gen.ApplicationSpec, error) {
 	var members []gen.ApplicationMemberSpec
 	opts := system.ApplicationMemberSpecOptions{
-		CronSource:              app.opts.CronSource,
-		CronSchedulerOptions:    app.opts.CronSchedulerOptions,
-		SyncAddressBookInterval: app.opts.SyncProcessInterval,
-		AddressBook:             app.book,
+		CronSource:               app.opts.CronSource,
+		CronSchedulerOptions:     app.opts.CronSchedulerOptions,
+		SyncAddressBookInterval:  app.opts.SyncProcessInterval,
+		PlacementMonitorInterval: app.opts.PlacementMonitorInterval,
+		AddressBook:              app.book,
 	}
 	members = append(members, system.ApplicationMemberSpec(opts), app.routeMemberSpec())
 	members = append(members, app.opts.MemberSpecs...)

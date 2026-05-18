@@ -26,6 +26,13 @@ type (
 		Name gen.Atom
 		Node gen.Atom
 	}
+	MonitorPlacement struct {
+		Name gen.Atom
+	}
+	DuplicatePlacement struct {
+		Name gen.Atom
+		Node gen.Atom
+	}
 	MessageForwardLocate struct {
 		Name gen.Atom
 		From gen.PID

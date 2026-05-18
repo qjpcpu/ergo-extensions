@@ -129,9 +129,16 @@ picked := book.PickNode(gen.Atom("worker.A")) // pick based on consistent hashin
 
 - Supervisor: `system.ApplicationMemberSpec`, `system.FactorySystemSup`
 - WhereIs: `system.WhereIsProcess`, `MessageLocate`, `MessageGetAddressBook`
+- Placement monitor: `system.PlacementMonitorProcess`, `MonitorPlacement`, `DuplicatePlacement`
 - Address book: `IAddressBook`, `IAddressBookQuery`, `app.Node.LocateProcess`
 - Daemon orchestration: `system.RegisterLauncher`, `system.NewSpawner`, `system.SingletonDaemon`
 - Cron scheduling: `cron.JobSpec`, `cron.JobProvider`, `cron.KVStore`, `cron.NewManagedSource`
+
+## Placement Monitor
+
+`system.PlacementMonitorProcess` is a local-only helper for named processes. A named process may send `system.MonitorPlacement{Name: selfName}` after startup to monitor whether `WhereIsProcess` still selects the local node for that name.
+
+The monitor request must be sent by the named process itself, not by a sidecar actor on its behalf. If whereis later resolves the name to another node, the sender receives `system.DuplicatePlacement{Name, Node}`. This is only a notification; the monitor does not kill, migrate, or repair processes.
 
 ## Forwarding Notes
 

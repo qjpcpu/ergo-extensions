@@ -40,11 +40,12 @@ func startNode(t *testing.T, cluster *mem.Cluster, name string) app.Node {
 func startNodeExact(t *testing.T, cluster *mem.Cluster, name string) app.Node {
 	t.Helper()
 	n, err := app.StartSimpleNode(app.SimpleNodeOptions{
-		NodeName:            name,
-		Port:                0,
-		Cookie:              "whereis-test-cookie",
-		Registrar:           mem.CreateWithCluster(cluster),
-		SyncProcessInterval: 50 * time.Millisecond,
+		NodeName:                 name,
+		Port:                     0,
+		Cookie:                   "whereis-test-cookie",
+		Registrar:                mem.CreateWithCluster(cluster),
+		SyncProcessInterval:      50 * time.Millisecond,
+		PlacementMonitorInterval: 50 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("start node %s: %v", name, err)

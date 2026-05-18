@@ -14,13 +14,14 @@ The design intentionally keeps each concern in a separate actor while sharing a 
 
 ## Runtime Topology
 
-The `system.Supervisor` process starts three long-running child actors:
+The `system.Supervisor` process starts four long-running child actors:
 
 - `system.WhereIsProcess`
+- `system.PlacementMonitorProcess`
 - `system.DaemonMonitorProcess`
 - `system.CronJobProcess`
 
-All three actors run independently and use the registrar for cluster membership and leader information. `WhereIsProcess` and `DaemonMonitorProcess` also share an in-memory `AddressBook`, which is created once by the supervisor and can be injected from the application layer.
+All four actors run independently. `WhereIsProcess` and `DaemonMonitorProcess` use the registrar for cluster membership and leader information. `WhereIsProcess` and `DaemonMonitorProcess` also share an in-memory `AddressBook`, which is created once by the supervisor and can be injected from the application layer.
 
 At node startup, `app.StartSimpleNode` wires the supervisor into the Ergo application tree and exposes the same `AddressBook` instance to helper APIs such as distributed locate calls.
 
@@ -84,7 +85,7 @@ This keeps the daemon subsystem generic: it only orchestrates placement and retr
 `system.Supervisor` is a one-for-one Ergo supervisor. Its only job is process lifecycle management:
 
 - it creates or accepts a shared `AddressBook`,
-- it starts `WhereIsProcess`, `DaemonMonitorProcess`, and `CronJobProcess`,
+- it starts `WhereIsProcess`, `PlacementMonitorProcess`, `DaemonMonitorProcess`, and `CronJobProcess`,
 - it applies transient restart semantics so temporary failures do not take down the full node runtime.
 
 The supervisor deliberately contains no control logic. Cluster behavior belongs in child actors so each concern can be reasoned about and tested independently.
@@ -94,6 +95,8 @@ The supervisor deliberately contains no control logic. Cluster behavior belongs 
 ### Responsibility
 
 `system.WhereIsProcess` maintains an eventually consistent distributed directory of named Ergo processes. Each node inspects its local process table, publishes ownership updates to the appropriate directory nodes, and answers locate requests.
+
+`system.PlacementMonitorProcess` is a local companion actor for duplicate placement notifications. A local process sends `MonitorPlacement{Name}` to it; the monitor periodically locates that name via `WhereIsProcess` and sends `DuplicatePlacement{Name, Node}` back when the selected placement is on another node. It only notifies and does not kill, migrate, or repair processes.
 
 ### Local State
 
@@ -341,7 +344,7 @@ The trigger only reports whether dispatch succeeded from the scheduler's perspec
 ### Node and Supervisor
 
 - `app.SimpleNodeOptions` controls registrar wiring and runtime startup.
-- `ApplicationMemberSpecOptions` controls the injected address book, cron source, cron scheduler options, and the `WhereIs` inspection interval.
+- `ApplicationMemberSpecOptions` controls the injected address book, cron source, cron scheduler options, the `WhereIs` inspection interval, and the placement monitor interval.
 
 ### Cron
 
