@@ -27,10 +27,77 @@ type messageDaemonLaunchTimeout struct {
 }
 
 const (
-	daemonLaunchTimeout = 30 * time.Second
-	daemonRunningGrace  = 15 * time.Second
-	daemonRetryMaxDelay = 60 * time.Second
+	defaultDaemonLaunchTimeout = 3 * time.Second
+	defaultDaemonRunningGrace  = 2 * time.Second
+	defaultDaemonRetryMaxDelay = 60 * time.Second
 )
+
+type Options struct {
+	InitialRecoveryDelay  time.Duration
+	LeaderRecoveryDelay   time.Duration
+	NodeLeftRecoveryDelay time.Duration
+	FullRecoveryInterval  time.Duration
+	LaunchTimeout         time.Duration
+	RunningGrace          time.Duration
+	RetryInitialDelay     time.Duration
+	RetryMaxDelay         time.Duration
+	RecoveryJitterMax     time.Duration
+	RetryJitterMax        time.Duration
+}
+
+func DefaultOptions() Options {
+	return Options{
+		InitialRecoveryDelay:  500 * time.Millisecond,
+		LeaderRecoveryDelay:   500 * time.Millisecond,
+		NodeLeftRecoveryDelay: 500 * time.Millisecond,
+		FullRecoveryInterval:  15 * time.Minute,
+		LaunchTimeout:         defaultDaemonLaunchTimeout,
+		RunningGrace:          defaultDaemonRunningGrace,
+		RetryInitialDelay:     500 * time.Millisecond,
+		RetryMaxDelay:         defaultDaemonRetryMaxDelay,
+		RecoveryJitterMax:     250 * time.Millisecond,
+		RetryJitterMax:        500 * time.Millisecond,
+	}
+}
+
+func normalizeOptions(opts Options) Options {
+	defaults := DefaultOptions()
+	if opts.InitialRecoveryDelay <= 0 {
+		opts.InitialRecoveryDelay = defaults.InitialRecoveryDelay
+	}
+	if opts.LeaderRecoveryDelay <= 0 {
+		opts.LeaderRecoveryDelay = defaults.LeaderRecoveryDelay
+	}
+	if opts.NodeLeftRecoveryDelay <= 0 {
+		opts.NodeLeftRecoveryDelay = defaults.NodeLeftRecoveryDelay
+	}
+	if opts.FullRecoveryInterval <= 0 {
+		opts.FullRecoveryInterval = defaults.FullRecoveryInterval
+	}
+	if opts.LaunchTimeout <= 0 {
+		opts.LaunchTimeout = defaults.LaunchTimeout
+	}
+	if opts.RunningGrace <= 0 {
+		opts.RunningGrace = defaults.RunningGrace
+	}
+	if opts.RetryInitialDelay <= 0 {
+		opts.RetryInitialDelay = defaults.RetryInitialDelay
+	}
+	if opts.RetryMaxDelay <= 0 {
+		opts.RetryMaxDelay = defaults.RetryMaxDelay
+	}
+	if opts.RecoveryJitterMax < 0 {
+		opts.RecoveryJitterMax = 0
+	} else if opts.RecoveryJitterMax == 0 {
+		opts.RecoveryJitterMax = defaults.RecoveryJitterMax
+	}
+	if opts.RetryJitterMax < 0 {
+		opts.RetryJitterMax = 0
+	} else if opts.RetryJitterMax == 0 {
+		opts.RetryJitterMax = defaults.RetryJitterMax
+	}
+	return opts
+}
 
 var (
 	daemonLaunchStarted = gen.Atom("started")
@@ -64,14 +131,21 @@ type daemon struct {
 	recovered       map[gen.Atom]struct{}
 	launching       map[gen.Atom]daemonLaunchState
 	nextEpoch       int64
+	options         Options
 }
 
 func Factory(book core.IAddressBook) gen.ProcessFactory {
+	return FactoryWithOptions(book, Options{})
+}
+
+func FactoryWithOptions(book core.IAddressBook, opts Options) gen.ProcessFactory {
+	opts = normalizeOptions(opts)
 	return func() gen.ProcessBehavior {
 		return &daemon{
 			book:      book,
 			recovered: make(map[gen.Atom]struct{}),
 			launching: make(map[gen.Atom]daemonLaunchState),
+			options:   opts,
 		}
 	}
 }
@@ -87,14 +161,14 @@ func (w *daemon) HandleMessage(from gen.PID, message any) error {
 		if err := w.setupRegistrarMonitoring(); err != nil {
 			w.SendAfter(w.PID(), messageInit{}, time.Second*1)
 		} else {
-			w.launchAllAfter(time.Second * 10)
+			w.launchAllAfter(w.options.InitialRecoveryDelay)
 		}
 	case core.MessageLaunchAllDaemon:
 		if err := w.leaderShouldRecoverDaemon(); err != nil {
 			w.launchAllAfter(time.Second * 60)
 		} else {
 			w.recovered = make(map[gen.Atom]struct{})
-			w.launchAllAfter(time.Minute * 15)
+			w.launchAllAfter(w.options.FullRecoveryInterval)
 		}
 	case core.MessageEnsureDaemon:
 		return w.handleEnsureDaemon(e)
@@ -114,7 +188,7 @@ func (w *daemon) HandleEvent(event gen.MessageEvent) error {
 		if e.Name == w.Node().Name() {
 			w.isLeader = true
 			w.recovered = make(map[gen.Atom]struct{})
-			w.launchAllAfter(time.Second * 10)
+			w.launchAllAfter(w.options.LeaderRecoveryDelay)
 			return nil
 		}
 	case events.EventNodeSwitchedToFollower:
@@ -126,7 +200,7 @@ func (w *daemon) HandleEvent(event gen.MessageEvent) error {
 	case events.EventNodeLeft:
 		if w.isLeader {
 			w.recovered = make(map[gen.Atom]struct{})
-			w.launchAllAfter(time.Second * 10)
+			w.launchAllAfter(w.options.NodeLeftRecoveryDelay)
 		}
 	}
 	return nil
@@ -139,7 +213,9 @@ func (w *daemon) launchAllAfter(duration time.Duration) {
 	}
 	// Add jitter to avoid synchronized leader recovery in case of registrar issues
 	// or multiple nodes triggering at once.
-	duration += time.Duration(rand.Intn(1000)) * time.Millisecond
+	if w.options.RecoveryJitterMax > 0 {
+		duration += time.Duration(rand.Int63n(int64(w.options.RecoveryJitterMax)))
+	}
 	if duration <= 0 {
 		w.Send(w.PID(), core.MessageLaunchAllDaemon{})
 	} else {
@@ -184,7 +260,7 @@ func (w *daemon) leaderShouldRecoverDaemon() (err error) {
 	// Full recovery runs every ~15 minutes, so checking for 10x max timeout ensures
 	// we only catch genuinely stale entries that will never complete.
 	now := time.Now().UTC()
-	maxStaleAge := 10 * daemonLaunchTimeout
+	maxStaleAge := 10 * w.options.LaunchTimeout
 	staleCount := 0
 	for name, state := range w.launching {
 		if now.Sub(state.StartedAt) > maxStaleAge {
@@ -299,7 +375,7 @@ func (w *daemon) handleEnsureDaemon(msg core.MessageEnsureDaemon) error {
 		StartedAt:  time.Now().UTC(),
 	}
 	w.launching[msg.Process.ProcessName] = state
-	w.scheduleLaunchTimeout(msg.Process.ProcessName, epoch, daemonLaunchTimeout)
+	w.scheduleLaunchTimeout(msg.Process.ProcessName, epoch, w.options.LaunchTimeout)
 
 	launchMsg := core.MessageLaunchOneDaemon{
 		Launcher: msg.Launcher,
@@ -372,7 +448,7 @@ func (w *daemon) handleDaemonLaunchResult(msg core.MessageDaemonLaunchResult) er
 	case daemonLaunchStarted, daemonLaunchTaken:
 		state.Phase = daemonLaunchPhaseRunningGrace
 		w.launching[msg.Name] = state
-		w.scheduleLaunchTimeout(msg.Name, msg.Epoch, daemonRunningGrace)
+		w.scheduleLaunchTimeout(msg.Name, msg.Epoch, w.options.RunningGrace)
 		return nil
 	default:
 		delete(w.launching, msg.Name)
@@ -424,8 +500,17 @@ func (w *daemon) retryDelay(attempt int) time.Duration {
 	if attempt < 0 {
 		attempt = 0
 	}
-	delay := min(time.Second<<min(attempt, 5), daemonRetryMaxDelay)
-	return delay + time.Duration(rand.Intn(500))*time.Millisecond
+	delay := w.options.RetryInitialDelay
+	for i := 0; i < attempt && delay < w.options.RetryMaxDelay; i++ {
+		delay *= 2
+	}
+	if delay > w.options.RetryMaxDelay {
+		delay = w.options.RetryMaxDelay
+	}
+	if w.options.RetryJitterMax > 0 {
+		delay += time.Duration(rand.Int63n(int64(w.options.RetryJitterMax)))
+	}
+	return delay
 }
 
 func (w *daemon) sendLaunchResult(owner gen.Atom, result core.MessageDaemonLaunchResult) {
@@ -497,7 +582,7 @@ func (w *daemonLaunchWorker) HandleMessage(from gen.PID, message any) error {
 		State: daemonLaunchStarted,
 	}
 
-	_, err := w.SpawnRegister(w.request.Process.ProcessName, w.launcher.Factory, w.launcher.Option, w.request.Process.Args...)
+	pid, err := w.SpawnRegister(w.request.Process.ProcessName, w.launcher.Factory, w.launcher.Option, w.request.Process.Args...)
 	if err != nil {
 		if err == gen.ErrTaken {
 			result.State = daemonLaunchTaken
@@ -505,6 +590,11 @@ func (w *daemonLaunchWorker) HandleMessage(from gen.PID, message any) error {
 			result.State = daemonLaunchFailed
 			result.Err = err.Error()
 		}
+	} else {
+		w.Send(core.WhereIsProcess, core.MessageRegisterLocalProcess{
+			Name: w.request.Process.ProcessName,
+			PID:  pid,
+		})
 	}
 
 	if w.request.Owner != "" {

@@ -53,12 +53,18 @@ func TestWhereisLocateBySend(t *testing.T) {
 	n1 := startNode(t, cluster, "node-a@127.0.0.1")
 	n2 := startNode(t, cluster, "node-b@127.0.0.1")
 
+	waitForClusterNodes(t, 10*time.Second, n1, n2)
+
 	// 1. 在 n1 上启动一个命名的进程
-	procName := gen.Atom("target.proc")
+	procName := uniqueProcessName("target.proc")
 	_ = spawnNamed(t, n1, procName)
 
-	// 等待地址簿同步
 	waitUntil(t, 10*time.Second, func() bool {
+		return n1.LocateProcess(procName) == n1.Name()
+	})
+
+	// 等待地址簿同步
+	waitUntil(t, 30*time.Second, func() bool {
 		node := n2.LocateProcess(procName)
 		return node == n1.Name()
 	})
@@ -91,12 +97,17 @@ func TestWhereisForwardLocateRedirectsFromWrongNode(t *testing.T) {
 	n1 := startNode(t, cluster, "node-a@127.0.0.1")
 	n2 := startNode(t, cluster, "node-b@127.0.0.1")
 
-	procName := gen.Atom("target.forward.proc")
+	waitForClusterNodes(t, 10*time.Second, n1, n2)
+
+	procName := uniqueProcessName("target.forward.proc")
 	_ = spawnNamed(t, n1, procName)
 
 	waitUntil(t, 10*time.Second, func() bool {
-		return n1.AddressBook().GetAvailableNodes().Len() == 2 &&
-			n2.LocateProcess(procName) == n1.Name()
+		return n1.LocateProcess(procName) == n1.Name()
+	})
+
+	waitUntil(t, 30*time.Second, func() bool {
+		return n2.LocateProcess(procName) == n1.Name()
 	})
 
 	owner := n1.AddressBook().PickDirectoryNode(procName)

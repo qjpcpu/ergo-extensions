@@ -16,7 +16,8 @@ type ApplicationMemberSpecOptions struct {
 	AddressBook              *AddressBook
 	CronSource               cronpkg.Source
 	CronSchedulerOptions     cronpkg.SchedulerOptions
-	SyncAddressBookInterval  time.Duration
+	WhereIsOptions           whereis.Options
+	DaemonOptions            daemon.Options
 	PlacementMonitorInterval time.Duration
 }
 
@@ -32,7 +33,8 @@ func FactorySystemSup(opts ApplicationMemberSpecOptions) gen.ProcessFactory {
 		sup := &systemSup{
 			cronSource:               opts.CronSource,
 			cronOptions:              opts.CronSchedulerOptions,
-			syncProcessInterval:      opts.SyncAddressBookInterval,
+			whereisOptions:           opts.WhereIsOptions,
+			daemonOptions:            opts.DaemonOptions,
 			placementMonitorInterval: opts.PlacementMonitorInterval,
 		}
 		if opts.AddressBook != nil {
@@ -49,7 +51,8 @@ type systemSup struct {
 	book                     *AddressBook
 	cronSource               cronpkg.Source
 	cronOptions              cronpkg.SchedulerOptions
-	syncProcessInterval      time.Duration
+	whereisOptions           whereis.Options
+	daemonOptions            daemon.Options
 	placementMonitorInterval time.Duration
 }
 
@@ -65,11 +68,11 @@ func (sup *systemSup) Init(args ...any) (act.SupervisorSpec, error) {
 	spec.Children = []act.SupervisorChildSpec{
 		{
 			Name:    WhereIsProcess,
-			Factory: whereis.Factory(book, sup.syncProcessInterval),
+			Factory: whereis.FactoryWithOptions(book, sup.whereisOptions),
 		},
 		{
 			Name:    DaemonMonitorProcess,
-			Factory: daemon.Factory(book),
+			Factory: daemon.FactoryWithOptions(book, sup.daemonOptions),
 		},
 		{
 			Name:    PlacementMonitorProcess,

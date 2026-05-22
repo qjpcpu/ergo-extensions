@@ -94,7 +94,7 @@ The supervisor deliberately contains no control logic. Cluster behavior belongs 
 
 ### Responsibility
 
-`system.WhereIsProcess` maintains an eventually consistent distributed directory of named Ergo processes. Each node inspects its local process table, publishes ownership updates to the appropriate directory nodes, and answers locate requests.
+`system.WhereIsProcess` maintains an eventually consistent distributed directory of named Ergo processes. Each node publishes explicit local registration updates when helpers are used, periodically inspects its local process table as a fallback, publishes ownership updates to the appropriate directory nodes, and answers locate requests.
 
 `system.PlacementMonitorProcess` is a local companion actor for duplicate placement notifications. A local process sends `MonitorPlacement{Name}` to it; the monitor periodically locates that name via `WhereIsProcess` and sends `DuplicatePlacement{Name, Node}` back when the selected placement is on another node. It only notifies and does not kill, migrate, or repair processes.
 
@@ -111,7 +111,7 @@ The actor tracks:
 
 ### Process Inspection
 
-The main loop is periodic:
+The fallback loop is periodic:
 
 1. fetch the current local Ergo process list,
 2. compare it with the last observed PID set,
@@ -120,6 +120,8 @@ The main loop is periodic:
 5. publish either incremental shard updates or a periodic full anti-entropy sync.
 
 Incremental sync is used when only a few process entries changed. Full sync is forced periodically and after topology churn so stale directory state is eventually overwritten even if individual update messages were lost.
+
+The default `WhereIsOptions.SyncInterval` is 2 seconds. Explicit local registration messages are the fast path for new named processes; the periodic loop is the anti-entropy fallback for processes spawned outside the helpers or for missed messages.
 
 ### Directory Sharding
 
@@ -179,6 +181,8 @@ Only the registrar-elected leader performs recovery scans. The daemon actor list
 - `EventNodeLeft`.
 
 When the local node becomes leader, or when a node leaves, the actor schedules a delayed recovery pass. The delay includes jitter so duplicate triggers do not cause synchronized recovery bursts.
+
+The default daemon recovery profile is tuned for fast convergence: initial, leader, and node-left recovery are scheduled after 500ms plus bounded jitter; launch confirmation timeout defaults to 3 seconds and running grace defaults to 2 seconds. These values can be changed with `DaemonOptions`.
 
 ### Recovery Model
 
@@ -423,9 +427,10 @@ The full daemon recovery path after a leader election is:
 11. the worker attempts `SpawnRegister`,
 12. the worker replies `started`, `already_taken`, or `failed`,
 13. the owner moves into grace, retries, or clears state accordingly,
-14. `WhereIsProcess` eventually observes the named process and the owner clears the launch state.
+14. the launch worker publishes a local whereis registration update, with periodic inspection as fallback,
+15. `WhereIsProcess` observes the named process and the owner clears the launch state.
 
-The key serialization rule is that only the directory owner is allowed to drive steps 6 through 14 for a given daemon name.
+The key serialization rule is that only the directory owner is allowed to drive steps 6 through 15 for a given daemon name.
 
 ### Daemon Retry Flow
 

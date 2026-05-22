@@ -13,6 +13,42 @@ import (
 
 const ProcessName = gen.Atom("extensions_whereis")
 
+type Options struct {
+	SyncInterval        time.Duration
+	TopologyDebounceMin time.Duration
+	TopologyDebounceMax time.Duration
+	QueryTimeout        int
+}
+
+func DefaultOptions() Options {
+	return Options{
+		SyncInterval:        2 * time.Second,
+		TopologyDebounceMin: 100 * time.Millisecond,
+		TopologyDebounceMax: 2 * time.Second,
+		QueryTimeout:        3,
+	}
+}
+
+func normalizeOptions(opts Options) Options {
+	defaults := DefaultOptions()
+	if opts.SyncInterval <= 0 {
+		opts.SyncInterval = defaults.SyncInterval
+	}
+	if opts.TopologyDebounceMin <= 0 {
+		opts.TopologyDebounceMin = defaults.TopologyDebounceMin
+	}
+	if opts.TopologyDebounceMax <= 0 {
+		opts.TopologyDebounceMax = defaults.TopologyDebounceMax
+	}
+	if opts.TopologyDebounceMax < opts.TopologyDebounceMin {
+		opts.TopologyDebounceMax = opts.TopologyDebounceMin
+	}
+	if opts.QueryTimeout <= 0 {
+		opts.QueryTimeout = defaults.QueryTimeout
+	}
+	return opts
+}
+
 type messageInit struct{}
 type messageInspectProcess struct{}
 type messageTopologyChange struct {
@@ -33,6 +69,7 @@ type whereis struct {
 	// only includes named processes
 	processCache       *core.AtomicValue[core.ProcessInfoList]
 	inspectInterval    time.Duration
+	options            Options
 	antiEntropyCounter int
 	topologyChangeID   int64
 	sendFailureLogAt   map[gen.Atom]time.Time
@@ -43,9 +80,15 @@ type whereis struct {
 }
 
 func Factory(book *core.AddressBook, inspectInterval time.Duration) gen.ProcessFactory {
-	if inspectInterval == 0 {
-		inspectInterval = time.Second * 3
+	opts := DefaultOptions()
+	if inspectInterval > 0 {
+		opts.SyncInterval = inspectInterval
 	}
+	return FactoryWithOptions(book, opts)
+}
+
+func FactoryWithOptions(book *core.AddressBook, opts Options) gen.ProcessFactory {
+	opts = normalizeOptions(opts)
 	return func() gen.ProcessBehavior {
 		return &whereis{
 			book:             book,
@@ -55,7 +98,8 @@ func Factory(book *core.AddressBook, inspectInterval time.Duration) gen.ProcessF
 			processCache:     core.NewAtomicValue[core.ProcessInfoList](),
 			selfVersion:      core.NewVersion(),
 			nodeVersions:     make(map[gen.Atom]core.ProcessVersion),
-			inspectInterval:  inspectInterval,
+			inspectInterval:  opts.SyncInterval,
+			options:          opts,
 			sendFailureLogAt: make(map[gen.Atom]time.Time),
 			nowFn:            func() time.Time { return time.Now().UTC() },
 		}
@@ -74,6 +118,10 @@ func (w *whereis) now() time.Time {
 		return w.nowFn()
 	}
 	return time.Now().UTC()
+}
+
+func pidIsZero(pid gen.PID) bool {
+	return pid == gen.PID{}
 }
 
 func (w *whereis) sendProcessChangedMessage(pid gen.ProcessID, msg core.MessageProcessChanged) error {
@@ -154,6 +202,8 @@ func (w *whereis) HandleMessage(from gen.PID, message any) error {
 		}
 	case core.MessageProcessChanged:
 		return w.handleProcessChanged(e)
+	case core.MessageRegisterLocalProcess:
+		return w.registerLocalProcess(e)
 	case core.MessageLocate:
 		if e.Name == "" {
 			return nil
@@ -236,8 +286,18 @@ func (w *whereis) HandleEvent(event gen.MessageEvent) error {
 		// Stagger the sync based on cluster size to prevent sync storms.
 		// Base delay 100ms, max delay proportional to node count (10ms per node).
 		// Cap the max random delay at 2 seconds (reduced from 20s for test stability).
-		maxRand := min(max(n*10, 500), 2000)
-		delay := time.Duration(100+rand.Intn(maxRand)) * time.Millisecond
+		window := w.options.TopologyDebounceMax - w.options.TopologyDebounceMin
+		if window < 0 {
+			window = 0
+		}
+		sizeCap := time.Duration(min(max(n*10, 500), 2000)) * time.Millisecond
+		if sizeCap < window {
+			window = sizeCap
+		}
+		delay := w.options.TopologyDebounceMin
+		if window > 0 {
+			delay += time.Duration(rand.Int63n(int64(window)))
+		}
 		w.scheduleTopologyDebounce(delay)
 	}
 	return nil
@@ -320,6 +380,75 @@ func (w *whereis) inspectProcessList() error {
 		})
 	}
 	return nil
+}
+
+func (w *whereis) registerLocalProcess(msg core.MessageRegisterLocalProcess) error {
+	if msg.Name == "" {
+		return nil
+	}
+	pid := msg.PID
+	birthAt := msg.BirthAt
+	if !pidIsZero(pid) {
+		if info, err := w.Node().ProcessInfo(pid); err == nil {
+			if info.Name != "" {
+				msg.Name = info.Name
+			}
+			if birthAt == 0 {
+				birthAt = time.Now().Unix() - info.Uptime
+			}
+		}
+	}
+	if birthAt == 0 {
+		birthAt = time.Now().Unix()
+	}
+
+	var down core.ProcessInfoList
+	if oldPID, ok := w.nameToPID[msg.Name]; ok && oldPID != pid {
+		down = append(down, core.ProcessInfo{
+			Name:    msg.Name,
+			PID:     oldPID,
+			Node:    w.selfNodeName(),
+			BirthAt: w.nameToBirthAt[msg.Name],
+		})
+		delete(w.pidToName, oldPID)
+	}
+
+	if !pidIsZero(pid) {
+		w.pidToName[pid] = msg.Name
+		w.nameToPID[msg.Name] = pid
+	}
+	w.nameToBirthAt[msg.Name] = birthAt
+
+	up := core.ProcessInfoList{{
+		Name:    msg.Name,
+		PID:     pid,
+		Node:    w.selfNodeName(),
+		BirthAt: birthAt,
+	}}
+	w.rebuildProcessCache()
+	w.book.RemoveProcess(w.selfNodeName(), down...)
+	w.book.AddProcess(w.selfNodeName(), up...)
+	w.selfVersion = w.selfVersion.Incr()
+	w.registerToShards(core.MessageProcessChanged{
+		Node:        w.selfNodeName(),
+		UpProcess:   up,
+		DownProcess: down,
+		Version:     w.selfVersion,
+	})
+	return nil
+}
+
+func (w *whereis) rebuildProcessCache() {
+	all := make(core.ProcessInfoList, 0, len(w.nameToPID))
+	for name, pid := range w.nameToPID {
+		all = append(all, core.ProcessInfo{
+			Name:    name,
+			PID:     pid,
+			Node:    w.selfNodeName(),
+			BirthAt: w.nameToBirthAt[name],
+		})
+	}
+	w.processCache.Store(all)
 }
 
 // collectProcessList gets all processes from the current node,

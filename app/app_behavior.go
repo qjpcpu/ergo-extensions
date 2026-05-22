@@ -14,7 +14,7 @@ type simpleApp struct {
 func newApp(book *system.AddressBook, opts SimpleNodeOptions) *simpleApp {
 	return &simpleApp{
 		book:  book,
-		hints: newRouteHintCache(opts.SyncProcessInterval),
+		hints: newRouteHintCache(opts.WhereIsOptions.SyncInterval),
 		opts:  opts,
 	}
 }
@@ -24,7 +24,8 @@ func (app *simpleApp) Load(node gen.Node, args ...any) (gen.ApplicationSpec, err
 	opts := system.ApplicationMemberSpecOptions{
 		CronSource:               app.opts.CronSource,
 		CronSchedulerOptions:     app.opts.CronSchedulerOptions,
-		SyncAddressBookInterval:  app.opts.SyncProcessInterval,
+		WhereIsOptions:           app.opts.WhereIsOptions,
+		DaemonOptions:            app.opts.DaemonOptions,
 		PlacementMonitorInterval: app.opts.PlacementMonitorInterval,
 		AddressBook:              app.book,
 	}

@@ -15,8 +15,9 @@ import (
 
 type nodeImpl struct {
 	gen.Node
-	route gen.Atom
-	book  system.IAddressBook
+	route        gen.Atom
+	book         system.IAddressBook
+	queryTimeout int
 }
 
 func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
@@ -74,7 +75,11 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &nodeImpl{Node: node, route: routeProcessName, book: book}, nil
+	queryTimeout := opts.WhereIsOptions.QueryTimeout
+	if queryTimeout <= 0 {
+		queryTimeout = system.DefaultWhereIsOptions().QueryTimeout
+	}
+	return &nodeImpl{Node: node, route: routeProcessName, book: book, queryTimeout: queryTimeout}, nil
 }
 
 func acceptorNetFamily(value string) (string, error) {
@@ -172,7 +177,7 @@ func (n *nodeImpl) LocateProcess(process gen.Atom) gen.Atom {
 		string(system.WhereIsProcess),
 		system.MessageLocate{Name: process},
 		ForwardNode(owner),
-		ForwardTimeout(10),
+		ForwardTimeout(n.queryTimeout),
 	)
 	if err != nil {
 		return ""

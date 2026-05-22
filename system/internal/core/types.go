@@ -57,6 +57,11 @@ type (
 		Version     ProcessVersion
 		FullSync    bool
 	}
+	MessageRegisterLocalProcess struct {
+		Name    gen.Atom
+		PID     gen.PID
+		BirthAt int64
+	}
 	ProcessInfoList       []ProcessInfo
 	MessageGetAddressBook struct{}
 	MessageAddressBook    struct {
@@ -90,6 +95,7 @@ func init() {
 		ProcessInfo{},
 		ProcessInfoList{},
 		MessageProcessChanged{},
+		MessageRegisterLocalProcess{},
 		MessageLocate{},
 		MessageLocateResult{},
 		MessageForwardLocate{},

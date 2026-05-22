@@ -26,6 +26,8 @@ type (
 	Spawner                     = core.Spawner
 	DaemonProcess               = core.DaemonProcess
 	Launcher                    = core.Launcher
+	WhereIsOptions              = whereis.Options
+	DaemonOptions               = daemon.Options
 	DaemonIteratorFactory       = core.DaemonIteratorFactory
 	DaemonIterator              = core.DaemonIterator
 	ProcessVersion              = core.ProcessVersion
@@ -37,6 +39,7 @@ type (
 	DuplicatePlacement          = core.DuplicatePlacement
 	MessageForwardLocate        = core.MessageForwardLocate
 	MessageProcessChanged       = core.MessageProcessChanged
+	MessageRegisterLocalProcess = core.MessageRegisterLocalProcess
 	MessageGetAddressBook       = core.MessageGetAddressBook
 	MessageAddressBook          = core.MessageAddressBook
 	MessageLaunchAllDaemon      = core.MessageLaunchAllDaemon
@@ -59,6 +62,14 @@ func NewNodeList(list ...gen.Atom) *NodeList {
 
 func NewAddressBook() *AddressBook {
 	return core.NewAddressBook()
+}
+
+func DefaultWhereIsOptions() WhereIsOptions {
+	return whereis.DefaultOptions()
+}
+
+func DefaultDaemonOptions() DaemonOptions {
+	return daemon.DefaultOptions()
 }
 
 func RegisterLauncher(name gen.Atom, launcher Launcher) error {

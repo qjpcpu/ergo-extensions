@@ -44,7 +44,8 @@ type SimpleNodeOptions struct {
 	DefaultLogOptions        gen.DefaultLoggerOptions    // Default logger configuration.
 	CronSource               CronSource                  // Managed cron source composed of a job provider and a state KV store.
 	CronSchedulerOptions     CronSchedulerOptions        // Cron scheduler options.
-	SyncProcessInterval      time.Duration               // Whereis sync interval for pulling remote changes.
+	WhereIsOptions           system.WhereIsOptions       // Whereis discovery, query, and topology sync options.
+	DaemonOptions            system.DaemonOptions        // Daemon recovery and retry timing options.
 	PlacementMonitorInterval time.Duration               // Placement monitor interval for duplicate named process notifications.
 	Registrar                gen.Registrar               // Custom registrar implementation (used if Endpoints is empty).
 }

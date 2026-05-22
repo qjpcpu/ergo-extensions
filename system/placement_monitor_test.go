@@ -32,7 +32,9 @@ func TestPlacementMonitorReportsDuplicatePlacement(t *testing.T) {
 	n1 := startNode(t, cluster, "node-a@127.0.0.1")
 	n2 := startNode(t, cluster, "node-b@127.0.0.1")
 
-	name := gen.Atom("proc.placement.dup")
+	waitForClusterNodes(t, 10*time.Second, n1, n2)
+
+	name := uniqueProcessName("proc.placement.dup")
 	_ = spawnNamed(t, n1, name)
 	time.Sleep(1200 * time.Millisecond)
 	_ = spawnNamed(t, n2, name)

@@ -51,11 +51,19 @@ func TestLauncherRegistration(t *testing.T) {
 type mockProcess struct {
 	gen.Process
 	spawnedName gen.Atom
+	sentTo      any
+	sentMessage any
 }
 
 func (m *mockProcess) SpawnRegister(name gen.Atom, factory gen.ProcessFactory, options gen.ProcessOptions, args ...any) (gen.PID, error) {
 	m.spawnedName = name
 	return gen.PID{ID: 1}, nil
+}
+
+func (m *mockProcess) Send(to any, message any) error {
+	m.sentTo = to
+	m.sentMessage = message
+	return nil
 }
 
 func TestSpawner(t *testing.T) {
@@ -77,6 +85,13 @@ func TestSpawner(t *testing.T) {
 	}
 	if parent.spawnedName != procName {
 		t.Errorf("expected spawned name %s, got %s", procName, parent.spawnedName)
+	}
+	msg, ok := parent.sentMessage.(MessageRegisterLocalProcess)
+	if !ok {
+		t.Fatalf("expected MessageRegisterLocalProcess, got %T", parent.sentMessage)
+	}
+	if parent.sentTo != WhereIsProcess || msg.Name != procName || msg.PID.ID != 1 {
+		t.Fatalf("unexpected whereis register notification: to=%v msg=%+v", parent.sentTo, msg)
 	}
 
 	// Test non-existent launcher

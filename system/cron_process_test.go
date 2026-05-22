@@ -46,7 +46,9 @@ func TestCronShardsAssignedToSingleNode(t *testing.T) {
 				RebalanceDelay: 200 * time.Millisecond,
 				InitDelay:      50 * time.Millisecond,
 			},
-			SyncProcessInterval: 100 * time.Millisecond,
+			WhereIsOptions: system.WhereIsOptions{
+				SyncInterval: 100 * time.Millisecond,
+			},
 		})
 		if err != nil {
 			t.Fatalf("start node %s: %v", name, err)

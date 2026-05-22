@@ -132,6 +132,12 @@ func (w *routeActor) HandleMessage(from gen.PID, message any) error {
 			sendResp(err)
 			return nil
 		}
+		if e.Name != "" {
+			w.Send(system.WhereIsProcess, system.MessageRegisterLocalProcess{
+				Name: e.Name,
+				PID:  pid,
+			})
+		}
 		if e.Ch != nil {
 			err = w.MonitorPID(pid)
 			if err != nil {

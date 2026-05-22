@@ -1,9 +1,9 @@
 package system_test
 
 import (
+	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -12,9 +12,11 @@ import (
 	"ergo.services/ergo/gen"
 	"github.com/qjpcpu/ergo-extensions/app"
 	"github.com/qjpcpu/ergo-extensions/registrar/mem"
+	"github.com/qjpcpu/ergo-extensions/system"
 )
 
 var nodeSeq int64
+var procSeq int64
 
 func uniqueNodeName(base string) string {
 	seq := atomic.AddInt64(&nodeSeq, 1)
@@ -23,6 +25,11 @@ func uniqueNodeName(base string) string {
 		return fmt.Sprintf("%s-%d", base, seq)
 	}
 	return fmt.Sprintf("%s-%d@%s", parts[0], seq, parts[1])
+}
+
+func uniqueProcessName(base string) gen.Atom {
+	seq := atomic.AddInt64(&procSeq, 1)
+	return gen.Atom(fmt.Sprintf("%s.%d", base, seq))
 }
 
 type testProc struct{ act.Actor }
@@ -44,7 +51,7 @@ func startNodeExact(t *testing.T, cluster *mem.Cluster, name string) app.Node {
 		Port:                     0,
 		Cookie:                   "whereis-test-cookie",
 		Registrar:                mem.CreateWithCluster(cluster),
-		SyncProcessInterval:      50 * time.Millisecond,
+		WhereIsOptions:           system.WhereIsOptions{SyncInterval: 50 * time.Millisecond},
 		PlacementMonitorInterval: 50 * time.Millisecond,
 	})
 	if err != nil {
@@ -71,13 +78,47 @@ func waitUntil(t *testing.T, timeout time.Duration, fn func() bool) {
 	t.Fatalf("timeout after %s", timeout)
 }
 
+func waitForClusterNodes(t *testing.T, timeout time.Duration, nodes ...app.Node) {
+	t.Helper()
+	waitUntil(t, timeout, func() bool {
+		for _, n := range nodes {
+			available := n.AddressBook().GetAvailableNodes()
+			if available.Len() != len(nodes) {
+				return false
+			}
+			for _, expected := range nodes {
+				if !available.Exist(expected.Name()) {
+					return false
+				}
+			}
+		}
+		return true
+	})
+}
+
 func spawnNamed(t *testing.T, n app.Node, name gen.Atom) gen.PID {
+	t.Helper()
+	return spawnNamedWithBirthAt(t, n, name, 0)
+}
+
+func spawnNamedWithBirthAt(t *testing.T, n app.Node, name gen.Atom, birthAt int64) gen.PID {
 	t.Helper()
 	pid, err := n.SpawnRegister(name, func() gen.ProcessBehavior { return &testProc{} }, gen.ProcessOptions{})
 	if err != nil {
 		t.Fatalf("spawn %s on %s: %v", name, n.Name(), err)
 	}
+	if err := n.Send(system.WhereIsProcess, system.MessageRegisterLocalProcess{Name: name, PID: pid, BirthAt: birthAt}); err != nil {
+		t.Fatalf("register %s on %s: %v", name, n.Name(), err)
+	}
 	return pid
+}
+
+func killAndWaitPID(t *testing.T, n app.Node, pid gen.PID) {
+	t.Helper()
+	_ = n.Kill(pid)
+	if err := n.WaitPID(pid); err != nil && !errors.Is(err, gen.ErrProcessUnknown) {
+		t.Fatalf("wait for killed pid %s on %s: %v", pid, n.Name(), err)
+	}
 }
 
 func locateNode(n app.Node, name gen.Atom) (gen.Atom, bool) {
@@ -99,16 +140,9 @@ func TestWhereisConvergesOnJoin(t *testing.T) {
 	n2 := startNode(t, cluster, "node-b@127.0.0.1")
 	defer n2.Stop()
 
-	// Wait for nodes to discover each other before spawning processes
-	waitUntil(t, 10*time.Second, func() bool {
-		nodes1 := n1.AddressBook().GetAvailableNodes()
-		nodes2 := n2.AddressBook().GetAvailableNodes()
-		return nodes1.Len() == 2 && nodes2.Len() == 2 &&
-			nodes1.Exist(n1.Name()) && nodes1.Exist(n2.Name()) &&
-			nodes2.Exist(n1.Name()) && nodes2.Exist(n2.Name())
-	})
+	waitForClusterNodes(t, 10*time.Second, n1, n2)
 
-	nameA := gen.Atom("proc.A")
+	nameA := uniqueProcessName("proc.A")
 	_ = spawnNamed(t, n1, nameA)
 
 	waitUntil(t, 60*time.Second, func() bool {
@@ -116,7 +150,7 @@ func TestWhereisConvergesOnJoin(t *testing.T) {
 		return ok && node == n1.Name()
 	})
 
-	nameB := gen.Atom("proc.B")
+	nameB := uniqueProcessName("proc.B")
 	_ = spawnNamed(t, n2, nameB)
 
 	waitUntil(t, 60*time.Second, func() bool {
@@ -132,7 +166,9 @@ func TestWhereisRemovesProcessesOnNodeLeave(t *testing.T) {
 	n2 := startNode(t, cluster, "node-b@127.0.0.1")
 	defer n2.Stop()
 
-	name := gen.Atom("proc.leave")
+	waitForClusterNodes(t, 10*time.Second, n1, n2)
+
+	name := uniqueProcessName("proc.leave")
 	_ = spawnNamed(t, n2, name)
 
 	waitUntil(t, 30*time.Second, func() bool {
@@ -164,18 +200,13 @@ func TestWhereisDuplicateNameDeterministicWinnerAndFailover(t *testing.T) {
 	n3 := startNode(t, cluster, "node-c@127.0.0.1")
 	defer n3.Stop()
 
-	dup := gen.Atom("proc.dup")
-	waitUntil(t, 10*time.Second, func() bool {
-		return n1.AddressBook().GetAvailableNodes().Len() == 3 &&
-			n2.AddressBook().GetAvailableNodes().Len() == 3 &&
-			n3.AddressBook().GetAvailableNodes().Len() == 3
-	})
-	pid2 := spawnNamed(t, n2, dup)
-	time.Sleep(1200 * time.Millisecond)
-	_ = spawnNamed(t, n3, dup)
+	dup := uniqueProcessName("proc.dup")
+	waitForClusterNodes(t, 10*time.Second, n1, n2, n3)
+	pid2 := spawnNamedWithBirthAt(t, n2, dup, 1)
+	_ = spawnNamedWithBirthAt(t, n3, dup, 2)
 
-	// n2's process is definitively older (spawned 1.2s before n3's),
-	// so locate() will always select n2 as the winner via BirthAt.
+	// n2's process is definitively older, so locate() will always select n2
+	// as the winner via BirthAt.
 	winner := n2.Name()
 
 	waitWinner := func(n app.Node) bool {
@@ -188,7 +219,7 @@ func TestWhereisDuplicateNameDeterministicWinnerAndFailover(t *testing.T) {
 	waitUntil(t, 60*time.Second, func() bool { return waitWinner(n3) })
 
 	// winner is always n2; kill n2's process and expect n3 to take over.
-	_ = n2.Kill(pid2)
+	killAndWaitPID(t, n2, pid2)
 	loserNode := n3
 
 	waitUntil(t, 60*time.Second, func() bool {
@@ -198,41 +229,23 @@ func TestWhereisDuplicateNameDeterministicWinnerAndFailover(t *testing.T) {
 }
 
 func TestWhereisDuplicateNameOldestWins(t *testing.T) {
-	cluster := mem.NewCluster()
-	n1 := startNode(t, cluster, "node-a@127.0.0.1")
-	defer n1.Stop()
-	n2 := startNode(t, cluster, "node-b@127.0.0.1")
-	defer n2.Stop()
-	n3 := startNode(t, cluster, "node-c@127.0.0.1")
-	defer n3.Stop()
+	book := system.NewAddressBook()
+	n2 := gen.Atom("node-b@127.0.0.1")
+	n3 := gen.Atom("node-c@127.0.0.1")
+	dup := uniqueProcessName("proc.dup.oldest")
 
-	// Wait for nodes to discover each other
-	waitUntil(t, 10*time.Second, func() bool {
-		return n1.AddressBook().GetAvailableNodes().Len() == 3 &&
-			n2.AddressBook().GetAvailableNodes().Len() == 3 &&
-			n3.AddressBook().GetAvailableNodes().Len() == 3
-	})
+	book.SetAvailableNodes(system.NewNodeList(n2, n3))
+	if err := book.AddProcess(n3, system.ProcessInfo{Name: dup, PID: gen.PID{Node: n3, ID: 3}, Node: n3, BirthAt: 2}); err != nil {
+		t.Fatalf("add newer process: %v", err)
+	}
+	if err := book.AddProcess(n2, system.ProcessInfo{Name: dup, PID: gen.PID{Node: n2, ID: 2}, Node: n2, BirthAt: 1}); err != nil {
+		t.Fatalf("add older process: %v", err)
+	}
 
-	dup := gen.Atom("proc.dup.oldest")
-	pid2 := spawnNamed(t, n2, dup)
-	time.Sleep(1200 * time.Millisecond)
-	pid3 := spawnNamed(t, n3, dup)
-
-	// Add a small delay to allow directory owner to stabilize
-	time.Sleep(200 * time.Millisecond)
-
-	waitUntil(t, 30*time.Second, func() bool { // Reduced timeout - if it takes longer, there's likely an issue
-		node, ok := locateNode(n1, dup)
-		return ok && node == n2.Name()
-	})
-
-	_ = n2.Kill(pid2)
-	waitUntil(t, 30*time.Second, func() bool { // Reduced timeout
-		node, ok := locateNode(n1, dup)
-		return ok && node == n3.Name()
-	})
-
-	_ = n3.Kill(pid3)
+	node, ok := book.LocateLocal(dup)
+	if !ok || node != n2 {
+		t.Fatalf("expected oldest node %s, got %s (ok=%v)", n2, node, ok)
+	}
 }
 
 func TestWhereisDuplicateNameTieBreakStable(t *testing.T) {
@@ -244,71 +257,35 @@ func TestWhereisDuplicateNameTieBreakStable(t *testing.T) {
 	n3 := startNode(t, cluster, "node-c@127.0.0.1")
 	defer n3.Stop()
 
-	dup := gen.Atom("proc.dup.tie")
+	waitForClusterNodes(t, 10*time.Second, n1, n2, n3)
+
+	dup := uniqueProcessName("proc.dup.tie")
 	winner := nodeMin(n2.Name(), n3.Name())
 
-	try := func() bool {
-		now := time.Now()
-		next := time.Unix(now.Unix()+1, 0).Add(20 * time.Millisecond)
-		time.Sleep(time.Until(next))
+	pid2 := spawnNamedWithBirthAt(t, n2, dup, 1)
+	pid3 := spawnNamedWithBirthAt(t, n3, dup, 1)
+	defer func() {
+		killAndWaitPID(t, n2, pid2)
+		killAndWaitPID(t, n3, pid3)
+	}()
 
-		var (
-			pid2 gen.PID
-			pid3 gen.PID
-			err2 error
-			err3 error
-		)
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			pid2, err2 = n2.SpawnRegister(dup, func() gen.ProcessBehavior { return &testProc{} }, gen.ProcessOptions{})
-		}()
-		go func() {
-			defer wg.Done()
-			pid3, err3 = n3.SpawnRegister(dup, func() gen.ProcessBehavior { return &testProc{} }, gen.ProcessOptions{})
-		}()
-		wg.Wait()
-		if err2 != nil || err3 != nil {
-			return false
+	waitUntil(t, 60*time.Second, func() bool {
+		// In sharded model, processList might not work as before because it syncs ONLY to owner.
+		// But here we can still check if it's found globally.
+		node, ok := locateNode(n1, dup)
+		return ok && (node == n2.Name() || node == n3.Name())
+	})
+
+	waitUntil(t, 60*time.Second, func() bool {
+		node, ok := locateNode(n1, dup)
+		return ok && node == winner
+	})
+
+	for i := 0; i < 10; i++ {
+		node, ok := locateNode(n1, dup)
+		if !ok || node != winner {
+			t.Fatalf("expected stable winner %s, got %s (ok=%v)", winner, node, ok)
 		}
-		defer func() {
-			_ = n2.Kill(pid2)
-			_ = n3.Kill(pid3)
-		}()
-
-		waitUntil(t, 60*time.Second, func() bool {
-			// In sharded model, processList might not work as before because it syncs ONLY to owner.
-			// But here we can still check if it's found globally.
-			node, ok := locateNode(n1, dup)
-			return ok && (node == n2.Name() || node == n3.Name())
-		})
-
-		waitUntil(t, 60*time.Second, func() bool {
-			node, ok := locateNode(n1, dup)
-			return ok && node == winner
-		})
-
-		for i := 0; i < 10; i++ {
-			node, ok := locateNode(n1, dup)
-			if !ok || node != winner {
-				return false
-			}
-		}
-
-		return true
-	}
-
-	ok := false
-	for i := 0; i < 5; i++ {
-		if try() {
-			ok = true
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	if !ok {
-		t.Fatalf("failed to reproduce tie BirthAt across nodes")
 	}
 }
 
@@ -319,25 +296,18 @@ func TestWhereisConvergesAfterManyLocalChanges(t *testing.T) {
 	n2 := startNode(t, cluster, "node-b@127.0.0.1")
 	defer n2.Stop()
 
-	waitUntil(t, 5*time.Second, func() bool {
-		n1Nodes := n1.AddressBook().GetAvailableNodes()
-		n2Nodes := n2.AddressBook().GetAvailableNodes()
-		return n1Nodes.Exist(n1.Name()) &&
-			n1Nodes.Exist(n2.Name()) &&
-			n2Nodes.Exist(n1.Name()) &&
-			n2Nodes.Exist(n2.Name())
-	})
+	waitForClusterNodes(t, 10*time.Second, n1, n2)
 
 	var pids []gen.PID
 	var names []gen.Atom
 	for i := 0; i < 25; i++ {
-		name := gen.Atom(fmt.Sprintf("proc.bulk.%02d", i))
+		name := uniqueProcessName(fmt.Sprintf("proc.bulk.%02d", i))
 		names = append(names, name)
 		pids = append(pids, spawnNamed(t, n1, name))
 	}
 
 	for i := 0; i < len(pids); i += 2 {
-		_ = n1.Kill(pids[i])
+		killAndWaitPID(t, n1, pids[i])
 	}
 
 	expected := make(map[gen.Atom]struct{})
@@ -375,13 +345,7 @@ func TestWhereisClearsStaleOwnerStateAfterTopologyRebalance(t *testing.T) {
 	n5 := startNodeExact(t, cluster, "node-e@127.0.0.1")
 	defer n5.Stop()
 
-	waitUntil(t, 10*time.Second, func() bool {
-		return n1.AddressBook().GetAvailableNodes().Len() == 5 &&
-			n2.AddressBook().GetAvailableNodes().Len() == 5 &&
-			n3.AddressBook().GetAvailableNodes().Len() == 5 &&
-			n4.AddressBook().GetAvailableNodes().Len() == 5 &&
-			n5.AddressBook().GetAvailableNodes().Len() == 5
-	})
+	waitForClusterNodes(t, 10*time.Second, n1, n2, n3, n4, n5)
 
 	n6Name := "node-f@127.0.0.1"
 	n6 := startNodeExact(t, cluster, n6Name)
@@ -393,8 +357,9 @@ func TestWhereisClearsStaleOwnerStateAfterTopologyRebalance(t *testing.T) {
 	})
 
 	ownerOnSix := make(map[gen.Atom]gen.Atom)
+	rebalancePrefix := fmt.Sprintf("proc.rebalance.%d", atomic.AddInt64(&procSeq, 1))
 	for i := 0; i < 5000; i++ {
-		name := gen.Atom(fmt.Sprintf("proc.rebalance.%04d", i))
+		name := gen.Atom(fmt.Sprintf("%s.%04d", rebalancePrefix, i))
 		ownerOnSix[name] = n1.AddressBook().PickDirectoryNode(name)
 	}
 
@@ -408,7 +373,7 @@ func TestWhereisClearsStaleOwnerStateAfterTopologyRebalance(t *testing.T) {
 
 	var target gen.Atom
 	for i := 0; i < 5000; i++ {
-		name := gen.Atom(fmt.Sprintf("proc.rebalance.%04d", i))
+		name := gen.Atom(fmt.Sprintf("%s.%04d", rebalancePrefix, i))
 		if ownerOnFive := n1.AddressBook().PickDirectoryNode(name); ownerOnFive != "" && ownerOnFive != ownerOnSix[name] {
 			target = name
 			break
@@ -437,7 +402,7 @@ func TestWhereisClearsStaleOwnerStateAfterTopologyRebalance(t *testing.T) {
 		return ok && node == n1.Name()
 	})
 
-	_ = n1.Kill(pid)
+	killAndWaitPID(t, n1, pid)
 	waitUntil(t, 30*time.Second, func() bool {
 		_, ok := locateNode(n4, target)
 		return !ok

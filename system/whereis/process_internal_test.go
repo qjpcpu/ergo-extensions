@@ -193,3 +193,50 @@ func TestWhereisFetchAvailableBookNodesReturnsRegistrarError(t *testing.T) {
 		t.Fatalf("expected empty available nodes cache, got %d", got)
 	}
 }
+
+func TestRegisterLocalProcessFastPathSendsOnlyOwnerShard(t *testing.T) {
+	book := core.NewAddressBook()
+	self := gen.Atom("node-a@127.0.0.1")
+	remote := gen.Atom("node-b@127.0.0.1")
+	if err := book.SetAvailableNodes(core.NewNodeList(self, remote)); err != nil {
+		t.Fatalf("set available nodes: %v", err)
+	}
+	name := findRemoteDirectoryProcess(t, book, self)
+
+	var sendCalls int
+	var sentTo gen.ProcessID
+	var sentMsg core.MessageProcessChanged
+	w := &whereis{
+		book:             book,
+		selfNode:         self,
+		nameToPID:        make(map[gen.Atom]gen.PID),
+		nameToBirthAt:    make(map[gen.Atom]int64),
+		pidToName:        make(map[gen.PID]gen.Atom),
+		processCache:     core.NewAtomicValue[core.ProcessInfoList](),
+		selfVersion:      core.NewVersion(),
+		sendFailureLogAt: make(map[gen.Atom]time.Time),
+		nowFn:            func() time.Time { return time.Date(2026, 3, 27, 20, 0, 0, 0, time.UTC) },
+		sendProcessChanged: func(pid gen.ProcessID, msg core.MessageProcessChanged) error {
+			sendCalls++
+			sentTo = pid
+			sentMsg = msg
+			return nil
+		},
+	}
+
+	if err := w.registerLocalProcess(core.MessageRegisterLocalProcess{Name: name, BirthAt: 123}); err != nil {
+		t.Fatalf("register local process: %v", err)
+	}
+	if sendCalls != 1 {
+		t.Fatalf("expected one shard message, got %d", sendCalls)
+	}
+	if sentTo.Node != remote || sentTo.Name != ProcessName {
+		t.Fatalf("unexpected shard target: %+v", sentTo)
+	}
+	if len(sentMsg.UpProcess) != 1 || sentMsg.UpProcess[0].Name != name || sentMsg.Node != self {
+		t.Fatalf("unexpected shard message: %+v", sentMsg)
+	}
+	if node, ok := book.LocateLocal(name); !ok || node != self {
+		t.Fatalf("expected local book to locate %s on %s, got %s ok=%v", name, self, node, ok)
+	}
+}

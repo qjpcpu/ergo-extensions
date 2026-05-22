@@ -60,7 +60,9 @@ n, err := app.StartSimpleNode(app.SimpleNodeOptions{
     CronSchedulerOptions: cron.SchedulerOptions{
         ShardCount: 128,
     },
-    SyncProcessInterval: time.Second * 3,
+    WhereIsOptions: system.WhereIsOptions{
+        SyncInterval: time.Second * 2,
+    },
 })
 _ = n
 _ = err

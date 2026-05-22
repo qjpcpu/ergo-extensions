@@ -557,8 +557,8 @@ func TestBookQueryUsesDefaultTimeoutWhenZero(t *testing.T) {
 	if _, err := query.Locate(gen.Atom("proc.timeout.default")); err != nil {
 		t.Fatalf("locate failed: %v", err)
 	}
-	if caller.lastTO != 10 {
-		t.Fatalf("expected default timeout 10, got %d", caller.lastTO)
+	if caller.lastTO != DefaultQueryTimeoutSeconds {
+		t.Fatalf("expected default timeout %d, got %d", DefaultQueryTimeoutSeconds, caller.lastTO)
 	}
 }
 

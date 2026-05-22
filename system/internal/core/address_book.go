@@ -18,6 +18,7 @@ import (
 var ErrNoAvailableNodes = errors.New("no available nodes")
 
 const WhereIsProcess = gen.Atom("extensions_whereis")
+const DefaultQueryTimeoutSeconds = 3
 
 // QueryOption defines the options for process lookup.
 type QueryOption struct {
@@ -629,7 +630,7 @@ func (query *bookQuery) locate(processName gen.Atom) (node gen.Atom, err error) 
 	}
 	timeout := query.option.Timeout
 	if timeout == 0 {
-		timeout = 10
+		timeout = DefaultQueryTimeoutSeconds
 	}
 	res, err := query.caller.CallWithTimeout(
 		gen.ProcessID{Name: WhereIsProcess, Node: owner},

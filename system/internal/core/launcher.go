@@ -53,7 +53,14 @@ func (p Spawner) SpawnRegister(processName gen.Atom, args ...any) (pid gen.PID, 
 		err = fmt.Errorf("no such launcher %s", p.launcher)
 		return
 	}
-	return p.parent.SpawnRegister(processName, launcher.Factory, launcher.Option, args...)
+	pid, err = p.parent.SpawnRegister(processName, launcher.Factory, launcher.Option, args...)
+	if err == nil {
+		_ = p.parent.Send(WhereIsProcess, MessageRegisterLocalProcess{
+			Name: processName,
+			PID:  pid,
+		})
+	}
+	return
 }
 
 type DaemonProcess struct {
