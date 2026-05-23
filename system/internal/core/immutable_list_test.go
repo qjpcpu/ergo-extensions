@@ -31,3 +31,22 @@ func TestImmutableList_NilVsEmpty(t *testing.T) {
 		t.Fatalf("empty.GetAll() should be non-nil empty slice")
 	}
 }
+
+func TestImmutableListExistAndRange(t *testing.T) {
+	list := NewImmutableList([]int{1, 2, 3})
+	if !list.Exist(2) {
+		t.Fatal("expected element to exist")
+	}
+	if list.Exist(4) {
+		t.Fatal("unexpected element")
+	}
+
+	var visited []int
+	list.Range(func(v int) bool {
+		visited = append(visited, v)
+		return v != 2
+	})
+	if len(visited) != 2 || visited[0] != 1 || visited[1] != 2 {
+		t.Fatalf("unexpected range visit: %+v", visited)
+	}
+}

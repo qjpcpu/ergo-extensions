@@ -407,6 +407,34 @@ func TestAddressBook_Helpers(t *testing.T) {
 	}
 }
 
+func TestAddressBookDirectoryBatchAndNodeHelpers(t *testing.T) {
+	book := NewAddressBook()
+	nodes := NewNodeList("node-b@127.0.0.1", "node-a@127.0.0.1")
+	if err := book.SetAvailableNodes(nodes); err != nil {
+		t.Fatalf("set nodes: %v", err)
+	}
+	if version := book.NodesVersion(); version == 0 {
+		t.Fatal("expected nodes version to increment")
+	}
+	if got := book.PickDirectoryNodeBatch(nil); got != nil {
+		t.Fatalf("empty batch should return nil, got %#v", got)
+	}
+	batch := book.PickDirectoryNodeBatch([]gen.Atom{"proc-a", "", "proc-b"})
+	if len(batch) != 2 || batch["proc-a"] == "" || batch["proc-b"] == "" {
+		t.Fatalf("unexpected directory batch: %#v", batch)
+	}
+	directoryNodes := book.DirectoryNodes()
+	if len(directoryNodes) != 2 || directoryNodes[0] != "node-a@127.0.0.1" || directoryNodes[1] != "node-b@127.0.0.1" {
+		t.Fatalf("unexpected directory nodes: %+v", directoryNodes)
+	}
+	if got := SortNodes([]gen.Atom{"b", "a"}); len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Fatalf("unexpected sort: %+v", got)
+	}
+	if got := UniqNodes([]gen.Atom{"a", "a", "b"}); len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Fatalf("unexpected uniq: %+v", got)
+	}
+}
+
 func TestAddressBook_Internal_Locate(t *testing.T) {
 	// Test the loop in locate where node is not found or process not in node
 	book := NewAddressBook()

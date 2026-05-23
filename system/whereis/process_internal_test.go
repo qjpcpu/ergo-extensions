@@ -9,6 +9,7 @@ import (
 	"ergo.services/ergo/gen"
 	"ergo.services/ergo/testing/unit"
 	core "github.com/qjpcpu/ergo-extensions/system/internal/core"
+	"github.com/qjpcpu/registrar/events"
 )
 
 type failingRegistrar struct {
@@ -75,6 +76,23 @@ func findRemoteDirectoryProcess(t *testing.T, book *core.AddressBook, self gen.A
 		}
 	}
 	t.Fatal("failed to find a process name owned by a remote directory node")
+	return ""
+}
+
+func findLocalDirectoryProcess(t *testing.T, book *core.AddressBook, self gen.Atom) gen.Atom {
+	t.Helper()
+	return findLocalDirectoryProcessWithPrefix(t, book, self, "proc.local")
+}
+
+func findLocalDirectoryProcessWithPrefix(t *testing.T, book *core.AddressBook, self gen.Atom, prefix string) gen.Atom {
+	t.Helper()
+	for i := 0; i < 1024; i++ {
+		name := gen.Atom(fmt.Sprintf("%s.%d", prefix, i))
+		if book.PickDirectoryNode(name) == self {
+			return name
+		}
+	}
+	t.Fatal("failed to find a process name owned by the local directory node")
 	return ""
 }
 
@@ -342,4 +360,300 @@ func TestUnregisterLocalProcessIgnoresEmptyAndUnknownName(t *testing.T) {
 	actor.SendMessage(gen.PID{}, core.MessageUnregisterLocalProcess{})
 	actor.SendMessage(gen.PID{}, core.MessageUnregisterLocalProcess{Name: gen.Atom("missing")})
 	actor.ShouldNotSend().Assert()
+}
+
+func TestWhereisLocateMessageHandlesLocalMissingAndRemoteOwners(t *testing.T) {
+	book := core.NewAddressBook()
+	self := gen.Atom("node-a@127.0.0.1")
+	remote := gen.Atom("node-b@127.0.0.1")
+	if err := book.SetAvailableNodes(core.NewNodeList(self, remote)); err != nil {
+		t.Fatalf("set available nodes: %v", err)
+	}
+
+	localName := findLocalDirectoryProcess(t, book, self)
+	if err := book.AddProcess(self, core.ProcessInfo{Name: localName, Node: self}); err != nil {
+		t.Fatalf("add local process: %v", err)
+	}
+	remoteName := findRemoteDirectoryProcess(t, book, self)
+	missingLocalName := findLocalDirectoryProcessWithPrefix(t, book, self, "proc.local.missing")
+	from := gen.PID{Node: gen.Atom("client@127.0.0.1"), ID: 77}
+
+	actor := spawnWhereisUnit(t, book, self)
+	actor.SendMessage(from, core.MessageLocate{})
+	actor.ShouldNotSend().Assert()
+
+	actor.SendMessage(from, core.MessageLocate{Name: localName})
+	actor.ShouldSend().
+		To(from).
+		Message(core.MessageLocateResult{Name: localName, Node: self}).
+		Once().
+		Assert()
+
+	actor.ClearEvents()
+	actor.SendMessage(from, core.MessageLocate{Name: missingLocalName})
+	actor.ShouldSend().
+		To(from).
+		Message(core.MessageLocateResult{Name: missingLocalName}).
+		Once().
+		Assert()
+
+	actor.ClearEvents()
+	actor.SendMessage(from, core.MessageLocate{Name: remoteName})
+	actor.ShouldSend().
+		To(gen.ProcessID{Node: remote, Name: ProcessName}).
+		Message(core.MessageForwardLocate{Name: remoteName, From: from}).
+		Once().
+		Assert()
+}
+
+func TestWhereisForwardLocateRepliesOrRedirects(t *testing.T) {
+	book := core.NewAddressBook()
+	self := gen.Atom("node-a@127.0.0.1")
+	remote := gen.Atom("node-b@127.0.0.1")
+	if err := book.SetAvailableNodes(core.NewNodeList(self, remote)); err != nil {
+		t.Fatalf("set available nodes: %v", err)
+	}
+	localName := findLocalDirectoryProcess(t, book, self)
+	if err := book.AddProcess(self, core.ProcessInfo{Name: localName, Node: self}); err != nil {
+		t.Fatalf("add local process: %v", err)
+	}
+	remoteName := findRemoteDirectoryProcess(t, book, self)
+	from := gen.PID{Node: gen.Atom("client@127.0.0.1"), ID: 78}
+
+	actor := spawnWhereisUnit(t, book, self)
+	actor.SendMessage(gen.PID{}, core.MessageForwardLocate{Name: localName, From: from})
+	actor.ShouldSend().
+		To(from).
+		Message(core.MessageLocateResult{Name: localName, Node: self}).
+		Once().
+		Assert()
+
+	actor.ClearEvents()
+	ref := gen.Ref{ID: [3]uint64{1, 2, 3}}
+	actor.SendMessage(gen.PID{}, core.MessageForwardLocate{Name: localName, From: from, Ref: ref})
+	responseFound := false
+	for _, event := range actor.Events() {
+		sendResponse, ok := event.(unit.SendResponseEvent)
+		if ok && sendResponse.To == from && sendResponse.Ref == ref && sendResponse.Response == self {
+			responseFound = true
+		}
+	}
+	if !responseFound {
+		t.Fatalf("expected forwarded locate call response to %v", from)
+	}
+
+	actor.ClearEvents()
+	actor.SendMessage(gen.PID{}, core.MessageForwardLocate{Name: remoteName, From: from})
+	actor.ShouldSend().
+		To(gen.ProcessID{Node: remote, Name: ProcessName}).
+		MessageMatching(func(message any) bool {
+			msg, ok := message.(core.MessageForwardLocate)
+			return ok && msg.Name == remoteName && msg.From == from && msg.Hops == 1
+		}).
+		Once().
+		Assert()
+}
+
+func TestWhereisHandleCallLocateAndAddressBook(t *testing.T) {
+	book := core.NewAddressBook()
+	self := gen.Atom("node-a@127.0.0.1")
+	remote := gen.Atom("node-b@127.0.0.1")
+	if err := book.SetAvailableNodes(core.NewNodeList(self, remote)); err != nil {
+		t.Fatalf("set available nodes: %v", err)
+	}
+	localName := findLocalDirectoryProcess(t, book, self)
+	if err := book.AddProcess(self, core.ProcessInfo{Name: localName, Node: self}); err != nil {
+		t.Fatalf("add local process: %v", err)
+	}
+	remoteName := findRemoteDirectoryProcess(t, book, self)
+	from := gen.PID{Node: gen.Atom("client@127.0.0.1"), ID: 79}
+
+	actor := spawnWhereisUnit(t, book, self)
+	result := actor.Call(from, core.MessageLocate{})
+	if result.Error != nil || result.Response != gen.Atom("") {
+		t.Fatalf("expected empty locate result, got response=%v err=%v", result.Response, result.Error)
+	}
+	result = actor.Call(from, core.MessageLocate{Name: localName})
+	if result.Error != nil || result.Response != self {
+		t.Fatalf("expected local locate response %s, got response=%v err=%v", self, result.Response, result.Error)
+	}
+	result = actor.Call(from, core.MessageGetAddressBook{})
+	if result.Error != nil {
+		t.Fatalf("get address book failed: %v", result.Error)
+	}
+	addressBook, ok := result.Response.(core.MessageAddressBook)
+	if !ok || addressBook.Book != book || addressBook.Owner == (gen.PID{}) {
+		t.Fatalf("unexpected address book response: %#v", result.Response)
+	}
+
+	actor.ClearEvents()
+	result = actor.Call(from, core.MessageLocate{Name: remoteName})
+	if result.Error != nil || result.Response != nil {
+		t.Fatalf("expected forwarded call to return nil response, got response=%v err=%v", result.Response, result.Error)
+	}
+	actor.ShouldSend().
+		To(gen.ProcessID{Node: remote, Name: ProcessName}).
+		MessageMatching(func(message any) bool {
+			msg, ok := message.(core.MessageForwardLocate)
+			return ok && msg.Name == remoteName && msg.From == from && msg.Ref != (gen.Ref{})
+		}).
+		Once().
+		Assert()
+}
+
+func TestWhereisEventInspectAndTopologyDebounce(t *testing.T) {
+	book := core.NewAddressBook()
+	self := gen.Atom("node-a@127.0.0.1")
+	if err := book.SetAvailableNodes(core.NewNodeList(self)); err != nil {
+		t.Fatalf("set available nodes: %v", err)
+	}
+	actor := spawnWhereisUnit(t, book, self)
+	w := actor.Behavior().(*whereis)
+	w.options.TopologyDebounceMin = time.Millisecond
+	w.options.TopologyDebounceMax = time.Millisecond
+
+	stats := w.HandleInspect(gen.PID{})
+	if stats["nodes"] != "1" {
+		t.Fatalf("expected one node in inspect stats, got %#v", stats)
+	}
+
+	if err := w.HandleEvent(gen.MessageEvent{Message: events.EventNodeJoined{}}); err != nil {
+		t.Fatalf("handle event: %v", err)
+	}
+	actor.ShouldSend().
+		To(actor.Process().PID()).
+		MessageMatching(func(message any) bool {
+			_, ok := message.(messageTopologyChange)
+			return ok
+		}).
+		Once().
+		Assert()
+	if w.topologyChangeID != 1 {
+		t.Fatalf("expected topology change id to increment, got %d", w.topologyChangeID)
+	}
+}
+
+func TestWhereisHandleProcessChangedVersioningAndFullSync(t *testing.T) {
+	book := core.NewAddressBook()
+	self := gen.Atom("node-a@127.0.0.1")
+	remote := gen.Atom("node-b@127.0.0.1")
+	if err := book.SetAvailableNodes(core.NewNodeList(self, remote)); err != nil {
+		t.Fatalf("set available nodes: %v", err)
+	}
+	w := &whereis{
+		book:         book,
+		selfNode:     self,
+		nodeVersions: make(map[gen.Atom]core.ProcessVersion),
+	}
+	version := core.NewVersion()
+	name := findLocalDirectoryProcess(t, book, self)
+	if err := w.handleProcessChanged(core.MessageProcessChanged{
+		Node:      remote,
+		Version:   version,
+		UpProcess: core.ProcessInfoList{{Name: name, Node: remote}},
+	}); err != nil {
+		t.Fatalf("handle incremental process change: %v", err)
+	}
+	if node, ok := book.LocateLocal(name); !ok || node != remote {
+		t.Fatalf("expected remote process to be added, got node=%s ok=%v", node, ok)
+	}
+
+	if err := w.handleProcessChanged(core.MessageProcessChanged{
+		Node:        remote,
+		Version:     version,
+		DownProcess: core.ProcessInfoList{{Name: name, Node: remote}},
+	}); err != nil {
+		t.Fatalf("handle stale process change: %v", err)
+	}
+	if node, ok := book.LocateLocal(name); !ok || node != remote {
+		t.Fatalf("stale version should be ignored, got node=%s ok=%v", node, ok)
+	}
+
+	newVersion := version.Incr()
+	replacement := findLocalDirectoryProcessWithPrefix(t, book, self, "proc.local.replacement")
+	if err := w.handleProcessChanged(core.MessageProcessChanged{
+		Node:        remote,
+		Version:     newVersion,
+		FullSync:    true,
+		UpProcess:   core.ProcessInfoList{{Name: replacement, Node: remote}},
+		DownProcess: core.ProcessInfoList{{Name: name, Node: remote}},
+	}); err != nil {
+		t.Fatalf("handle full sync process change: %v", err)
+	}
+	if _, ok := book.LocateLocal(name); ok {
+		t.Fatalf("expected full sync to replace stale process %s", name)
+	}
+	if node, ok := book.LocateLocal(replacement); !ok || node != remote {
+		t.Fatalf("expected full sync replacement on %s, got node=%s ok=%v", remote, node, ok)
+	}
+}
+
+func TestWhereisAntiEntropyThresholdScalesWithClusterSize(t *testing.T) {
+	book := core.NewAddressBook()
+	w := &whereis{book: book}
+	if got := w.antiEntropyThreshold(); got != 100 {
+		t.Fatalf("expected minimum threshold 100, got %d", got)
+	}
+}
+
+func TestWhereisInitAndInspectMessagesScheduleNextInspection(t *testing.T) {
+	book := core.NewAddressBook()
+	self := gen.Atom("node-a@127.0.0.1")
+	if err := book.SetAvailableNodes(core.NewNodeList(self)); err != nil {
+		t.Fatalf("set available nodes: %v", err)
+	}
+	actor := spawnWhereisUnit(t, book, self)
+	w := actor.Behavior().(*whereis)
+	w.registrar = &failingRegistrar{}
+	w.inspectInterval = time.Hour
+
+	actor.SendMessage(gen.PID{}, messageInit{})
+	actor.ShouldSend().
+		To(actor.Process().PID()).
+		MessageMatching(func(message any) bool {
+			_, ok := message.(messageInspectProcess)
+			return ok
+		}).
+		Once().
+		Assert()
+
+	actor.ClearEvents()
+	actor.SendMessage(gen.PID{}, messageInspectProcess{})
+	actor.ShouldSend().
+		To(actor.Process().PID()).
+		MessageMatching(func(message any) bool {
+			_, ok := message.(messageInspectProcess)
+			return ok
+		}).
+		Once().
+		Assert()
+}
+
+func TestWhereisTopologyChangeRefreshesAndPurgesNodeVersions(t *testing.T) {
+	book := core.NewAddressBook()
+	self := gen.Atom("node-a@127.0.0.1")
+	remote := gen.Atom("node-b@127.0.0.1")
+	if err := book.SetAvailableNodes(core.NewNodeList(self, remote)); err != nil {
+		t.Fatalf("set available nodes: %v", err)
+	}
+	actor := spawnWhereisUnit(t, book, self)
+	w := actor.Behavior().(*whereis)
+	w.registrar = &failingRegistrar{}
+	w.nodeVersions[remote] = core.NewVersion()
+	w.topologyChangeID = 9
+	name := findRemoteDirectoryProcess(t, book, self)
+	w.processCache.Store(core.ProcessInfoList{{Name: name, Node: self}})
+
+	actor.SendMessage(gen.PID{}, messageTopologyChange{ID: 8})
+	if _, ok := w.nodeVersions[remote]; !ok {
+		t.Fatal("stale topology id should not purge node versions")
+	}
+
+	actor.SendMessage(gen.PID{}, messageTopologyChange{ID: 9})
+	if _, ok := w.nodeVersions[remote]; ok {
+		t.Fatal("topology refresh should purge unavailable node version")
+	}
+	if w.selfVersion.Equal(core.ProcessVersion{}) {
+		t.Fatal("topology refresh should increment self version")
+	}
 }
