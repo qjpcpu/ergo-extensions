@@ -121,7 +121,25 @@ The fallback loop is periodic:
 
 Incremental sync is used when only a few process entries changed. Full sync is forced periodically and after topology churn so stale directory state is eventually overwritten even if individual update messages were lost.
 
-The default `WhereIsOptions.SyncInterval` is 2 seconds. Explicit local registration messages are the fast path for new named processes; the periodic loop is the anti-entropy fallback for processes spawned outside the helpers or for missed messages.
+The default `WhereIsOptions.SyncInterval` is 2 seconds. Explicit local registration and unregister messages are the fast path for named processes that start or stop quickly; the periodic loop is the anti-entropy fallback for processes spawned outside the helpers, missed messages, or abnormal exits.
+
+When a named process starts outside `system.NewSpawner(...).SpawnRegister(...)`, callers can publish it immediately:
+
+```go
+_ = self.Send(system.WhereIsProcess, system.MessageRegisterLocalProcess{
+    Name: name,
+    PID:  pid,
+})
+```
+
+Before an actor intentionally exits or is killed, callers can reduce the stale-route window by publishing a local unregister. This only updates the directory; it does not stop the process:
+
+```go
+_ = self.Send(system.WhereIsProcess, system.MessageUnregisterLocalProcess{
+    Name: name,
+    PID:  pid,
+})
+```
 
 ### Directory Sharding
 

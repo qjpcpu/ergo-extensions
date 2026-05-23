@@ -103,6 +103,34 @@ sp := system.NewSpawner(self, gen.Atom("worker"))
 pid, err := sp.SpawnRegister(gen.Atom("worker.A"), /* args... */)
 ```
 
+`SpawnRegister` through `system.NewSpawner` publishes a fast local whereis
+registration after the actor starts. If you spawn a named actor directly, send
+the same fast-path update yourself so callers do not have to wait for the
+periodic whereis scan:
+
+```go
+pid, err := self.SpawnRegister(gen.Atom("worker.A"), factory, options, args...)
+if err != nil { /* handle */ }
+_ = self.Send(system.WhereIsProcess, system.MessageRegisterLocalProcess{
+    Name: gen.Atom("worker.A"),
+    PID:  pid,
+})
+```
+
+For actors that go up and down quickly, send a fast local unregister before
+the actor exits or before you kill it. This only updates whereis; it does not
+stop the actor:
+
+```go
+_ = self.Send(system.WhereIsProcess, system.MessageUnregisterLocalProcess{
+    Name: gen.Atom("worker.A"),
+    PID:  pid,
+})
+```
+
+The periodic whereis scan remains the fallback for missed messages or abnormal
+process exits.
+
 4) Locate a process by its registered name:
 
 Using `app.Node` helper:
@@ -130,7 +158,7 @@ picked := book.PickNode(gen.Atom("worker.A")) // pick based on consistent hashin
 ## Selected Entry Points
 
 - Supervisor: `system.ApplicationMemberSpec`, `system.FactorySystemSup`
-- WhereIs: `system.WhereIsProcess`, `MessageLocate`, `MessageGetAddressBook`
+- WhereIs: `system.WhereIsProcess`, `MessageLocate`, `MessageRegisterLocalProcess`, `MessageUnregisterLocalProcess`, `MessageGetAddressBook`
 - Placement monitor: `system.PlacementMonitorProcess`, `MonitorPlacement`, `DuplicatePlacement`
 - Address book: `IAddressBook`, `IAddressBookQuery`, `app.Node.LocateProcess`
 - Daemon orchestration: `system.RegisterLauncher`, `system.NewSpawner`, `system.SingletonDaemon`

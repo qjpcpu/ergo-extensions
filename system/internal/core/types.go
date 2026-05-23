@@ -62,6 +62,10 @@ type (
 		PID     gen.PID
 		BirthAt int64
 	}
+	MessageUnregisterLocalProcess struct {
+		Name gen.Atom
+		PID  gen.PID
+	}
 	ProcessInfoList       []ProcessInfo
 	MessageGetAddressBook struct{}
 	MessageAddressBook    struct {
@@ -96,6 +100,7 @@ func init() {
 		ProcessInfoList{},
 		MessageProcessChanged{},
 		MessageRegisterLocalProcess{},
+		MessageUnregisterLocalProcess{},
 		MessageLocate{},
 		MessageLocateResult{},
 		MessageForwardLocate{},

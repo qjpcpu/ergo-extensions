@@ -204,6 +204,8 @@ func (w *whereis) HandleMessage(from gen.PID, message any) error {
 		return w.handleProcessChanged(e)
 	case core.MessageRegisterLocalProcess:
 		return w.registerLocalProcess(e)
+	case core.MessageUnregisterLocalProcess:
+		return w.unregisterLocalProcess(e)
 	case core.MessageLocate:
 		if e.Name == "" {
 			return nil
@@ -432,6 +434,57 @@ func (w *whereis) registerLocalProcess(msg core.MessageRegisterLocalProcess) err
 	w.registerToShards(core.MessageProcessChanged{
 		Node:        w.selfNodeName(),
 		UpProcess:   up,
+		DownProcess: down,
+		Version:     w.selfVersion,
+	})
+	return nil
+}
+
+func (w *whereis) unregisterLocalProcess(msg core.MessageUnregisterLocalProcess) error {
+	if msg.Name == "" {
+		return nil
+	}
+
+	pid := msg.PID
+	if oldPID, ok := w.nameToPID[msg.Name]; ok {
+		if !pidIsZero(pid) && oldPID != pid {
+			return nil
+		}
+		pid = oldPID
+	} else if !pidIsZero(pid) {
+		if oldName, ok := w.pidToName[pid]; ok {
+			if oldName != msg.Name {
+				return nil
+			}
+		} else {
+			return nil
+		}
+	} else if _, ok := w.nameToBirthAt[msg.Name]; !ok {
+		return nil
+	}
+
+	birthAt := w.nameToBirthAt[msg.Name]
+	if birthAt == 0 {
+		birthAt = time.Now().Unix()
+	}
+
+	down := core.ProcessInfoList{{
+		Name:    msg.Name,
+		PID:     pid,
+		Node:    w.selfNodeName(),
+		BirthAt: birthAt,
+	}}
+	delete(w.nameToPID, msg.Name)
+	delete(w.nameToBirthAt, msg.Name)
+	if !pidIsZero(pid) {
+		delete(w.pidToName, pid)
+	}
+
+	w.rebuildProcessCache()
+	w.book.RemoveProcess(w.selfNodeName(), down...)
+	w.selfVersion = w.selfVersion.Incr()
+	w.registerToShards(core.MessageProcessChanged{
+		Node:        w.selfNodeName(),
 		DownProcess: down,
 		Version:     w.selfVersion,
 	})

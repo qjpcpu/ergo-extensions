@@ -16,36 +16,37 @@ const (
 var ErrNoAvailableNodes = daemon.ErrNoAvailableNodes
 
 type (
-	QueryOption                 = core.QueryOption
-	IAddressBookQuery           = core.IAddressBookQuery
-	IAddressBook                = core.IAddressBook
-	AddressBook                 = core.AddressBook
-	NodeList                    = core.NodeList
-	ImmutableList[T comparable] = core.ImmutableList[T]
-	AtomicValue[T any]          = core.AtomicValue[T]
-	Spawner                     = core.Spawner
-	DaemonProcess               = core.DaemonProcess
-	Launcher                    = core.Launcher
-	WhereIsOptions              = whereis.Options
-	DaemonOptions               = daemon.Options
-	DaemonIteratorFactory       = core.DaemonIteratorFactory
-	DaemonIterator              = core.DaemonIterator
-	ProcessVersion              = core.ProcessVersion
-	ProcessInfo                 = core.ProcessInfo
-	ProcessInfoList             = core.ProcessInfoList
-	MessageLocate               = core.MessageLocate
-	MessageLocateResult         = core.MessageLocateResult
-	MonitorPlacement            = core.MonitorPlacement
-	DuplicatePlacement          = core.DuplicatePlacement
-	MessageForwardLocate        = core.MessageForwardLocate
-	MessageProcessChanged       = core.MessageProcessChanged
-	MessageRegisterLocalProcess = core.MessageRegisterLocalProcess
-	MessageGetAddressBook       = core.MessageGetAddressBook
-	MessageAddressBook          = core.MessageAddressBook
-	MessageLaunchAllDaemon      = core.MessageLaunchAllDaemon
-	MessageEnsureDaemon         = core.MessageEnsureDaemon
-	MessageLaunchOneDaemon      = core.MessageLaunchOneDaemon
-	MessageDaemonLaunchResult   = core.MessageDaemonLaunchResult
+	QueryOption                   = core.QueryOption
+	IAddressBookQuery             = core.IAddressBookQuery
+	IAddressBook                  = core.IAddressBook
+	AddressBook                   = core.AddressBook
+	NodeList                      = core.NodeList
+	ImmutableList[T comparable]   = core.ImmutableList[T]
+	AtomicValue[T any]            = core.AtomicValue[T]
+	Spawner                       = core.Spawner
+	DaemonProcess                 = core.DaemonProcess
+	Launcher                      = core.Launcher
+	WhereIsOptions                = whereis.Options
+	DaemonOptions                 = daemon.Options
+	DaemonIteratorFactory         = core.DaemonIteratorFactory
+	DaemonIterator                = core.DaemonIterator
+	ProcessVersion                = core.ProcessVersion
+	ProcessInfo                   = core.ProcessInfo
+	ProcessInfoList               = core.ProcessInfoList
+	MessageLocate                 = core.MessageLocate
+	MessageLocateResult           = core.MessageLocateResult
+	MonitorPlacement              = core.MonitorPlacement
+	DuplicatePlacement            = core.DuplicatePlacement
+	MessageForwardLocate          = core.MessageForwardLocate
+	MessageProcessChanged         = core.MessageProcessChanged
+	MessageRegisterLocalProcess   = core.MessageRegisterLocalProcess
+	MessageUnregisterLocalProcess = core.MessageUnregisterLocalProcess
+	MessageGetAddressBook         = core.MessageGetAddressBook
+	MessageAddressBook            = core.MessageAddressBook
+	MessageLaunchAllDaemon        = core.MessageLaunchAllDaemon
+	MessageEnsureDaemon           = core.MessageEnsureDaemon
+	MessageLaunchOneDaemon        = core.MessageLaunchOneDaemon
+	MessageDaemonLaunchResult     = core.MessageDaemonLaunchResult
 )
 
 func NewAtomicValue[T any]() *AtomicValue[T] {

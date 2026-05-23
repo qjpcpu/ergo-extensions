@@ -46,12 +46,17 @@ func startNode(t *testing.T, cluster *mem.Cluster, name string) app.Node {
 
 func startNodeExact(t *testing.T, cluster *mem.Cluster, name string) app.Node {
 	t.Helper()
+	return startNodeExactWithSyncInterval(t, cluster, name, 50*time.Millisecond)
+}
+
+func startNodeExactWithSyncInterval(t *testing.T, cluster *mem.Cluster, name string, syncInterval time.Duration) app.Node {
+	t.Helper()
 	n, err := app.StartSimpleNode(app.SimpleNodeOptions{
 		NodeName:                 name,
 		Port:                     0,
 		Cookie:                   "whereis-test-cookie",
 		Registrar:                mem.CreateWithCluster(cluster),
-		WhereIsOptions:           system.WhereIsOptions{SyncInterval: 50 * time.Millisecond},
+		WhereIsOptions:           system.WhereIsOptions{SyncInterval: syncInterval},
 		PlacementMonitorInterval: 50 * time.Millisecond,
 	})
 	if err != nil {
@@ -159,6 +164,34 @@ func TestWhereisConvergesOnJoin(t *testing.T) {
 	})
 }
 
+func TestWhereisFastUnregisterRemovesRouteBeforeSlowScan(t *testing.T) {
+	cluster := mem.NewCluster()
+	n1 := startNodeExactWithSyncInterval(t, cluster, uniqueNodeName("node-a@127.0.0.1"), 5*time.Second)
+	defer n1.Stop()
+	n2 := startNodeExactWithSyncInterval(t, cluster, uniqueNodeName("node-b@127.0.0.1"), 5*time.Second)
+	defer n2.Stop()
+
+	waitForClusterNodes(t, 10*time.Second, n1, n2)
+
+	name := uniqueProcessName("proc.fast-unregister")
+	pid := spawnNamed(t, n2, name)
+
+	waitUntil(t, 30*time.Second, func() bool {
+		node, ok := locateNode(n1, name)
+		return ok && node == n2.Name()
+	})
+
+	if err := n2.Send(system.WhereIsProcess, system.MessageUnregisterLocalProcess{Name: name, PID: pid}); err != nil {
+		t.Fatalf("fast unregister %s on %s: %v", name, n2.Name(), err)
+	}
+	killAndWaitPID(t, n2, pid)
+
+	waitUntil(t, 4*time.Second, func() bool {
+		_, ok := locateNode(n1, name)
+		return !ok
+	})
+}
+
 func TestWhereisRemovesProcessesOnNodeLeave(t *testing.T) {
 	cluster := mem.NewCluster()
 	n1 := startNode(t, cluster, "node-a@127.0.0.1")
@@ -203,13 +236,15 @@ func TestWhereisDuplicateNameDeterministicWinnerAndFailover(t *testing.T) {
 	dup := uniqueProcessName("proc.dup")
 	waitForClusterNodes(t, 10*time.Second, n1, n2, n3)
 	pid2 := spawnNamedWithBirthAt(t, n2, dup, 1)
-	_ = spawnNamedWithBirthAt(t, n3, dup, 2)
+	pid3 := spawnNamedWithBirthAt(t, n3, dup, 2)
 
 	// n2's process is definitively older, so locate() will always select n2
 	// as the winner via BirthAt.
 	winner := n2.Name()
 
 	waitWinner := func(n app.Node) bool {
+		_ = n2.Send(system.WhereIsProcess, system.MessageRegisterLocalProcess{Name: dup, PID: pid2, BirthAt: 1})
+		_ = n3.Send(system.WhereIsProcess, system.MessageRegisterLocalProcess{Name: dup, PID: pid3, BirthAt: 2})
 		node, ok := locateNode(n, dup)
 		return ok && node == winner
 	}
