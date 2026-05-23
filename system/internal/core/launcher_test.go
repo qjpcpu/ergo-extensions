@@ -3,8 +3,12 @@ package core
 import (
 	"testing"
 
+	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
+	"ergo.services/ergo/testing/unit"
 )
+
+type spawnerParentProc struct{ act.Actor }
 
 func TestLauncherRegistration(t *testing.T) {
 	name := gen.Atom("test_launcher")
@@ -48,54 +52,39 @@ func TestLauncherRegistration(t *testing.T) {
 	}
 }
 
-type mockProcess struct {
-	gen.Process
-	spawnedName gen.Atom
-	sentTo      any
-	sentMessage any
-}
-
-func (m *mockProcess) SpawnRegister(name gen.Atom, factory gen.ProcessFactory, options gen.ProcessOptions, args ...any) (gen.PID, error) {
-	m.spawnedName = name
-	return gen.PID{ID: 1}, nil
-}
-
-func (m *mockProcess) Send(to any, message any) error {
-	m.sentTo = to
-	m.sentMessage = message
-	return nil
-}
-
 func TestSpawner(t *testing.T) {
 	launcherName := gen.Atom("spawner_launcher")
 	factory := func() gen.ProcessBehavior { return nil }
 	RegisterLauncher(launcherName, Launcher{Factory: factory})
 	defer UnregisterLauncher(launcherName)
 
-	parent := &mockProcess{}
-	spawner := NewSpawner(parent, launcherName)
+	parent, err := unit.Spawn(t, func() gen.ProcessBehavior { return &spawnerParentProc{} })
+	if err != nil {
+		t.Fatalf("spawn parent actor: %v", err)
+	}
+	parent.ClearEvents()
+	spawner := NewSpawner(parent.Process(), launcherName)
 
 	procName := gen.Atom("my_proc")
 	pid, err := spawner.SpawnRegister(procName)
 	if err != nil {
 		t.Fatalf("SpawnRegister failed: %v", err)
 	}
-	if pid.ID != 1 {
-		t.Errorf("expected pid ID 1, got %d", pid.ID)
+	if pid == (gen.PID{}) {
+		t.Fatal("expected non-zero pid")
 	}
-	if parent.spawnedName != procName {
-		t.Errorf("expected spawned name %s, got %s", procName, parent.spawnedName)
-	}
-	msg, ok := parent.sentMessage.(MessageRegisterLocalProcess)
-	if !ok {
-		t.Fatalf("expected MessageRegisterLocalProcess, got %T", parent.sentMessage)
-	}
-	if parent.sentTo != WhereIsProcess || msg.Name != procName || msg.PID.ID != 1 {
-		t.Fatalf("unexpected whereis register notification: to=%v msg=%+v", parent.sentTo, msg)
-	}
+	parent.ShouldSpawn().Once().Assert()
+	parent.ShouldSend().
+		To(WhereIsProcess).
+		MessageMatching(func(message any) bool {
+			msg, ok := message.(MessageRegisterLocalProcess)
+			return ok && msg.Name == procName && msg.PID == pid
+		}).
+		Once().
+		Assert()
 
 	// Test non-existent launcher
-	spawnerInvalid := NewSpawner(parent, "non_existent")
+	spawnerInvalid := NewSpawner(parent.Process(), "non_existent")
 	_, err = spawnerInvalid.SpawnRegister("any")
 	if err == nil {
 		t.Errorf("expected error for non-existent launcher")

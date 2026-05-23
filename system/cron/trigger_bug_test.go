@@ -4,33 +4,34 @@ import (
 	"testing"
 	"time"
 
+	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
+	"ergo.services/ergo/testing/unit"
 )
 
-type mockProcess struct {
-	gen.Process
-	sent map[gen.Atom]int
-}
+type triggerTestProc struct{ act.Actor }
 
-func (m *mockProcess) Send(to any, message any) error {
-	target := to.(gen.Atom)
-	if target == "fail" {
-		return gen.ErrProcessUnknown
+func spawnTriggerTestProcess(t *testing.T) *unit.TestActor {
+	t.Helper()
+	actor, err := unit.Spawn(t, func() gen.ProcessBehavior { return &triggerTestProc{} })
+	if err != nil {
+		t.Fatalf("spawn trigger test process: %v", err)
 	}
-	m.sent[target]++
-	return nil
+	actor.ClearEvents()
+	actor.Process().SetMethodFailurePattern("Send", "fail", gen.ErrProcessUnknown)
+	return actor
 }
 
 func TestTriggerBatchBug(t *testing.T) {
 	trigger := LocalTrigger{Batch: true}
-	p := &mockProcess{sent: make(map[gen.Atom]int)}
+	actor := spawnTriggerTestProcess(t)
 
 	jobs := []DispatchJob{
 		{JobID: "1", TriggerProcess: "fail", ScheduledAt: time.Now()},
 		{JobID: "2", TriggerProcess: "success", ScheduledAt: time.Now()},
 	}
 
-	failed, err := trigger.Fire(p, jobs)
+	failed, err := trigger.Fire(actor.Process(), jobs)
 	if err == nil {
 		t.Fatalf("expected batch failure")
 	}
@@ -38,21 +39,26 @@ func TestTriggerBatchBug(t *testing.T) {
 		t.Fatalf("unexpected failed jobs: %+v", failed)
 	}
 
-	if p.sent["success"] != 1 {
-		t.Errorf("expected success process to receive message")
-	}
+	actor.ShouldSend().
+		To(gen.Atom("success")).
+		MessageMatching(func(message any) bool {
+			msg, ok := message.(MessageTrigger)
+			return ok && msg.JobID == "2"
+		}).
+		Once().
+		Assert()
 }
 
 func TestTriggerNoBatchBug(t *testing.T) {
 	trigger := LocalTrigger{Batch: false}
-	p := &mockProcess{sent: make(map[gen.Atom]int)}
+	actor := spawnTriggerTestProcess(t)
 
 	jobs := []DispatchJob{
 		{JobID: "1", TriggerProcess: "fail", ScheduledAt: time.Now()},
 		{JobID: "2", TriggerProcess: "success", ScheduledAt: time.Now()},
 	}
 
-	failed, err := trigger.Fire(p, jobs)
+	failed, err := trigger.Fire(actor.Process(), jobs)
 	if err == nil {
 		t.Fatalf("expected non-batch failure")
 	}
@@ -60,7 +66,12 @@ func TestTriggerNoBatchBug(t *testing.T) {
 		t.Fatalf("unexpected failed jobs: %+v", failed)
 	}
 
-	if p.sent["success"] != 1 {
-		t.Errorf("expected success process to receive message")
-	}
+	actor.ShouldSend().
+		To(gen.Atom("success")).
+		MessageMatching(func(message any) bool {
+			msg, ok := message.(MessageTrigger)
+			return ok && msg.JobID == "2"
+		}).
+		Once().
+		Assert()
 }

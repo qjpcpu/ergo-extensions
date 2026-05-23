@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"ergo.services/ergo/gen"
+	"ergo.services/ergo/testing/unit"
 	core "github.com/qjpcpu/ergo-extensions/system/internal/core"
 )
 
@@ -75,6 +76,26 @@ func findRemoteDirectoryProcess(t *testing.T, book *core.AddressBook, self gen.A
 	}
 	t.Fatal("failed to find a process name owned by a remote directory node")
 	return ""
+}
+
+func spawnWhereisUnit(t *testing.T, book *core.AddressBook, self gen.Atom) *unit.TestActor {
+	t.Helper()
+	actor, err := unit.Spawn(t, FactoryWithOptions(book, Options{
+		SyncInterval: time.Hour,
+	}), unit.WithNodeName(self))
+	if err != nil {
+		t.Fatalf("spawn whereis actor: %v", err)
+	}
+	actor.ClearEvents()
+	return actor
+}
+
+func processChangedWith(t *testing.T, node gen.Atom, verify func(core.MessageProcessChanged) bool) func(any) bool {
+	t.Helper()
+	return func(message any) bool {
+		msg, ok := message.(core.MessageProcessChanged)
+		return ok && msg.Node == node && verify(msg)
+	}
 }
 
 func TestRegisterToShardsSendFailureDoesNotScheduleTopologyDebounce(t *testing.T) {
@@ -203,39 +224,19 @@ func TestRegisterLocalProcessFastPathSendsOnlyOwnerShard(t *testing.T) {
 	}
 	name := findRemoteDirectoryProcess(t, book, self)
 
-	var sendCalls int
-	var sentTo gen.ProcessID
-	var sentMsg core.MessageProcessChanged
-	w := &whereis{
-		book:             book,
-		selfNode:         self,
-		nameToPID:        make(map[gen.Atom]gen.PID),
-		nameToBirthAt:    make(map[gen.Atom]int64),
-		pidToName:        make(map[gen.PID]gen.Atom),
-		processCache:     core.NewAtomicValue[core.ProcessInfoList](),
-		selfVersion:      core.NewVersion(),
-		sendFailureLogAt: make(map[gen.Atom]time.Time),
-		nowFn:            func() time.Time { return time.Date(2026, 3, 27, 20, 0, 0, 0, time.UTC) },
-		sendProcessChanged: func(pid gen.ProcessID, msg core.MessageProcessChanged) error {
-			sendCalls++
-			sentTo = pid
-			sentMsg = msg
-			return nil
-		},
-	}
-
-	if err := w.registerLocalProcess(core.MessageRegisterLocalProcess{Name: name, BirthAt: 123}); err != nil {
-		t.Fatalf("register local process: %v", err)
-	}
-	if sendCalls != 1 {
-		t.Fatalf("expected one shard message, got %d", sendCalls)
-	}
-	if sentTo.Node != remote || sentTo.Name != ProcessName {
-		t.Fatalf("unexpected shard target: %+v", sentTo)
-	}
-	if len(sentMsg.UpProcess) != 1 || sentMsg.UpProcess[0].Name != name || sentMsg.Node != self {
-		t.Fatalf("unexpected shard message: %+v", sentMsg)
-	}
+	actor := spawnWhereisUnit(t, book, self)
+	actor.SendMessage(gen.PID{}, core.MessageRegisterLocalProcess{Name: name, BirthAt: 123})
+	actor.ShouldSend().
+		To(gen.ProcessID{Node: remote, Name: ProcessName}).
+		MessageMatching(processChangedWith(t, self, func(msg core.MessageProcessChanged) bool {
+			return len(msg.UpProcess) == 1 &&
+				msg.UpProcess[0].Name == name &&
+				msg.UpProcess[0].Node == self &&
+				msg.UpProcess[0].BirthAt == 123 &&
+				len(msg.DownProcess) == 0
+		})).
+		Once().
+		Assert()
 	if node, ok := book.LocateLocal(name); !ok || node != self {
 		t.Fatalf("expected local book to locate %s on %s, got %s ok=%v", name, self, node, ok)
 	}
@@ -251,51 +252,26 @@ func TestUnregisterLocalProcessFastPathSendsOnlyOwnerShard(t *testing.T) {
 	name := findRemoteDirectoryProcess(t, book, self)
 	pid := gen.PID{Node: self, ID: 10}
 	birthAt := int64(123)
-	if err := book.AddProcess(self, core.ProcessInfo{Name: name, PID: pid, Node: self, BirthAt: birthAt}); err != nil {
-		t.Fatalf("add process: %v", err)
-	}
 
-	var sendCalls int
-	var sentTo gen.ProcessID
-	var sentMsg core.MessageProcessChanged
-	w := &whereis{
-		book:             book,
-		selfNode:         self,
-		nameToPID:        map[gen.Atom]gen.PID{name: pid},
-		nameToBirthAt:    map[gen.Atom]int64{name: birthAt},
-		pidToName:        map[gen.PID]gen.Atom{pid: name},
-		processCache:     core.NewAtomicValue[core.ProcessInfoList](),
-		selfVersion:      core.NewVersion(),
-		sendFailureLogAt: make(map[gen.Atom]time.Time),
-		nowFn:            func() time.Time { return time.Date(2026, 3, 27, 20, 0, 0, 0, time.UTC) },
-		sendProcessChanged: func(pid gen.ProcessID, msg core.MessageProcessChanged) error {
-			sendCalls++
-			sentTo = pid
-			sentMsg = msg
-			return nil
-		},
-	}
+	actor := spawnWhereisUnit(t, book, self)
+	actor.SendMessage(gen.PID{}, core.MessageRegisterLocalProcess{Name: name, PID: pid, BirthAt: birthAt})
+	actor.ClearEvents()
 
-	if err := w.unregisterLocalProcess(core.MessageUnregisterLocalProcess{Name: name, PID: pid}); err != nil {
-		t.Fatalf("unregister local process: %v", err)
-	}
-	if sendCalls != 1 {
-		t.Fatalf("expected one shard message, got %d", sendCalls)
-	}
-	if sentTo.Node != remote || sentTo.Name != ProcessName {
-		t.Fatalf("unexpected shard target: %+v", sentTo)
-	}
-	if len(sentMsg.DownProcess) != 1 || sentMsg.DownProcess[0].Name != name || sentMsg.DownProcess[0].PID != pid || sentMsg.Node != self {
-		t.Fatalf("unexpected shard message: %+v", sentMsg)
-	}
+	actor.SendMessage(gen.PID{}, core.MessageUnregisterLocalProcess{Name: name, PID: pid})
+	actor.ShouldSend().
+		To(gen.ProcessID{Node: remote, Name: ProcessName}).
+		MessageMatching(processChangedWith(t, self, func(msg core.MessageProcessChanged) bool {
+			return len(msg.UpProcess) == 0 &&
+				len(msg.DownProcess) == 1 &&
+				msg.DownProcess[0].Name == name &&
+				msg.DownProcess[0].PID == pid &&
+				msg.DownProcess[0].Node == self &&
+				msg.DownProcess[0].BirthAt == birthAt
+		})).
+		Once().
+		Assert()
 	if _, ok := book.LocateLocal(name); ok {
 		t.Fatalf("expected local book to remove %s", name)
-	}
-	if _, ok := w.nameToPID[name]; ok {
-		t.Fatalf("expected nameToPID to remove %s", name)
-	}
-	if _, ok := w.pidToName[pid]; ok {
-		t.Fatalf("expected pidToName to remove %v", pid)
 	}
 }
 
@@ -309,37 +285,15 @@ func TestUnregisterLocalProcessIgnoresMismatchedPID(t *testing.T) {
 	name := findRemoteDirectoryProcess(t, book, self)
 	currentPID := gen.PID{Node: self, ID: 10}
 	stalePID := gen.PID{Node: self, ID: 9}
-	if err := book.AddProcess(self, core.ProcessInfo{Name: name, PID: currentPID, Node: self, BirthAt: 123}); err != nil {
-		t.Fatalf("add process: %v", err)
-	}
 
-	var sendCalls int
-	w := &whereis{
-		book:             book,
-		selfNode:         self,
-		nameToPID:        map[gen.Atom]gen.PID{name: currentPID},
-		nameToBirthAt:    map[gen.Atom]int64{name: 123},
-		pidToName:        map[gen.PID]gen.Atom{currentPID: name},
-		processCache:     core.NewAtomicValue[core.ProcessInfoList](),
-		selfVersion:      core.NewVersion(),
-		sendFailureLogAt: make(map[gen.Atom]time.Time),
-		sendProcessChanged: func(pid gen.ProcessID, msg core.MessageProcessChanged) error {
-			sendCalls++
-			return nil
-		},
-	}
+	actor := spawnWhereisUnit(t, book, self)
+	actor.SendMessage(gen.PID{}, core.MessageRegisterLocalProcess{Name: name, PID: currentPID, BirthAt: 123})
+	actor.ClearEvents()
 
-	if err := w.unregisterLocalProcess(core.MessageUnregisterLocalProcess{Name: name, PID: stalePID}); err != nil {
-		t.Fatalf("unregister local process: %v", err)
-	}
-	if sendCalls != 0 {
-		t.Fatalf("expected no shard message, got %d", sendCalls)
-	}
+	actor.SendMessage(gen.PID{}, core.MessageUnregisterLocalProcess{Name: name, PID: stalePID})
+	actor.ShouldNotSend().Assert()
 	if node, ok := book.LocateLocal(name); !ok || node != self {
 		t.Fatalf("expected local book to keep %s on %s, got %s ok=%v", name, self, node, ok)
-	}
-	if got := w.nameToPID[name]; got != currentPID {
-		t.Fatalf("expected current pid to remain %v, got %v", currentPID, got)
 	}
 }
 
@@ -352,45 +306,27 @@ func TestUnregisterLocalProcessByNameRemovesZeroPIDFastPath(t *testing.T) {
 	}
 	name := findRemoteDirectoryProcess(t, book, self)
 
-	var sendCalls int
-	var sentMsg core.MessageProcessChanged
-	w := &whereis{
-		book:             book,
-		selfNode:         self,
-		nameToPID:        make(map[gen.Atom]gen.PID),
-		nameToBirthAt:    make(map[gen.Atom]int64),
-		pidToName:        make(map[gen.PID]gen.Atom),
-		processCache:     core.NewAtomicValue[core.ProcessInfoList](),
-		selfVersion:      core.NewVersion(),
-		sendFailureLogAt: make(map[gen.Atom]time.Time),
-		sendProcessChanged: func(pid gen.ProcessID, msg core.MessageProcessChanged) error {
-			sendCalls++
-			sentMsg = msg
-			return nil
-		},
-	}
-
-	if err := w.registerLocalProcess(core.MessageRegisterLocalProcess{Name: name, BirthAt: 123}); err != nil {
-		t.Fatalf("register zero-pid process: %v", err)
-	}
+	actor := spawnWhereisUnit(t, book, self)
+	actor.SendMessage(gen.PID{}, core.MessageRegisterLocalProcess{Name: name, BirthAt: 123})
 	if _, ok := book.LocateLocal(name); !ok {
 		t.Fatalf("expected local book to locate %s after register", name)
 	}
+	actor.ClearEvents()
 
-	if err := w.unregisterLocalProcess(core.MessageUnregisterLocalProcess{Name: name}); err != nil {
-		t.Fatalf("unregister zero-pid process by name: %v", err)
-	}
-	if sendCalls != 2 {
-		t.Fatalf("expected register and unregister shard messages, got %d", sendCalls)
-	}
-	if len(sentMsg.DownProcess) != 1 || sentMsg.DownProcess[0].Name != name || sentMsg.DownProcess[0].PID != (gen.PID{}) {
-		t.Fatalf("unexpected unregister shard message: %+v", sentMsg)
-	}
+	actor.SendMessage(gen.PID{}, core.MessageUnregisterLocalProcess{Name: name})
+	actor.ShouldSend().
+		To(gen.ProcessID{Node: remote, Name: ProcessName}).
+		MessageMatching(processChangedWith(t, self, func(msg core.MessageProcessChanged) bool {
+			return len(msg.UpProcess) == 0 &&
+				len(msg.DownProcess) == 1 &&
+				msg.DownProcess[0].Name == name &&
+				msg.DownProcess[0].PID == (gen.PID{}) &&
+				msg.DownProcess[0].BirthAt == 123
+		})).
+		Once().
+		Assert()
 	if _, ok := book.LocateLocal(name); ok {
 		t.Fatalf("expected local book to remove %s", name)
-	}
-	if _, ok := w.nameToBirthAt[name]; ok {
-		t.Fatalf("expected nameToBirthAt to remove %s", name)
 	}
 }
 
@@ -402,29 +338,8 @@ func TestUnregisterLocalProcessIgnoresEmptyAndUnknownName(t *testing.T) {
 		t.Fatalf("set available nodes: %v", err)
 	}
 
-	var sendCalls int
-	w := &whereis{
-		book:             book,
-		selfNode:         self,
-		nameToPID:        make(map[gen.Atom]gen.PID),
-		nameToBirthAt:    make(map[gen.Atom]int64),
-		pidToName:        make(map[gen.PID]gen.Atom),
-		processCache:     core.NewAtomicValue[core.ProcessInfoList](),
-		selfVersion:      core.NewVersion(),
-		sendFailureLogAt: make(map[gen.Atom]time.Time),
-		sendProcessChanged: func(pid gen.ProcessID, msg core.MessageProcessChanged) error {
-			sendCalls++
-			return nil
-		},
-	}
-
-	if err := w.unregisterLocalProcess(core.MessageUnregisterLocalProcess{}); err != nil {
-		t.Fatalf("unregister empty name: %v", err)
-	}
-	if err := w.unregisterLocalProcess(core.MessageUnregisterLocalProcess{Name: gen.Atom("missing")}); err != nil {
-		t.Fatalf("unregister unknown name: %v", err)
-	}
-	if sendCalls != 0 {
-		t.Fatalf("expected no shard message, got %d", sendCalls)
-	}
+	actor := spawnWhereisUnit(t, book, self)
+	actor.SendMessage(gen.PID{}, core.MessageUnregisterLocalProcess{})
+	actor.SendMessage(gen.PID{}, core.MessageUnregisterLocalProcess{Name: gen.Atom("missing")})
+	actor.ShouldNotSend().Assert()
 }

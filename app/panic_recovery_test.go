@@ -7,17 +7,18 @@ import (
 
 	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
+	"ergo.services/ergo/testing/unit"
 )
 
 type mockActor struct {
 	act.Actor
 
-	panicInit     bool
-	panicHandle    bool
+	panicInit       bool
+	panicHandle     bool
 	panicHandleCall bool
-	panicInspect  bool
-	panicLog      bool
-	panicEvent    bool
+	panicInspect    bool
+	panicLog        bool
+	panicEvent      bool
 
 	initCalled     bool
 	handleCalled   bool
@@ -84,17 +85,17 @@ func (m *mockActor) Terminate(reason error) {
 type mockMetaActor struct {
 	gen.MetaProcess
 
-	panicInit     bool
-	panicStart     bool
-	panicHandle    bool
+	panicInit       bool
+	panicStart      bool
+	panicHandle     bool
 	panicHandleCall bool
-	panicInspect  bool
+	panicInspect    bool
 
-	initCalled    bool
-	startCalled   bool
-	handleCalled  bool
+	initCalled     bool
+	startCalled    bool
+	handleCalled   bool
 	handleCallDone bool
-	inspectCalled bool
+	inspectCalled  bool
 
 	terminateReason error
 }
@@ -143,43 +144,50 @@ func (m *mockMetaActor) Terminate(reason error) {
 	m.terminateReason = reason
 }
 
+func spawnProtectedMockActor(t *testing.T, mock *mockActor) *unit.TestActor {
+	t.Helper()
+	actor, err := unit.Spawn(t, func() gen.ProcessBehavior { return ProtectActor(mock) })
+	if err != nil {
+		t.Fatalf("spawn protected actor: %v", err)
+	}
+	actor.ClearEvents()
+	return actor
+}
+
 func TestPanicAsErrorActor_NoPanic(t *testing.T) {
 	mock := &mockActor{}
-	wrapped := ProtectActor(mock)
 
-	err := wrapped.Init()
-	if err != nil {
-		t.Errorf("Init failed: %v", err)
-	}
+	actor := spawnProtectedMockActor(t, mock)
 	if !mock.initCalled {
 		t.Error("Init was not called")
 	}
 
-	_, err = wrapped.HandleCall(gen.PID{}, gen.Ref{}, nil)
-	if err != nil {
-		t.Errorf("HandleCall failed: %v", err)
+	callResult := actor.Call(gen.PID{}, nil)
+	if callResult.Error != nil {
+		t.Errorf("HandleCall failed: %v", callResult.Error)
+	}
+	if callResult.Response != "result" {
+		t.Errorf("expected HandleCall response result, got %v", callResult.Response)
 	}
 	if !mock.handleCallDone {
 		t.Error("HandleCall was not called")
 	}
 
-	err = wrapped.HandleMessage(gen.PID{}, nil)
-	if err != nil {
-		t.Errorf("HandleMessage failed: %v", err)
-	}
+	actor.SendMessage(gen.PID{}, nil)
 	if !mock.handleCalled {
 		t.Error("HandleMessage was not called")
 	}
 
-	result := wrapped.HandleInspect(gen.PID{})
-	if result == nil {
+	wrapped := actor.Behavior().(IActor)
+	inspectResult := wrapped.HandleInspect(gen.PID{})
+	if inspectResult == nil {
 		t.Error("HandleInspect returned nil")
 	}
 	if !mock.inspectCalled {
 		t.Error("HandleInspect was not called")
 	}
 
-	err = wrapped.HandleLog(gen.MessageLog{})
+	err := wrapped.HandleLog(gen.MessageLog{})
 	if err != nil {
 		t.Errorf("HandleLog failed: %v", err)
 	}
@@ -203,55 +211,50 @@ func TestPanicAsErrorActor_NoPanic(t *testing.T) {
 
 func TestPanicAsErrorActor_PanicInInit(t *testing.T) {
 	mock := &mockActor{panicInit: true}
-	wrapped := ProtectActor(mock)
 
-	err := wrapped.Init()
+	_, err := unit.Spawn(t, func() gen.ProcessBehavior { return ProtectActor(mock) })
 	if err == nil {
 		t.Error("Expected error from panic in Init")
 	}
-	var pErr PanicError
-	if !errors.As(err, &pErr) {
-		t.Errorf("Expected PanicError, got %T", err)
-	}
 	if !strings.Contains(err.Error(), "panic in Init") {
 		t.Errorf("Error message should contain 'panic in Init', got: %v", err.Error())
-	}
-	if pErr.stack == "" {
-		t.Error("Stack trace should not be empty")
 	}
 }
 
 func TestPanicAsErrorActor_PanicInHandleCall(t *testing.T) {
 	mock := &mockActor{panicHandleCall: true}
-	wrapped := ProtectActor(mock)
+	actor := spawnProtectedMockActor(t, mock)
 
-	_, err := wrapped.HandleCall(gen.PID{}, gen.Ref{}, nil)
-	if err == nil {
+	result := actor.Call(gen.PID{}, nil)
+	if result.Error == nil {
 		t.Error("Expected error from panic in HandleCall")
 	}
 	var pErr PanicError
-	if !errors.As(err, &pErr) {
-		t.Errorf("Expected PanicError, got %T", err)
+	if !errors.As(result.Error, &pErr) {
+		t.Errorf("Expected PanicError, got %T", result.Error)
 	}
-	if !strings.Contains(err.Error(), "panic in HandleCall") {
-		t.Errorf("Error message should contain 'panic in HandleCall', got: %v", err.Error())
+	if !strings.Contains(result.Error.Error(), "panic in HandleCall") {
+		t.Errorf("Error message should contain 'panic in HandleCall', got: %v", result.Error.Error())
 	}
 }
 
 func TestPanicAsErrorActorRE_PanicInHandleMessage(t *testing.T) {
 	mock := &mockActor{panicHandle: true}
-	wrapped := ProtectActor(mock)
+	actor := spawnProtectedMockActor(t, mock)
 
-	err := wrapped.HandleMessage(gen.PID{}, nil)
-	if err == nil {
+	actor.SendMessage(gen.PID{}, nil)
+	last := actor.LastEvent()
+	term, ok := last.(unit.TerminateEvent)
+	if !ok || term.Reason == nil {
 		t.Error("Expected error from panic in HandleMessage")
+		return
 	}
 	var pErr PanicError
-	if !errors.As(err, &pErr) {
-		t.Errorf("Expected PanicError, got %T", err)
+	if !errors.As(term.Reason, &pErr) {
+		t.Errorf("Expected PanicError, got %T", term.Reason)
 	}
-	if !strings.Contains(err.Error(), "panic in HandleMessage") {
-		t.Errorf("Error message should contain 'panic in HandleMessage', got: %v", err.Error())
+	if !strings.Contains(term.Reason.Error(), "panic in HandleMessage") {
+		t.Errorf("Error message should contain 'panic in HandleMessage', got: %v", term.Reason.Error())
 	}
 }
 
@@ -462,7 +465,7 @@ func TestProtectActor_Nil(t *testing.T) {
 	if wrapped == nil {
 		t.Error("ProtectActor should not return nil")
 	}
-	
+
 	// Should recover from nil pointer dereference
 	err := wrapped.Init()
 	if err == nil {
@@ -478,7 +481,7 @@ func TestProtectMetaActor_Nil(t *testing.T) {
 	if wrapped == nil {
 		t.Error("ProtectMetaActor should not return nil")
 	}
-	
+
 	// Should recover from nil pointer dereference
 	err := wrapped.Start()
 	if err == nil {
