@@ -87,6 +87,7 @@ func (p *placementMonitor) handleLocateResult(msg core.MessageLocateResult) {
 	if !ok {
 		return
 	}
+	//lint:ignore S1016 keep this explicit so the two message types can evolve independently.
 	_ = p.Send(pid, core.DuplicatePlacement{Name: msg.Name, Node: msg.Node})
 }
 

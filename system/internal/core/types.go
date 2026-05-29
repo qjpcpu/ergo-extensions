@@ -9,17 +9,7 @@ import (
 )
 
 type (
-	messageInit           struct{}
-	messageInspectProcess struct{}
-	messageTopologyChange struct {
-		ID int64
-	}
-	messageDaemonLaunchTimeout struct {
-		Name  gen.Atom
-		Epoch int64
-	}
-	messageScheduleCron struct{}
-	MessageLocate       struct {
+	MessageLocate struct {
 		Name gen.Atom
 	}
 	MessageLocateResult struct {
