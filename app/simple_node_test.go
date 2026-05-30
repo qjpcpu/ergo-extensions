@@ -113,6 +113,15 @@ func TestAcceptorHost(t *testing.T) {
 	}
 }
 
+func TestStrReturnsFirstNonEmptyOrEmpty(t *testing.T) {
+	if got := str("", "", "value", "fallback"); got != "value" {
+		t.Fatalf("expected first non-empty value, got %q", got)
+	}
+	if got := str("", ""); got != "" {
+		t.Fatalf("expected empty value, got %q", got)
+	}
+}
+
 func TestForwardCallUnknownProcessDoesNotFallbackLocal(t *testing.T) {
 	cluster := mem.NewCluster()
 	node, err := StartSimpleNode(SimpleNodeOptions{
