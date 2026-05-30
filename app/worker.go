@@ -60,6 +60,7 @@ type messageSpawnProcess struct {
 	Factory gen.ProcessFactory
 	Options gen.ProcessOptions
 	Args    []any
+	Wait    bool
 	Ch      chan error
 }
 
@@ -137,6 +138,10 @@ func (w *routeActor) HandleMessage(from gen.PID, message any) error {
 				Name: e.Name,
 				PID:  pid,
 			})
+		}
+		if !e.Wait {
+			sendResp(nil)
+			return nil
 		}
 		if e.Ch != nil {
 			err = w.MonitorPID(pid)

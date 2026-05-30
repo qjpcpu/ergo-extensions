@@ -16,11 +16,26 @@ import (
 // currently hosting that process.
 type Node interface {
 	gen.Node
+
+	// LocateProcess returns the node that currently owns the named process.
 	LocateProcess(process gen.Atom) gen.Atom
+
+	// ForwardCall calls the named process on its current owner node.
 	ForwardCall(to string, msg any, opts ...ForwardOpts) (any, error)
+
+	// ForwardSend sends a message to the named process on its current owner node.
 	ForwardSend(to string, msg any, opts ...ForwardOpts) error
-	ForwardSpawnAndWait(fac gen.ProcessFactory, args ...any) error
+
+	// ForwardSpawn starts a process through the route worker and returns after spawn completes.
+	ForwardSpawn(name string, fac gen.ProcessFactory, args ...any) error
+
+	// ForwardSpawnAndWait starts a process through the route worker and waits until it exits.
+	ForwardSpawnAndWait(name string, fac gen.ProcessFactory, args ...any) error
+
+	// WaitPID waits until the given process exits.
 	WaitPID(pid gen.PID) error
+
+	// AddressBook returns the node's shared process address book.
 	AddressBook() system.IAddressBook
 }
 

@@ -202,14 +202,16 @@ func TestForwardSpawnAndWaitUsesRouteActor(t *testing.T) {
 	waitForAddressBook(t, node)
 
 	started := make(chan gen.PID, 1)
+	processName := "spawnwait-worker"
 	done := make(chan error, 1)
 	go func() {
-		done <- node.ForwardSpawnAndWait(func() gen.ProcessBehavior {
+		done <- node.ForwardSpawnAndWait(processName, func() gen.ProcessBehavior {
 			return &waitableActor{started: started}
 		})
 	}()
 
 	pid := <-started
+	waitForProcessLocation(t, node, gen.Atom(processName), node.Name())
 	time.Sleep(100 * time.Millisecond)
 	if err := node.Send(pid, "stop"); err != nil {
 		t.Fatalf("failed to stop spawned actor: %v", err)
@@ -218,6 +220,47 @@ func TestForwardSpawnAndWaitUsesRouteActor(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("ForwardSpawnAndWait failed: %v", err)
 	}
+}
+
+func TestForwardSpawnUsesRouteActor(t *testing.T) {
+	cluster := mem.NewCluster()
+	node, err := StartSimpleNode(SimpleNodeOptions{
+		NodeName:  "node-spawn@localhost",
+		Port:      11007,
+		Cookie:    "test-cookie",
+		Registrar: mem.CreateWithCluster(cluster),
+	})
+	if err != nil {
+		t.Fatalf("failed to start node: %v", err)
+	}
+	defer node.Stop()
+	waitForAddressBook(t, node)
+
+	started := make(chan gen.PID, 1)
+	processName := "spawn-worker"
+	if err := node.ForwardSpawn(processName, func() gen.ProcessBehavior {
+		return &waitableActor{started: started}
+	}); err != nil {
+		t.Fatalf("ForwardSpawn failed: %v", err)
+	}
+
+	pid := <-started
+	waitForProcessLocation(t, node, gen.Atom(processName), node.Name())
+	if err := node.Send(pid, "stop"); err != nil {
+		t.Fatalf("failed to stop spawned actor: %v", err)
+	}
+}
+
+func waitForProcessLocation(t *testing.T, node Node, process gen.Atom, want gen.Atom) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := node.LocateProcess(process); got == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("process %s was not located on %s", process, want)
 }
 
 func waitForAddressBook(t *testing.T, node Node) {

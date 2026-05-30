@@ -113,6 +113,32 @@ func TestCronFactoryInitCallAndEventScheduling(t *testing.T) {
 		Assert()
 }
 
+func TestCronHelperBranches(t *testing.T) {
+	if got := slotKey(time.Unix(60, 0), 0); got != 1 {
+		t.Fatalf("zero resolution should default to one minute slot, got %d", got)
+	}
+
+	pending := make([]pendingDispatch, 5)
+	trimmed := trimPendingQueue(nil, pending, 3)
+	if len(trimmed) != 3 {
+		t.Fatalf("expected trimmed pending queue length 3, got %d", len(trimmed))
+	}
+
+	safeWarning(nil, "ignored")
+	safeError(nil, "ignored")
+
+	p := &Process{}
+	if p.provider() != nil {
+		t.Fatal("nil source should return nil provider")
+	}
+	if p.backend() != nil {
+		t.Fatal("nil source should return nil backend")
+	}
+	if err := p.rebalance(); err != nil {
+		t.Fatalf("nil source rebalance should be a no-op, got %v", err)
+	}
+}
+
 func TestCronManagedSourceNilAndDefaults(t *testing.T) {
 	if NewManagedSource(nil, nil).Provider() != nil {
 		t.Fatal("nil provider should be returned as nil")

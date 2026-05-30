@@ -154,12 +154,29 @@ func (n *nodeImpl) ForwardCall(to string, msg any, opts ...ForwardOpts) (any, er
 	return res.response, res.err
 }
 
-func (n *nodeImpl) ForwardSpawnAndWait(fac gen.ProcessFactory, args ...any) error {
+func (n *nodeImpl) ForwardSpawn(name string, fac gen.ProcessFactory, args ...any) error {
 	ch := make(chan error, 1)
 	err := n.Send(n.route, messageSpawnProcess{
+		Name:    gen.Atom(name),
 		Factory: fac,
 		Options: gen.ProcessOptions{LinkParent: true},
 		Args:    args,
+		Ch:      ch,
+	})
+	if err != nil {
+		return err
+	}
+	return <-ch
+}
+
+func (n *nodeImpl) ForwardSpawnAndWait(name string, fac gen.ProcessFactory, args ...any) error {
+	ch := make(chan error, 1)
+	err := n.Send(n.route, messageSpawnProcess{
+		Name:    gen.Atom(name),
+		Factory: fac,
+		Options: gen.ProcessOptions{LinkParent: true},
+		Args:    args,
+		Wait:    true,
 		Ch:      ch,
 	})
 	if err != nil {

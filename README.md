@@ -172,7 +172,8 @@ The monitor request must be sent by the named process itself, not by a sidecar a
 
 ## Forwarding Notes
 
-- `app.SimpleNodeOptions.NodeForwardWorker` controls the size of the shared route worker pool used by `ForwardSend`, `ForwardCall`, `WaitPID`, and `ForwardSpawnAndWait`.
+- `app.SimpleNodeOptions.NodeForwardWorker` controls the size of the shared route worker pool used by `ForwardSend`, `ForwardCall`, `WaitPID`, `ForwardSpawn`, and `ForwardSpawnAndWait`.
+- `ForwardSpawn(name, factory, args...)` starts a process through the route worker. `ForwardSpawnAndWait(name, factory, args...)` also waits for it to exit. Pass a non-empty name to register the process immediately with whereis, or an empty name for an anonymous process.
 - The default is `128` so high-frequency forwarding does not serialize behind a small worker pool when directory lookups or remote delivery checks are slow.
 - `ForwardSend` keeps a short-lived route hint cache. A successful send can extend the hint a little, but cache misses or send failures fall back to `Locate` so stale routes do not live forever.
 - Lower the worker count only if you want to reduce background concurrency and the forwarding path is not a throughput bottleneck.
