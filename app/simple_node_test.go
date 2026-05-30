@@ -187,7 +187,7 @@ func TestWaitPIDUsesRouteActor(t *testing.T) {
 	}
 }
 
-func TestForwardSpawnAndWaitUsesRouteActor(t *testing.T) {
+func TestForwardSpawnReturnsPIDAndCanWaitWithRouteActor(t *testing.T) {
 	cluster := mem.NewCluster()
 	node, err := StartSimpleNode(SimpleNodeOptions{
 		NodeName:  "node-spawnwait@localhost",
@@ -203,14 +203,21 @@ func TestForwardSpawnAndWaitUsesRouteActor(t *testing.T) {
 
 	started := make(chan gen.PID, 1)
 	processName := "spawnwait-worker"
+	pid, err := node.ForwardSpawn(processName, func() gen.ProcessBehavior {
+		return &waitableActor{started: started}
+	})
+	if err != nil {
+		t.Fatalf("ForwardSpawn failed: %v", err)
+	}
+	if startedPID := <-started; startedPID != pid {
+		t.Fatalf("expected returned PID %v to match started PID %v", pid, startedPID)
+	}
+
 	done := make(chan error, 1)
 	go func() {
-		done <- node.ForwardSpawnAndWait(processName, func() gen.ProcessBehavior {
-			return &waitableActor{started: started}
-		})
+		done <- node.WaitPID(pid)
 	}()
 
-	pid := <-started
 	waitForProcessLocation(t, node, gen.Atom(processName), node.Name())
 	time.Sleep(100 * time.Millisecond)
 	if err := node.Send(pid, "stop"); err != nil {
@@ -218,7 +225,7 @@ func TestForwardSpawnAndWaitUsesRouteActor(t *testing.T) {
 	}
 
 	if err := <-done; err != nil {
-		t.Fatalf("ForwardSpawnAndWait failed: %v", err)
+		t.Fatalf("WaitPID failed: %v", err)
 	}
 }
 
@@ -238,13 +245,16 @@ func TestForwardSpawnUsesRouteActor(t *testing.T) {
 
 	started := make(chan gen.PID, 1)
 	processName := "spawn-worker"
-	if err := node.ForwardSpawn(processName, func() gen.ProcessBehavior {
+	pid, err := node.ForwardSpawn(processName, func() gen.ProcessBehavior {
 		return &waitableActor{started: started}
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("ForwardSpawn failed: %v", err)
 	}
 
-	pid := <-started
+	if startedPID := <-started; startedPID != pid {
+		t.Fatalf("expected returned PID %v to match started PID %v", pid, startedPID)
+	}
 	waitForProcessLocation(t, node, gen.Atom(processName), node.Name())
 	if err := node.Send(pid, "stop"); err != nil {
 		t.Fatalf("failed to stop spawned actor: %v", err)

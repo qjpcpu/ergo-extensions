@@ -26,11 +26,8 @@ type Node interface {
 	// ForwardSend sends a message to the named process on its current owner node.
 	ForwardSend(to string, msg any, opts ...ForwardOpts) error
 
-	// ForwardSpawn starts a process through the route worker and returns after spawn completes.
-	ForwardSpawn(name string, fac gen.ProcessFactory, args ...any) error
-
-	// ForwardSpawnAndWait starts a process through the route worker and waits until it exits.
-	ForwardSpawnAndWait(name string, fac gen.ProcessFactory, args ...any) error
+	// ForwardSpawn starts a process through the route worker and returns its PID.
+	ForwardSpawn(name string, fac gen.ProcessFactory, args ...any) (gen.PID, error)
 
 	// WaitPID waits until the given process exits.
 	WaitPID(pid gen.PID) error

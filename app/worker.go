@@ -60,8 +60,7 @@ type messageSpawnProcess struct {
 	Factory gen.ProcessFactory
 	Options gen.ProcessOptions
 	Args    []any
-	Wait    bool
-	Ch      chan error
+	Ch      chan nodeResult
 }
 
 type routeActor struct {
@@ -117,9 +116,9 @@ func (w *routeActor) HandleMessage(from gen.PID, message any) error {
 		}
 		w.monitorPID[e.PID] = e.Ch
 	case messageSpawnProcess:
-		sendResp := func(err error) {
+		sendResp := func(pid gen.PID, err error) {
 			if e.Ch != nil {
-				e.Ch <- err
+				e.Ch <- nodeResult{response: pid, err: err}
 			}
 		}
 		var pid gen.PID
@@ -130,7 +129,7 @@ func (w *routeActor) HandleMessage(from gen.PID, message any) error {
 			pid, err = w.Spawn(e.Factory, e.Options, e.Args...)
 		}
 		if err != nil {
-			sendResp(err)
+			sendResp(gen.PID{}, err)
 			return nil
 		}
 		if e.Name != "" {
@@ -139,19 +138,7 @@ func (w *routeActor) HandleMessage(from gen.PID, message any) error {
 				PID:  pid,
 			})
 		}
-		if !e.Wait {
-			sendResp(nil)
-			return nil
-		}
-		if e.Ch != nil {
-			err = w.MonitorPID(pid)
-			if err != nil {
-				w.Node().Kill(pid)
-				sendResp(err)
-				return nil
-			}
-			w.monitorPID[pid] = e.Ch
-		}
+		sendResp(pid, nil)
 	case gen.MessageDownPID:
 		if ch, ok := w.monitorPID[e.PID]; ok {
 			delete(w.monitorPID, e.PID)
