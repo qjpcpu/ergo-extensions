@@ -144,6 +144,38 @@ func TestRouteActorSendToNodeLocalAndRemote(t *testing.T) {
 	}
 }
 
+func TestRouteActorSendToPIDLocalAndRemote(t *testing.T) {
+	self := gen.Atom("node-a@localhost")
+	remote := gen.Atom("node-b@localhost")
+	actor, err := unit.Spawn(t, func() gen.ProcessBehavior {
+		return newRouteActor(system.NewAddressBook(), newRouteHintCache(0))
+	}, unit.WithNodeName(self))
+	if err != nil {
+		t.Fatalf("spawn route actor: %v", err)
+	}
+	route := actor.Behavior().(*routeActor)
+	actor.ClearEvents()
+
+	localPID := gen.PID{Node: self, ID: 1, Creation: 1}
+	if err := route.sendToPID(localPID, "local"); err != nil {
+		t.Fatalf("local PID send failed: %v", err)
+	}
+	actor.ShouldSend().
+		To(localPID).
+		Message("local").
+		Once().
+		Assert()
+
+	actor.ClearEvents()
+	remotePID := gen.PID{Node: remote, ID: 2, Creation: 1}
+	if err := route.sendToPID(remotePID, "remote"); err != nil {
+		t.Fatalf("remote PID send failed: %v", err)
+	}
+	if !hasImportantRouteSend(actor, remotePID, "remote") {
+		t.Fatalf("expected important remote PID send, events=%#v", actor.Events())
+	}
+}
+
 func TestRouteActorForwardSendUsesCacheAndBook(t *testing.T) {
 	self := gen.Atom("node-a@localhost")
 	remote := gen.Atom("node-b@localhost")
@@ -182,7 +214,7 @@ func TestRouteActorForwardSendUsesCacheAndBook(t *testing.T) {
 	}
 }
 
-func hasImportantRouteSend(actor *unit.TestActor, to gen.ProcessID, message any) bool {
+func hasImportantRouteSend(actor *unit.TestActor, to any, message any) bool {
 	for _, event := range actor.Events() {
 		send, ok := event.(unit.SendEvent)
 		if !ok || !send.Important || send.To != to {

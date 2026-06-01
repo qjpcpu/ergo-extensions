@@ -23,8 +23,14 @@ type Node interface {
 	// ForwardCall calls the named process on its current owner node.
 	ForwardCall(to string, msg any, opts ...ForwardOpts) (any, error)
 
+	// ForwardCallPID calls the process identified by PID.
+	ForwardCallPID(to gen.PID, msg any, opts ...ForwardOpts) (any, error)
+
 	// ForwardSend sends a message to the named process on its current owner node.
 	ForwardSend(to string, msg any, opts ...ForwardOpts) error
+
+	// ForwardSendPID sends a message to the process identified by PID.
+	ForwardSendPID(to gen.PID, msg any, opts ...ForwardOpts) error
 
 	// ForwardSpawn starts a process through the route worker and returns its PID.
 	ForwardSpawn(name string, fac gen.ProcessFactory, args ...any) (gen.PID, error)

@@ -137,12 +137,41 @@ func (n *nodeImpl) ForwardSend(to string, msg any, opts ...ForwardOpts) error {
 	return (<-ch).err
 }
 
+func (n *nodeImpl) ForwardSendPID(to gen.PID, msg any, opts ...ForwardOpts) error {
+	ch := make(chan nodeResult, 1)
+	err := n.Send(n.route, messagePIDSend{
+		to:  to,
+		msg: msg,
+		ch:  ch,
+	})
+	if err != nil {
+		return err
+	}
+	return (<-ch).err
+}
+
 func (n *nodeImpl) ForwardCall(to string, msg any, opts ...ForwardOpts) (any, error) {
 	ch := make(chan nodeResult, 1)
 	option := n.getOpts(opts...)
 	err := n.Send(n.route, messageNodeCall{
 		to:      to,
 		toNode:  option.Node,
+		msg:     msg,
+		timeout: option.Timeout,
+		ch:      ch,
+	})
+	if err != nil {
+		return nil, err
+	}
+	res := <-ch
+	return res.response, res.err
+}
+
+func (n *nodeImpl) ForwardCallPID(to gen.PID, msg any, opts ...ForwardOpts) (any, error) {
+	ch := make(chan nodeResult, 1)
+	option := n.getOpts(opts...)
+	err := n.Send(n.route, messagePIDCall{
+		to:      to,
 		msg:     msg,
 		timeout: option.Timeout,
 		ch:      ch,

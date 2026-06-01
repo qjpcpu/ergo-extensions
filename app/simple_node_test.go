@@ -238,6 +238,46 @@ func TestForwardSpawnReturnsPIDAndCanWaitWithRouteActor(t *testing.T) {
 	}
 }
 
+func TestForwardPIDUsesRouteActor(t *testing.T) {
+	cluster := mem.NewCluster()
+	node, err := StartSimpleNode(SimpleNodeOptions{
+		NodeName:  "node-forwardpid@localhost",
+		Port:      11008,
+		Cookie:    "test-cookie",
+		Registrar: mem.CreateWithCluster(cluster),
+	})
+	if err != nil {
+		t.Fatalf("failed to start node: %v", err)
+	}
+	defer node.Stop()
+	waitForAddressBook(t, node)
+
+	pid, err := node.Spawn(func() gen.ProcessBehavior { return &waitableActor{} }, gen.ProcessOptions{})
+	if err != nil {
+		t.Fatalf("failed to spawn actor: %v", err)
+	}
+
+	res, err := node.ForwardCallPID(pid, "ping", ForwardTimeout(1))
+	if err != nil {
+		t.Fatalf("ForwardCallPID failed: %v", err)
+	}
+	if res != "pong" {
+		t.Fatalf("expected pong, got %#v", res)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- node.WaitPID(pid)
+	}()
+
+	if err := node.ForwardSendPID(pid, "stop"); err != nil {
+		t.Fatalf("ForwardSendPID failed: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("WaitPID failed: %v", err)
+	}
+}
+
 func TestForwardSpawnUsesRouteActor(t *testing.T) {
 	cluster := mem.NewCluster()
 	node, err := StartSimpleNode(SimpleNodeOptions{
@@ -311,4 +351,11 @@ func (a *waitableActor) HandleMessage(from gen.PID, message any) error {
 		return gen.TerminateReasonNormal
 	}
 	return nil
+}
+
+func (a *waitableActor) HandleCall(from gen.PID, ref gen.Ref, request any) (any, error) {
+	if msg, ok := request.(string); ok && msg == "ping" {
+		return "pong", nil
+	}
+	return nil, nil
 }

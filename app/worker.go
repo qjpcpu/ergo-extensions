@@ -50,6 +50,19 @@ type messageNodeCall struct {
 	ch      chan nodeResult
 }
 
+type messagePIDSend struct {
+	to  gen.PID
+	msg any
+	ch  chan nodeResult
+}
+
+type messagePIDCall struct {
+	to      gen.PID
+	msg     any
+	timeout int
+	ch      chan nodeResult
+}
+
 type messageWaitProcess struct {
 	PID gen.PID
 	Ch  chan error
@@ -86,6 +99,8 @@ func (w *routeActor) HandleMessage(from gen.PID, message any) error {
 	switch e := message.(type) {
 	case messageNodeSend:
 		e.ch <- nodeResult{err: w.forwardSend(e.to, e.toNode, e.msg)}
+	case messagePIDSend:
+		e.ch <- nodeResult{err: w.sendToPID(e.to, e.msg)}
 	case messageNodeCall:
 		var res any
 		var err error
@@ -108,6 +123,9 @@ func (w *routeActor) HandleMessage(from gen.PID, message any) error {
 				res, err = w.CallImportant(gen.ProcessID{Node: p, Name: gen.Atom(e.to)}, e.msg)
 			}
 		}
+		e.ch <- nodeResult{response: res, err: err}
+	case messagePIDCall:
+		res, err := w.CallPID(e.to, e.msg, e.timeout)
 		e.ch <- nodeResult{response: res, err: err}
 	case messageWaitProcess:
 		if err := w.MonitorPID(e.PID); err != nil {
@@ -187,6 +205,13 @@ func (w *routeActor) sendToNode(to string, node gen.Atom, msg any) error {
 		return w.Send(process, msg)
 	}
 	return w.SendImportant(gen.ProcessID{Node: node, Name: process}, msg)
+}
+
+func (w *routeActor) sendToPID(to gen.PID, msg any) error {
+	if to.Node == w.Node().Name() {
+		return w.Send(to, msg)
+	}
+	return w.SendImportant(to, msg)
 }
 
 type nodeResult struct {
