@@ -3,6 +3,7 @@ package app
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"ergo.services/ergo/gen"
 	"ergo.services/ergo/testing/unit"
@@ -192,7 +193,7 @@ func TestRouteActorSendToPIDLocalAndRemote(t *testing.T) {
 	}
 }
 
-func TestRouteActorForwardSendUsesCacheAndBook(t *testing.T) {
+func TestRouteActorForwardSendUsesBookForRegularSend(t *testing.T) {
 	self := gen.Atom("node-a@localhost")
 	remote := gen.Atom("node-b@localhost")
 	book := system.NewAddressBook()
@@ -217,16 +218,66 @@ func TestRouteActorForwardSendUsesCacheAndBook(t *testing.T) {
 		t.Fatalf("expected remote forward send, events=%#v", actor.Events())
 	}
 
+	route.hints.set("worker", self, time.Now())
 	actor.ClearEvents()
-	if err := route.forwardSend("worker", "", "cached", false); err != nil {
-		t.Fatalf("cached forward send failed: %v", err)
+	if err := route.forwardSend("worker", "", "stale-hint", false); err != nil {
+		t.Fatalf("forward send with stale hint failed: %v", err)
 	}
-	if !hasRouteSend(actor, gen.ProcessID{Node: remote, Name: "worker"}, "cached", false) {
-		t.Fatalf("expected cached remote forward send, events=%#v", actor.Events())
+	if !hasRouteSend(actor, gen.ProcessID{Node: remote, Name: "worker"}, "stale-hint", false) {
+		t.Fatalf("expected regular send to ignore stale hint, events=%#v", actor.Events())
 	}
 
 	if err := route.forwardSend("missing", "", "nope", false); !errors.Is(err, gen.ErrProcessUnknown) {
 		t.Fatalf("expected ErrProcessUnknown, got %v", err)
+	}
+}
+
+func TestRouteActorForwardImportantSendUsesCache(t *testing.T) {
+	self := gen.Atom("node-a@localhost")
+	remote := gen.Atom("node-b@localhost")
+	book := system.NewAddressBook()
+	if err := book.SetAvailableNodes(system.NewNodeList(self, remote)); err != nil {
+		t.Fatalf("set nodes: %v", err)
+	}
+	if err := book.AddProcess(remote, system.ProcessInfo{Name: "worker", Node: remote}); err != nil {
+		t.Fatalf("add process: %v", err)
+	}
+	actor, err := unit.Spawn(t, func() gen.ProcessBehavior {
+		return newRouteActor(book, newRouteHintCache(0))
+	}, unit.WithNodeName(self))
+	if err != nil {
+		t.Fatalf("spawn route actor: %v", err)
+	}
+	route := actor.Behavior().(*routeActor)
+
+	route.hints.set("worker", self, time.Now())
+	if err := route.forwardSend("worker", "", "important-cached", true); err != nil {
+		t.Fatalf("important cached forward send failed: %v", err)
+	}
+	if !hasRouteSend(actor, gen.Atom("worker"), "important-cached", true) {
+		t.Fatalf("expected important send to use cached node, events=%#v", actor.Events())
+	}
+}
+
+func TestRouteActorImportantCallPreservesTimeout(t *testing.T) {
+	actor, err := unit.Spawn(t, func() gen.ProcessBehavior {
+		return newRouteActor(system.NewAddressBook(), newRouteHintCache(0))
+	}, unit.WithNodeName("node-a@localhost"))
+	if err != nil {
+		t.Fatalf("spawn route actor: %v", err)
+	}
+	route := actor.Behavior().(*routeActor)
+	actor.ClearEvents()
+
+	to := gen.ProcessID{Node: "node-b@localhost", Name: "worker"}
+	if _, err := route.callImportantWithTimeout(to, "ping", 7); err != nil {
+		t.Fatalf("important call failed: %v", err)
+	}
+	if route.ImportantDelivery() {
+		t.Fatal("important delivery flag was not restored")
+	}
+	if !hasRouteCallWithTimeout(actor, to, "ping", 7) {
+		t.Fatalf("expected call with timeout, events=%#v", actor.Events())
 	}
 }
 
@@ -237,6 +288,19 @@ func hasRouteSend(actor *unit.TestActor, to any, message any, important bool) bo
 			continue
 		}
 		if send.Message == message {
+			return true
+		}
+	}
+	return false
+}
+
+func hasRouteCallWithTimeout(actor *unit.TestActor, to any, request any, timeout int) bool {
+	for _, event := range actor.Events() {
+		call, ok := event.(unit.CallEvent)
+		if !ok || call.To != to {
+			continue
+		}
+		if call.Request == request && call.Timeout == timeout {
 			return true
 		}
 	}

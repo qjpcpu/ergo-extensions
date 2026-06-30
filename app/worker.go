@@ -116,7 +116,7 @@ func (w *routeActor) HandleMessage(from gen.PID, message any) error {
 		}
 		if err != nil || p == "" || w.Node().Name() == p {
 			if e.important {
-				res, err = w.CallImportant(gen.Atom(e.to), e.msg)
+				res, err = w.callImportantWithTimeout(gen.Atom(e.to), e.msg, e.timeout)
 			} else if e.timeout > 0 {
 				res, err = w.CallWithTimeout(gen.Atom(e.to), e.msg, e.timeout)
 			} else {
@@ -124,7 +124,7 @@ func (w *routeActor) HandleMessage(from gen.PID, message any) error {
 			}
 		} else {
 			if e.important {
-				res, err = w.CallImportant(gen.ProcessID{Node: p, Name: gen.Atom(e.to)}, e.msg)
+				res, err = w.callImportantWithTimeout(gen.ProcessID{Node: p, Name: gen.Atom(e.to)}, e.msg, e.timeout)
 			} else if e.timeout > 0 {
 				res, err = w.CallWithTimeout(gen.ProcessID{Node: p, Name: gen.Atom(e.to)}, e.msg, e.timeout)
 			} else {
@@ -185,12 +185,14 @@ func (w *routeActor) forwardSend(to string, node gen.Atom, msg any, important bo
 	}
 	process := gen.Atom(to)
 	now := time.Now()
-	if cachedNode, ok := w.hints.get(process, now); ok {
-		if err := w.sendToNode(to, cachedNode, msg, important); err == nil {
-			w.hints.touch(process, cachedNode, now)
-			return nil
+	if important {
+		if cachedNode, ok := w.hints.get(process, now); ok {
+			if err := w.sendToNode(to, cachedNode, msg, true); err == nil {
+				w.hints.touch(process, cachedNode, now)
+				return nil
+			}
+			w.hints.invalidate(process)
 		}
-		w.hints.invalidate(process)
 	}
 	resolvedNode, err := w.book.QueryBy(w, system.QueryOption{}).Locate(process)
 	if err != nil {
@@ -233,9 +235,23 @@ func (w *routeActor) sendToPID(to gen.PID, msg any, important bool) error {
 
 func (w *routeActor) callPID(to gen.PID, msg any, timeout int, important bool) (any, error) {
 	if important {
-		return w.CallImportant(to, msg)
+		return w.callImportantWithTimeout(to, msg, timeout)
 	}
 	return w.CallPID(to, msg, timeout)
+}
+
+func (w *routeActor) callImportantWithTimeout(to any, msg any, timeout int) (any, error) {
+	prev := w.ImportantDelivery()
+	if err := w.SetImportantDelivery(true); err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = w.SetImportantDelivery(prev)
+	}()
+	if timeout > 0 {
+		return w.CallWithTimeout(to, msg, timeout)
+	}
+	return w.Call(to, msg)
 }
 
 type nodeResult struct {
