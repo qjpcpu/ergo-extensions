@@ -70,8 +70,9 @@ type SimpleNodeOptions struct {
 
 type ForwardOpts func(*forwardopts)
 type forwardopts struct {
-	Timeout int
-	Node    gen.Atom
+	Timeout   int
+	Node      gen.Atom
+	Important bool
 }
 
 func ForwardTimeout(t int) ForwardOpts {
@@ -80,4 +81,8 @@ func ForwardTimeout(t int) ForwardOpts {
 
 func ForwardNode(t gen.Atom) ForwardOpts {
 	return func(o *forwardopts) { o.Node = t }
+}
+
+func ForwardImportant() ForwardOpts {
+	return func(o *forwardopts) { o.Important = true }
 }

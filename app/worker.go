@@ -36,31 +36,35 @@ func (p *myPool) Init(args ...any) (act.PoolOptions, error) {
 }
 
 type messageNodeSend struct {
-	to     string
-	toNode gen.Atom
-	msg    any
-	ch     chan nodeResult
+	to        string
+	toNode    gen.Atom
+	msg       any
+	important bool
+	ch        chan nodeResult
 }
 
 type messageNodeCall struct {
-	to      string
-	toNode  gen.Atom
-	msg     any
-	timeout int
-	ch      chan nodeResult
+	to        string
+	toNode    gen.Atom
+	msg       any
+	timeout   int
+	important bool
+	ch        chan nodeResult
 }
 
 type messagePIDSend struct {
-	to  gen.PID
-	msg any
-	ch  chan nodeResult
+	to        gen.PID
+	msg       any
+	important bool
+	ch        chan nodeResult
 }
 
 type messagePIDCall struct {
-	to      gen.PID
-	msg     any
-	timeout int
-	ch      chan nodeResult
+	to        gen.PID
+	msg       any
+	timeout   int
+	important bool
+	ch        chan nodeResult
 }
 
 type messageWaitProcess struct {
@@ -98,9 +102,9 @@ func (w *routeActor) Init(args ...any) error {
 func (w *routeActor) HandleMessage(from gen.PID, message any) error {
 	switch e := message.(type) {
 	case messageNodeSend:
-		e.ch <- nodeResult{err: w.forwardSend(e.to, e.toNode, e.msg)}
+		e.ch <- nodeResult{err: w.forwardSend(e.to, e.toNode, e.msg, e.important)}
 	case messagePIDSend:
-		e.ch <- nodeResult{err: w.sendToPID(e.to, e.msg)}
+		e.ch <- nodeResult{err: w.sendToPID(e.to, e.msg, e.important)}
 	case messageNodeCall:
 		var res any
 		var err error
@@ -111,21 +115,25 @@ func (w *routeActor) HandleMessage(from gen.PID, message any) error {
 			p, err = w.book.QueryBy(w, system.QueryOption{Timeout: e.timeout}).Locate(gen.Atom(e.to))
 		}
 		if err != nil || p == "" || w.Node().Name() == p {
-			if e.timeout > 0 {
+			if e.important {
+				res, err = w.CallImportant(gen.Atom(e.to), e.msg)
+			} else if e.timeout > 0 {
 				res, err = w.CallWithTimeout(gen.Atom(e.to), e.msg, e.timeout)
 			} else {
 				res, err = w.Call(gen.Atom(e.to), e.msg)
 			}
 		} else {
-			if e.timeout > 0 {
+			if e.important {
+				res, err = w.CallImportant(gen.ProcessID{Node: p, Name: gen.Atom(e.to)}, e.msg)
+			} else if e.timeout > 0 {
 				res, err = w.CallWithTimeout(gen.ProcessID{Node: p, Name: gen.Atom(e.to)}, e.msg, e.timeout)
 			} else {
-				res, err = w.CallImportant(gen.ProcessID{Node: p, Name: gen.Atom(e.to)}, e.msg)
+				res, err = w.Call(gen.ProcessID{Node: p, Name: gen.Atom(e.to)}, e.msg)
 			}
 		}
 		e.ch <- nodeResult{response: res, err: err}
 	case messagePIDCall:
-		res, err := w.CallPID(e.to, e.msg, e.timeout)
+		res, err := w.callPID(e.to, e.msg, e.timeout, e.important)
 		e.ch <- nodeResult{response: res, err: err}
 	case messageWaitProcess:
 		if err := w.MonitorPID(e.PID); err != nil {
@@ -171,14 +179,14 @@ func (w *routeActor) HandleMessage(from gen.PID, message any) error {
 	return nil
 }
 
-func (w *routeActor) forwardSend(to string, node gen.Atom, msg any) error {
+func (w *routeActor) forwardSend(to string, node gen.Atom, msg any, important bool) error {
 	if node != "" {
-		return w.sendToNode(to, node, msg)
+		return w.sendToNode(to, node, msg, important)
 	}
 	process := gen.Atom(to)
 	now := time.Now()
 	if cachedNode, ok := w.hints.get(process, now); ok {
-		if err := w.sendToNode(to, cachedNode, msg); err == nil {
+		if err := w.sendToNode(to, cachedNode, msg, important); err == nil {
 			w.hints.touch(process, cachedNode, now)
 			return nil
 		}
@@ -191,7 +199,7 @@ func (w *routeActor) forwardSend(to string, node gen.Atom, msg any) error {
 	if resolvedNode == "" {
 		return gen.ErrProcessUnknown
 	}
-	if err := w.sendToNode(to, resolvedNode, msg); err != nil {
+	if err := w.sendToNode(to, resolvedNode, msg, important); err != nil {
 		w.hints.invalidate(process)
 		return err
 	}
@@ -199,19 +207,35 @@ func (w *routeActor) forwardSend(to string, node gen.Atom, msg any) error {
 	return nil
 }
 
-func (w *routeActor) sendToNode(to string, node gen.Atom, msg any) error {
+func (w *routeActor) sendToNode(to string, node gen.Atom, msg any, important bool) error {
 	process := gen.Atom(to)
+	if important {
+		if node == w.Node().Name() {
+			return w.SendImportant(process, msg)
+		}
+		return w.SendImportant(gen.ProcessID{Node: node, Name: process}, msg)
+	}
 	if node == w.Node().Name() {
 		return w.Send(process, msg)
 	}
-	return w.SendImportant(gen.ProcessID{Node: node, Name: process}, msg)
+	return w.Send(gen.ProcessID{Node: node, Name: process}, msg)
 }
 
-func (w *routeActor) sendToPID(to gen.PID, msg any) error {
+func (w *routeActor) sendToPID(to gen.PID, msg any, important bool) error {
+	if important {
+		return w.SendImportant(to, msg)
+	}
 	if to.Node == w.Node().Name() {
 		return w.Send(to, msg)
 	}
-	return w.SendImportant(to, msg)
+	return w.Send(to, msg)
+}
+
+func (w *routeActor) callPID(to gen.PID, msg any, timeout int, important bool) (any, error) {
+	if important {
+		return w.CallImportant(to, msg)
+	}
+	return w.CallPID(to, msg, timeout)
 }
 
 type nodeResult struct {

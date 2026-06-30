@@ -270,6 +270,7 @@ func TestForwardPIDUsesRouteActor(t *testing.T) {
 		done <- node.WaitPID(pid)
 	}()
 
+	time.Sleep(100 * time.Millisecond)
 	if err := node.ForwardSendPID(pid, "stop"); err != nil {
 		t.Fatalf("ForwardSendPID failed: %v", err)
 	}

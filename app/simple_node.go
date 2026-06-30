@@ -126,10 +126,11 @@ func (n *nodeImpl) ForwardSend(to string, msg any, opts ...ForwardOpts) error {
 	ch := make(chan nodeResult, 1)
 	option := n.getOpts(opts...)
 	err := n.Send(n.route, messageNodeSend{
-		to:     to,
-		toNode: option.Node,
-		msg:    msg,
-		ch:     ch,
+		to:        to,
+		toNode:    option.Node,
+		msg:       msg,
+		important: option.Important,
+		ch:        ch,
 	})
 	if err != nil {
 		return err
@@ -139,10 +140,12 @@ func (n *nodeImpl) ForwardSend(to string, msg any, opts ...ForwardOpts) error {
 
 func (n *nodeImpl) ForwardSendPID(to gen.PID, msg any, opts ...ForwardOpts) error {
 	ch := make(chan nodeResult, 1)
+	option := n.getOpts(opts...)
 	err := n.Send(n.route, messagePIDSend{
-		to:  to,
-		msg: msg,
-		ch:  ch,
+		to:        to,
+		msg:       msg,
+		important: option.Important,
+		ch:        ch,
 	})
 	if err != nil {
 		return err
@@ -154,11 +157,12 @@ func (n *nodeImpl) ForwardCall(to string, msg any, opts ...ForwardOpts) (any, er
 	ch := make(chan nodeResult, 1)
 	option := n.getOpts(opts...)
 	err := n.Send(n.route, messageNodeCall{
-		to:      to,
-		toNode:  option.Node,
-		msg:     msg,
-		timeout: option.Timeout,
-		ch:      ch,
+		to:        to,
+		toNode:    option.Node,
+		msg:       msg,
+		timeout:   option.Timeout,
+		important: option.Important,
+		ch:        ch,
 	})
 	if err != nil {
 		return nil, err
@@ -171,10 +175,11 @@ func (n *nodeImpl) ForwardCallPID(to gen.PID, msg any, opts ...ForwardOpts) (any
 	ch := make(chan nodeResult, 1)
 	option := n.getOpts(opts...)
 	err := n.Send(n.route, messagePIDCall{
-		to:      to,
-		msg:     msg,
-		timeout: option.Timeout,
-		ch:      ch,
+		to:        to,
+		msg:       msg,
+		timeout:   option.Timeout,
+		important: option.Important,
+		ch:        ch,
 	})
 	if err != nil {
 		return nil, err

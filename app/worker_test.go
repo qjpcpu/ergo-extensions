@@ -126,7 +126,7 @@ func TestRouteActorSendToNodeLocalAndRemote(t *testing.T) {
 	route := actor.Behavior().(*routeActor)
 	actor.ClearEvents()
 
-	if err := route.sendToNode("worker", self, "local"); err != nil {
+	if err := route.sendToNode("worker", self, "local", false); err != nil {
 		t.Fatalf("local send failed: %v", err)
 	}
 	actor.ShouldSend().
@@ -136,10 +136,18 @@ func TestRouteActorSendToNodeLocalAndRemote(t *testing.T) {
 		Assert()
 
 	actor.ClearEvents()
-	if err := route.sendToNode("worker", remote, "remote"); err != nil {
+	if err := route.sendToNode("worker", remote, "remote", false); err != nil {
 		t.Fatalf("remote send failed: %v", err)
 	}
-	if !hasImportantRouteSend(actor, gen.ProcessID{Node: remote, Name: "worker"}, "remote") {
+	if !hasRouteSend(actor, gen.ProcessID{Node: remote, Name: "worker"}, "remote", false) {
+		t.Fatalf("expected regular remote send, events=%#v", actor.Events())
+	}
+
+	actor.ClearEvents()
+	if err := route.sendToNode("worker", remote, "important", true); err != nil {
+		t.Fatalf("important remote send failed: %v", err)
+	}
+	if !hasRouteSend(actor, gen.ProcessID{Node: remote, Name: "worker"}, "important", true) {
 		t.Fatalf("expected important remote send, events=%#v", actor.Events())
 	}
 }
@@ -157,7 +165,7 @@ func TestRouteActorSendToPIDLocalAndRemote(t *testing.T) {
 	actor.ClearEvents()
 
 	localPID := gen.PID{Node: self, ID: 1, Creation: 1}
-	if err := route.sendToPID(localPID, "local"); err != nil {
+	if err := route.sendToPID(localPID, "local", false); err != nil {
 		t.Fatalf("local PID send failed: %v", err)
 	}
 	actor.ShouldSend().
@@ -168,10 +176,18 @@ func TestRouteActorSendToPIDLocalAndRemote(t *testing.T) {
 
 	actor.ClearEvents()
 	remotePID := gen.PID{Node: remote, ID: 2, Creation: 1}
-	if err := route.sendToPID(remotePID, "remote"); err != nil {
+	if err := route.sendToPID(remotePID, "remote", false); err != nil {
 		t.Fatalf("remote PID send failed: %v", err)
 	}
-	if !hasImportantRouteSend(actor, remotePID, "remote") {
+	if !hasRouteSend(actor, remotePID, "remote", false) {
+		t.Fatalf("expected regular remote PID send, events=%#v", actor.Events())
+	}
+
+	actor.ClearEvents()
+	if err := route.sendToPID(remotePID, "important", true); err != nil {
+		t.Fatalf("important remote PID send failed: %v", err)
+	}
+	if !hasRouteSend(actor, remotePID, "important", true) {
 		t.Fatalf("expected important remote PID send, events=%#v", actor.Events())
 	}
 }
@@ -194,30 +210,30 @@ func TestRouteActorForwardSendUsesCacheAndBook(t *testing.T) {
 	}
 	route := actor.Behavior().(*routeActor)
 
-	if err := route.forwardSend("worker", "", "first"); err != nil {
+	if err := route.forwardSend("worker", "", "first", false); err != nil {
 		t.Fatalf("forward send failed: %v", err)
 	}
-	if !hasImportantRouteSend(actor, gen.ProcessID{Node: remote, Name: "worker"}, "first") {
+	if !hasRouteSend(actor, gen.ProcessID{Node: remote, Name: "worker"}, "first", false) {
 		t.Fatalf("expected remote forward send, events=%#v", actor.Events())
 	}
 
 	actor.ClearEvents()
-	if err := route.forwardSend("worker", "", "cached"); err != nil {
+	if err := route.forwardSend("worker", "", "cached", false); err != nil {
 		t.Fatalf("cached forward send failed: %v", err)
 	}
-	if !hasImportantRouteSend(actor, gen.ProcessID{Node: remote, Name: "worker"}, "cached") {
+	if !hasRouteSend(actor, gen.ProcessID{Node: remote, Name: "worker"}, "cached", false) {
 		t.Fatalf("expected cached remote forward send, events=%#v", actor.Events())
 	}
 
-	if err := route.forwardSend("missing", "", "nope"); !errors.Is(err, gen.ErrProcessUnknown) {
+	if err := route.forwardSend("missing", "", "nope", false); !errors.Is(err, gen.ErrProcessUnknown) {
 		t.Fatalf("expected ErrProcessUnknown, got %v", err)
 	}
 }
 
-func hasImportantRouteSend(actor *unit.TestActor, to any, message any) bool {
+func hasRouteSend(actor *unit.TestActor, to any, message any, important bool) bool {
 	for _, event := range actor.Events() {
 		send, ok := event.(unit.SendEvent)
-		if !ok || !send.Important || send.To != to {
+		if !ok || send.Important != important || send.To != to {
 			continue
 		}
 		if send.Message == message {
