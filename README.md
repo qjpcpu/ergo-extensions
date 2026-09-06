@@ -1,189 +1,143 @@
-# Ergo Extensions (system)
+# Ergo Extensions v2
 
-This repository provides a small set of building blocks to add distributed process discovery and daemon orchestration to an Ergo-based cluster. The `system` package contains the main runtime processes, and the `app` package provides helpers to start a node with them wired in.
+Ergo Extensions v2 provides leased actor routing, registrar-backed membership, daemon recovery, and distributed cron scheduling for `ergo.services/ergo v1.999.320`. It requires Go 1.24 or later. The root module remains v1; see [README-v1.md](README-v1.md).
 
-For a shorter architecture reference, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-
-## Requirements
-
-- `ergo.services/ergo v1.999.320`
-- A network registrar implementation (e.g. ZooKeeper via `github.com/qjpcpu/registrar/zk`).
-
-`app.StartSimpleNode` uses ZooKeeper when `SimpleNodeOptions.Endpoints` is set, a custom registrar when `SimpleNodeOptions.Registrar` is provided, and the built-in in-memory registrar otherwise.
-
-## Install
-
-```bash
-go get github.com/qjpcpu/ergo-extensions@latest
+```sh
+go get github.com/qjpcpu/ergo-extensions/v2@latest
 ```
 
-Import the system package:
+## Start a node
+
+Supply an Ergo registrar and a shared actor-route persistence implementation:
 
 ```go
-import "github.com/qjpcpu/ergo-extensions/system"
-```
-
-## Quick Start
-
-1) Add the supervisor to your application members:
-
-```go
-spec := gen.ApplicationSpec{
-    Members: []gen.ApplicationMemberSpec{
-        system.ApplicationMemberSpec(system.ApplicationMemberSpecOptions{}),
-    },
-}
-// Wire this application spec into your Ergo node environment/startup as usual.
-```
-
-Or start a node with everything wired in (uses ZooKeeper registrar when `Endpoints` is set; otherwise uses `Registrar` when provided; otherwise falls back to an in-memory single-node registrar):
-
-```go
-provider := cron.NewStaticSource(128,
-    cron.JobSpec{
-        ID:             "job.ping",
-        ShardKey:       "job.ping",
-        Schedule:       "* * * * *",
-        Location:       cron.LocationUTC,
-        TriggerProcess: gen.Atom("ping"),
-    },
+import (
+    "context"
+    "ergo.services/ergo/gen"
+    "github.com/qjpcpu/ergo-extensions/v2/app"
+    "github.com/qjpcpu/ergo-extensions/v2/system"
+    redisregistrar "github.com/qjpcpu/registrar/redis"
 )
-store := cron.NewMemoryKVStore()
-source := cron.NewManagedSource(provider, store)
 
-n, err := app.StartSimpleNode(app.SimpleNodeOptions{
-    NodeName: "node-1",
-    Options: zk.Options{
-        Endpoints: []string{"127.0.0.1:2181"},
-    },
-    CronSource: source,
-    CronSchedulerOptions: cron.SchedulerOptions{
-        ShardCount: 128,
-    },
-    WhereIsOptions: system.WhereIsOptions{
-        SyncInterval: time.Second * 2,
-    },
+registrar, err := redisregistrar.Create(redisregistrar.Options{
+    Endpoints: []string{"redis:6379"},
+    Cluster: "orders",
 })
-_ = n
-_ = err
+if err != nil { return err }
+
+node, err := app.StartSimpleNode(app.SimpleNodeOptions{
+    NodeName: "orders-1@orders-1",
+    AdvertiseHost: "orders-1",
+    Registrar: registrar,
+    ActorRoutePersistence: routeStore,
+})
+if err != nil { return err }
+defer node.Stop()
+
+routes := node.ActorRoutes()
+_, err = node.Spawn(func() gen.ProcessBehavior {
+    return routes.WithActorRoute("orders/42", &orderWorker{})
+}, gen.ProcessOptions{})
+if err != nil { return err }
+
+pid, found, err := routes.Locate(context.Background(), "orders/42")
+if err != nil { return err }
+if !found { return gen.ErrProcessUnknown }
+return node.Send(pid, ProcessOrder{OrderID: "A-100"})
 ```
 
-2) Register a launcher for your daemon processes (during init or startup):
+The example uses application-defined `routeStore`, `orderWorker`, and `ProcessOrder`. A complete executable example is in [v2/examples/basic](v2/examples/basic/main.go).
+
+`StartSimpleNode` creates, binds, and closes one router per node. `ActorRoutes()` provides lookup, behavior decorators, and lease statistics; `Topology()` provides the immutable node set, version, and consistent-hash placement.
+
+Use `WithActorRoute`, `WithSupervisorRoute`, or `WithPoolRoute` inside a factory to give each spawn its own wrapper and behavior.
+
+## Persistence contract
+
+Implement all five operations in the shared backend:
 
 ```go
-var WorkerLauncher = system.Launcher{
-    Factory: func() gen.ProcessBehavior { return &Worker{} },
-    Option:  gen.ProcessOptions{EnableRemote: true},
-    RecoveryScanner: func() system.DaemonIterator {
-        // Provide desired daemons to recover when the cluster leader starts/restarts.
-        jobs := []system.DaemonProcess{
-            {ProcessName: gen.Atom("worker.A")},
-            {ProcessName: gen.Atom("worker.B")},
-        }
-        i := 0
-        return func() ([]system.DaemonProcess, bool, error) {
-            if i == 0 {
-                i++
-                return jobs, false, nil
-            }
-            return nil, false, nil
-        }
-    },
+type ActorRoutePersistence interface {
+    Acquire(ctx context.Context, key gen.Atom, pid gen.PID, ttl time.Duration) (bool, error)
+    Replace(ctx context.Context, key gen.Atom, old, pid gen.PID, ttl time.Duration) (bool, error)
+    Renew(ctx context.Context, key gen.Atom, pid gen.PID, ttl time.Duration) (bool, error)
+    Release(ctx context.Context, key gen.Atom, pid gen.PID) error
+    Lookup(ctx context.Context, key gen.Atom) (gen.PID, bool, error)
 }
-
-func init() {
-    _ = system.RegisterLauncher(gen.Atom("worker"), WorkerLauncher)
-}
 ```
 
-3) Spawn a named daemon using a `Spawner`:
+Operations must be concurrent-safe and honor context cancellation and deadlines. Store the full PID, including creation, in a shared namespace.
+
+- `Acquire` succeeds for an absent/expired lease or the same owner. Another live lease returns `false, nil`.
+- `Replace` atomically compares the existing full PID with `old` and replaces it with `pid` and a fresh TTL. An absent key or a different owner returns `false, nil`. Implement this as one conditional storage operation, not separate release and acquire calls.
+- `Renew` extends only a live lease belonging to the exact PID.
+- `Release` deletes only the exact PID's lease and is idempotent.
+- `Lookup` treats absent and expired leases as not found.
+
+When Acquire conflicts, the router can replace an exited local PID after its business cleanup completes. For a remote owner, the router queries the registrar's current `Nodes()` result. Absence means offline and permits replacement before TTL expiry. Registrar query errors are returned to the caller; the AddressBook cache does not authorize takeover.
+
+Existing persistence implementations must add `Replace` before adopting this version.
+
+## Lifecycle and lease timing
+
+The wrapper acquires and starts renewing its route before business initialization. A conflict therefore fails before business Init executes. During initialization, messages can reach the Ergo mailbox; business processing starts after Init succeeds. Init failures run business termination cleanup and release the lease. A spawn timeout does not cancel a running user Init callback.
+
+On termination, renewal continues while business cleanup runs. The wrapper then queues the conditional release. Failed or dropped releases expire through TTL, and offline nodes can be taken over earlier through the registrar rule above.
+
+Each node uses one sharded timing wheel and a fixed worker pool. Renewals are individual storage operations. Default timing remains TTL 30 seconds, renewal interval 10 seconds, and operation timeout 3 seconds. Larger deployments can use longer TTLs together with longer renewal intervals, sized from measured latency and actor counts. Steady renewal demand is approximately `routed actors / renewal interval` per node. Increasing TTL alone does not reduce that demand.
+
+`ActorRoutes().Stats()` exposes tracked leases, queue depths, maximum observed renewal scheduling delay, renewal/release failures, lease losses, and dropped releases. Release work gets priority in bounded bursts so renewals can progress.
+
+When Renew reports that the PID no longer owns its lease, the router kills that exact actor incarnation and runs its existing termination lifecycle. Daemons then recover through their exit hook. Temporary storage errors retry without killing the actor. Termination cannot undo external work already performed.
+
+Shutdown allows business cleanup callbacks one operation-timeout budget, waits for current worker operations, and drains queued releases with another operation-timeout budget. Persistence methods must honor their contexts. Any remaining cleanup falls back to expiration. Custom bootstrap must stop its node before calling `router.Close()`.
+
+## Sending and calling
 
 ```go
-sp := system.NewSpawner(self, gen.Atom("worker"))
-pid, err := sp.SpawnRegister(gen.Atom("worker.A"), /* args... */)
+err := node.ForwardSend("orders/42", ProcessOrder{OrderID: "A-101"}, app.ForwardImportant())
+reply, err := node.ForwardCall("orders/42", GetOrder{OrderID: "A-101"}, app.ForwardTimeout(5))
 ```
 
-`SpawnRegister` through `system.NewSpawner` publishes a fast local whereis
-registration after the actor starts. If you spawn a named actor directly, send
-the same fast-path update yourself so callers do not have to wait for the
-periodic whereis scan:
+Forwarding resolves full PIDs through persistence. `ForwardNode(name)` addresses a registered process on a specific node. PID variants skip lookup.
+
+`ForwardTimeout` bounds queue wait, lookup, and delivery/call from the caller's perspective; the default is Ergo's 5-second request timeout. `ForwardContext(ctx)` supplies cancellation or an earlier deadline. Expired queued requests are discarded. Once a message has been sent or Init has begun, caller timeout does not undo the operation. Ergo's internal call timeouts have integer-second granularity, so a worker can finish later than its caller's deadline.
+
+`ForwardSpawn` uses the same default total timeout; decorate its factory if the process needs a route. `WaitPID` waits for process exit or node shutdown. Forwarding defaults to 128 workers, shared by sends and calls.
+
+Native `actor.Send("name", message)` still addresses a local process name. Use a resolved PID or `app.NewCaller(process, node.ActorRoutes())` for global routing from a business actor. `Caller.Send` uses the process delivery settings; ordinary remote sends do not confirm mailbox receipt. Use `Caller.SendImportant` for explicit mailbox delivery confirmation. Important delivery confirms mailbox routing, not completion of business processing.
+
+## Daemons
 
 ```go
-pid, err := self.SpawnRegister(gen.Atom("worker.A"), factory, options, args...)
-if err != nil { /* handle */ }
-_ = self.Send(system.WhereIsProcess, system.MessageRegisterLocalProcess{
-    Name: gen.Atom("worker.A"),
-    PID:  pid,
+err := system.RegisterLauncher("worker", system.Launcher{
+    Factory: func() gen.ProcessBehavior { return &worker{} },
+    RecoveryScanner: system.SingletonDaemon("worker/A", []any{"configuration"}),
 })
 ```
 
-For actors that go up and down quickly, send a fast local unregister before
-the actor exits or before you kill it. This only updates whereis; it does not
-stop the actor:
+Register launchers before starting the node. The leader rotates through one page per launcher and sends launches directly to the consistent-hash target. `DaemonOptions.ScanBatchSize` defaults to 32; `MaxInFlight` defaults to 64 per initiating daemon and covers local and remote recovery, including retained per-key retries. Failed scanner-backed tasks release capacity and retry through a coalesced scan after `RetryMaxDelay` (default 60 seconds); pending exact-PID cleanup retains its retry state. A fixed pool of eight I/O workers handles lookup, exact-owner cleanup, and remote delivery outside the daemon callback. At most one scanner fetch runs at a time; scanner implementations must bound their I/O.
 
-```go
-_ = self.Send(system.WhereIsProcess, system.MessageUnregisterLocalProcess{
-    Name: gen.Atom("worker.A"),
-    PID:  pid,
-})
-```
+Each target admits up to eight outstanding launches and coalesces duplicate keys. If Init times out but keeps running, its worker remains occupied until Init returns or the launch pool stops. Business Init should bound its external calls. Retries use exponential backoff and jitter and retain their admission slot. Successful starts release capacity immediately; `RunningGrace` is retained for source compatibility and no longer delays completion. Init returning `gen.TerminateReasonNormal` ends recovery for that key until a later scanner includes it again.
 
-The periodic whereis scan remains the fallback for missed messages or abnormal
-process exits.
+After membership publishes the updated topology, it notifies daemon recovery. A launched daemon's termination wrapper notifies recovery after cleanup; recovery conditionally releases that exact exited PID and retries cleanup failures before ensuring a replacement. Overflow notifications coalesce into a full recovery request. Full recovery defaults to 15 minutes as a repair pass. Node shutdown relies on membership recovery and configured scanners.
 
-4) Locate a process by its registered name:
+For application-driven spawning, `system.NewSpawner(process, router, "worker").SpawnRegister(...)` installs the same route and exit-recovery lifecycle when using custom bootstrap with an explicit router.
 
-Using `app.Node` helper:
-```go
-node := n.LocateProcess(gen.Atom("worker.A"))
-```
+## Deployment and upgrades
 
-Or via `AddressBook` for distributed lookup:
-```go
-respAny, err := self.Call(gen.ProcessID{Name: system.WhereIsProcess}, system.MessageGetAddressBook{})
-if err != nil { /* handle */ }
-book := respAny.(system.MessageAddressBook).Book
-node, err := book.QueryBy(self, system.QueryOption{Timeout: 5}).Locate(gen.Atom("worker.A"))
-```
+Existing actors stay on their current nodes after expansion. Rolling upgrades recover actors as old instances exit; business state should be restored by the new instance's Init. Keep launcher names, recovery arguments, and message types compatible across coexisting versions. Placement uses node membership rather than launcher-version capabilities.
 
-5) Access the shared `AddressBook` if you need more control (e.g., local pick):
+Pod readiness does not remove a node from the registrar. The application must stop its Ergo node during shutdown. Give the container enough termination time for business cleanup and route release.
 
-```go
-respAny, err := self.Call(gen.ProcessID{Name: system.WhereIsProcess}, system.MessageGetAddressBook{})
-if err != nil { /* handle */ }
-book := respAny.(system.MessageAddressBook).Book
-picked := book.PickNode(gen.Atom("worker.A")) // pick based on consistent hashing
-```
+## Cron and migration
 
-## Selected Entry Points
+Supply `CronSource` and `CronSchedulerOptions` through `SimpleNodeOptions`. Use a shared production `cron.KVStore` for scheduler state. See [v2/docs/ARCHITECTURE.md](v2/docs/ARCHITECTURE.md).
 
-- Supervisor: `system.ApplicationMemberSpec`, `system.FactorySystemSup`
-- WhereIs: `system.WhereIsProcess`, `MessageLocate`, `MessageRegisterLocalProcess`, `MessageUnregisterLocalProcess`, `MessageGetAddressBook`
-- Placement monitor: `system.PlacementMonitorProcess`, `MonitorPlacement`, `DuplicatePlacement`
-- Address book: `IAddressBook`, `IAddressBookQuery`, `app.Node.LocateProcess`
-- Daemon orchestration: `system.RegisterLauncher`, `system.NewSpawner`, `system.SingletonDaemon`
-- Cron scheduling: `cron.JobSpec`, `cron.JobProvider`, `cron.KVStore`, `cron.NewManagedSource`
-
-## Placement Monitor
-
-`system.PlacementMonitorProcess` is a local-only helper for named processes. A named process may send `system.MonitorPlacement{Name: selfName}` after startup to monitor whether `WhereIsProcess` still selects the local node for that name.
-
-The monitor request must be sent by the named process itself, not by a sidecar actor on its behalf. If whereis later resolves the name to another node, the sender receives `system.DuplicatePlacement{Name, Node}`. This is only a notification; the monitor does not kill, migrate, or repair processes.
-
-## Forwarding Notes
-
-- `app.SimpleNodeOptions.NodeForwardWorker` controls the size of the shared route worker pool used by `ForwardSend`, `ForwardCall`, `WaitPID`, and `ForwardSpawn`.
-- `ForwardSpawn(name, factory, args...)` starts a process through the route worker and returns its PID. Pass a non-empty name to register the process immediately with whereis, or an empty name for an anonymous process. Use `WaitPID(pid)` when you need to wait for the spawned process to exit.
-- The default is `128` so high-frequency forwarding does not serialize behind a small worker pool when directory lookups or remote delivery checks are slow.
-- `ForwardSend` keeps a short-lived route hint cache. A successful send can extend the hint a little, but cache misses or send failures fall back to `Locate` so stale routes do not live forever.
-- Lower the worker count only if you want to reduce background concurrency and the forwarding path is not a throughput bottleneck.
-
-## Limitations
-
-- `MessageLocate` returns a node, not a PID; ask the address book or the node itself for details.
-- Recovery scanners are user-supplied; ensure they are idempotent and resilient.
-- Broadcasts are best-effort; transient network issues may delay convergence.
+v1 imports remain available at the root module. In v2, durable route persistence and decorators replace whereis registration; `ActorRoutes().Locate` resolves actors and `Topology()` exposes placement. New callers must supply their registrar explicitly.
 
 ## License
 
-MIT License. See `LICENSE` for details.
+MIT. See [LICENSE](LICENSE).
+
+Recovery scans pace batches with `DaemonOptions.ScanBatchInterval` (default 50 ms). With the default batch size of 32, each leader admits at most about 640 scanned items per second, plus the initial batch; completion messages do not bypass this interval. This trades recovery speed for lower persistence load. Lease renewals remain proportional to active actors divided by the renewal interval; size that interval and Redis capacity together.
