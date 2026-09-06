@@ -15,7 +15,7 @@ type benchmarkRoutedActor struct{ act.Actor }
 func BenchmarkRoutedActorSpawn(b *testing.B) {
 	node, err := StartSimpleNode(SimpleNodeOptions{
 		Registrar:             mem.Create(),
-		ActorRoutePersistence: newTestRoutePersistence(),
+		ActorRoutePersistence: newTestRoutePersistence(b),
 		NodeName:              "route-benchmark@localhost",
 	})
 	if err != nil {

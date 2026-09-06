@@ -1,13 +1,12 @@
 package system
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"fmt"
 	"reflect"
-	"runtime"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"ergo.services/ergo/act"
@@ -36,225 +35,616 @@ var (
 	ErrActorRoutePersistenceNil = errors.New("actor route persistence is nil")
 )
 
-const routeLogInterval = 30 * time.Second
-
-// ActorRoutePersistence stores leased route-key-to-PID mappings.
-//
-// Implementations must be safe for concurrent use. Acquire, Renew, and Release
-// must compare both the key and PID atomically so an old actor incarnation can
-// never modify a newer owner's route.
-type ActorRoutePersistence interface {
-	Acquire(ctx context.Context, key gen.Atom, pid gen.PID, ttl time.Duration) (bool, error)
-	// Replace atomically changes an existing exact owner; false means the owner changed or disappeared.
-	Replace(ctx context.Context, key gen.Atom, old, pid gen.PID, ttl time.Duration) (bool, error)
-	Renew(ctx context.Context, key gen.Atom, pid gen.PID, ttl time.Duration) (bool, error)
-	Release(ctx context.Context, key gen.Atom, pid gen.PID) error
-	Lookup(ctx context.Context, key gen.Atom) (gen.PID, bool, error)
-}
-
-// ActorRouterOptions controls route lease timing.
+// ActorRouterOptions controls the shared session and independent route lifetime.
 type ActorRouterOptions struct {
-	// LeaseTTL is the lifetime of a successfully acquired or renewed route.
-	LeaseTTL time.Duration
-	// RenewInterval is the target interval between route renewals.
-	RenewInterval time.Duration
-	// OperationTimeout bounds each persistence operation.
-	OperationTimeout time.Duration
-	// RenewWorkers bounds concurrent renewal and release operations.
-	RenewWorkers int
-	// RenewQueueSize bounds queued renewal operations.
-	RenewQueueSize int
-	// ReleaseQueueSize bounds the higher-priority release queue.
-	ReleaseQueueSize int
+	SessionTTL           time.Duration
+	SessionRenewInterval time.Duration
+	OperationTimeout     time.Duration
+	LeaseSafetyMargin    time.Duration
+	RouteTTL             time.Duration
+	RouteChangeWorkers   int
+	RouteChangeQueueSize int
+	ReleaseQueueSize     int
 }
 
-// DefaultActorRouterOptions returns balanced defaults for route leases.
 func DefaultActorRouterOptions() ActorRouterOptions {
-	workers := runtime.GOMAXPROCS(0)
-	if workers < 4 {
-		workers = 4
-	}
 	return ActorRouterOptions{
-		LeaseTTL:         30 * time.Second,
-		RenewInterval:    10 * time.Second,
-		OperationTimeout: 3 * time.Second,
-		RenewWorkers:     workers,
-		RenewQueueSize:   65536,
-		ReleaseQueueSize: 65536,
+		SessionTTL:           30 * time.Second,
+		SessionRenewInterval: 10 * time.Second,
+		OperationTimeout:     3 * time.Second,
+		LeaseSafetyMargin:    3 * time.Second,
+		RouteTTL:             24 * time.Hour,
+		RouteChangeWorkers:   16,
+		RouteChangeQueueSize: 65536,
+		ReleaseQueueSize:     65536,
 	}
 }
-
-func normalizeActorRouterOptions(options ActorRouterOptions) (ActorRouterOptions, error) {
-	defaults := DefaultActorRouterOptions()
-	if options.LeaseTTL == 0 {
-		options.LeaseTTL = defaults.LeaseTTL
-	}
-	if options.RenewInterval == 0 {
-		options.RenewInterval = defaults.RenewInterval
-	}
-	if options.OperationTimeout == 0 {
-		options.OperationTimeout = defaults.OperationTimeout
-	}
-	if options.RenewWorkers == 0 {
-		options.RenewWorkers = defaults.RenewWorkers
-	}
-	if options.RenewQueueSize == 0 {
-		options.RenewQueueSize = defaults.RenewQueueSize
-	}
-	if options.ReleaseQueueSize == 0 {
-		options.ReleaseQueueSize = defaults.ReleaseQueueSize
-	}
-	if options.LeaseTTL < 0 || options.RenewInterval < 0 || options.OperationTimeout < 0 || options.RenewWorkers < 0 || options.RenewQueueSize < 0 || options.ReleaseQueueSize < 0 {
-		return ActorRouterOptions{}, errors.New("actor router options must be non-negative")
-	}
-	if options.RenewInterval >= options.LeaseTTL {
-		return ActorRouterOptions{}, errors.New("actor route renew interval must be shorter than lease TTL")
-	}
-	// Leave room for the latest jittered renewal and timing-wheel rounding.
-	margin := options.LeaseTTL - options.RenewInterval
-	if margin <= options.RenewInterval/10+routeSchedulerResolution(options.RenewInterval) {
-		return ActorRouterOptions{}, errors.New("actor route lease TTL must cover renewal jitter and scheduler resolution")
-	}
-	return options, nil
-}
-
-// ActorRouter decorates behavior instances with route leases and resolves keys
-// directly through an ActorRoutePersistence implementation.
-type ActorRouter struct {
-	persistence ActorRoutePersistence
-	options     ActorRouterOptions
-
-	mu   sync.RWMutex
-	node gen.Node
-
-	lastRenewLog    atomic.Int64
-	renewFailures   atomic.Uint64
-	leaseLosses     atomic.Uint64
-	releaseFailures atomic.Uint64
-	releaseDropped  atomic.Uint64
-	maxRenewDelay   atomic.Int64
-	instances       sync.Map // PID -> *localRouteInstance
-
-	managerMu sync.Mutex
-	manager   *routeLeaseManager
-	closed    bool
-	closeDone chan struct{}
-}
-
-type localRouteInstance struct {
-	mu      sync.Mutex
-	key     gen.Atom
-	stopped bool
-	done    chan struct{}
-}
-
-// Close stops route renewal workers. StartSimpleNode closes its router after
-// the node stops; custom node bootstrap must do the same.
-func (r *ActorRouter) Close() {
-	r.managerMu.Lock()
-	if r.closed {
-		done := r.closeDone
-		r.managerMu.Unlock()
-		if done != nil {
-			<-done
+func normalizeActorRouterOptions(o ActorRouterOptions) (ActorRouterOptions, error) {
+	d := DefaultActorRouterOptions()
+	for _, pair := range [][2]*time.Duration{{&o.SessionTTL, &d.SessionTTL}, {&o.SessionRenewInterval, &d.SessionRenewInterval}, {&o.OperationTimeout, &d.OperationTimeout}, {&o.LeaseSafetyMargin, &d.LeaseSafetyMargin}, {&o.RouteTTL, &d.RouteTTL}} {
+		if *pair[0] == 0 {
+			*pair[0] = *pair[1]
 		}
-		return
+		if *pair[0] < 0 {
+			return o, errors.New("actor router durations must be positive")
+		}
 	}
-	r.closed = true
-	r.closeDone = make(chan struct{})
-	manager := r.manager
-	r.managerMu.Unlock()
-	// Ergo's node wait can finish before business termination callbacks return.
-	ctx, cancel := r.operationContext(context.Background())
-	node, _ := r.boundNode()
-	if node != nil && !node.IsAlive() {
-		r.instances.Range(func(_, value any) bool {
-			select {
-			case <-value.(*localRouteInstance).done:
-				return true
-			case <-ctx.Done():
-				return false
-			}
-		})
+	for _, pair := range [][2]*int{{&o.RouteChangeWorkers, &d.RouteChangeWorkers}, {&o.RouteChangeQueueSize, &d.RouteChangeQueueSize}, {&o.ReleaseQueueSize, &d.ReleaseQueueSize}} {
+		if *pair[0] == 0 {
+			*pair[0] = *pair[1]
+		}
+		if *pair[0] < 0 {
+			return o, errors.New("actor router capacities must be positive")
+		}
 	}
-	cancel()
-	if manager != nil {
-		manager.close()
+	if o.SessionRenewInterval+o.SessionRenewInterval/10+o.OperationTimeout+o.LeaseSafetyMargin >= o.SessionTTL || o.RouteTTL <= o.LeaseSafetyMargin {
+		return o, errors.New("actor router TTL must cover renewal, operation timeout and safety margin")
 	}
-	r.managerMu.Lock()
-	r.manager = nil
-	close(r.closeDone)
-	r.managerMu.Unlock()
+	return o, nil
 }
 
-func (r *ActorRouter) trackRoute(key gen.Atom, pid gen.PID) error {
-	r.managerMu.Lock()
-	defer r.managerMu.Unlock()
-	if r.closed {
-		return ErrActorRouterClosed
-	}
-	if r.manager == nil {
-		r.manager = newRouteLeaseManager(r)
-	}
-	r.manager.track(key, pid)
-	r.instances.LoadOrStore(pid, &localRouteInstance{key: key, done: make(chan struct{})})
-	return nil
+type routerState uint8
+
+const (
+	routerUnbound routerState = iota
+	routerActive
+	routerDraining
+	routerLost
+	routerClosed
+)
+
+// ActorRouter manages one node session and resolves route validity directly.
+type ActorRouter struct {
+	persistence                                 ActorRoutePersistence
+	options                                     ActorRouterOptions
+	bindMu                                      sync.Mutex
+	mu                                          sync.Mutex
+	node                                        gen.Node
+	state                                       routerState
+	session                                     SessionID
+	deadline                                    time.Time
+	manager                                     *routeLeaseManager
+	instances                                   map[gen.PID]*localRouteInstance
+	pending                                     list.List
+	releaseCount                                int
+	renewFailures, leaseLosses, releaseFailures uint64
+	closeOnce                                   sync.Once
+	sessionCloseOnce                            sync.Once
+}
+type localRouteInstance struct {
+	done                                           chan struct{}
+	key                                            gen.Atom
+	pid                                            gen.PID
+	deadline                                       time.Time
+	acquiring, writing, acquired, cleanup, stopped bool
+	releasing                                      bool
+	release                                        *list.Element
+	retryAt                                        time.Time
+	slot                                           int64
 }
 
-func (r *ActorRouter) untrackRoute(key gen.Atom, pid gen.PID) {
-	if value, ok := r.instances.Load(pid); ok {
-		instance := value.(*localRouteInstance)
-		instance.mu.Lock()
-		defer instance.mu.Unlock()
-		instance.stopped = true
-		defer func() {
-			if instance.done != nil {
-				close(instance.done)
-			}
-			r.instances.Delete(pid)
-		}()
-	}
-
-	r.managerMu.Lock()
-	manager := r.manager
-	r.managerMu.Unlock()
-	if manager != nil {
-		manager.untrack(key, pid)
-	}
-}
-
-// NewActorRouter creates an unbound actor router.
-func NewActorRouter(persistence ActorRoutePersistence, options ActorRouterOptions) (*ActorRouter, error) {
-	if persistence == nil {
+func NewActorRouter(p ActorRoutePersistence, o ActorRouterOptions) (*ActorRouter, error) {
+	if p == nil {
 		return nil, ErrActorRoutePersistenceNil
 	}
-	normalized, err := normalizeActorRouterOptions(options)
+	o, err := normalizeActorRouterOptions(o)
 	if err != nil {
 		return nil, err
 	}
-	return &ActorRouter{persistence: persistence, options: normalized}, nil
+	return &ActorRouter{persistence: p, options: o, instances: make(map[gen.PID]*localRouteInstance)}, nil
 }
 
-// Bind attaches the router to one Ergo node. Rebinding the same node is idempotent.
+// Bind opens a fresh session for one node instance. Binding that same instance is idempotent.
 func (r *ActorRouter) Bind(node gen.Node) error {
 	if node == nil {
 		return errors.New("actor router node is nil")
 	}
-	r.managerMu.Lock()
-	defer r.managerMu.Unlock()
-	if r.closed {
+	r.bindMu.Lock()
+	defer r.bindMu.Unlock()
+	r.mu.Lock()
+	if r.state == routerLost || r.state == routerClosed || r.state == routerDraining {
+		r.mu.Unlock()
 		return ErrActorRouterClosed
 	}
+	if r.node != nil {
+		same := r.node == node
+		r.mu.Unlock()
+		if !same {
+			return ErrActorRouterBound
+		}
+		return nil
+	}
+	r.mu.Unlock()
+	ctx, cancel := r.operationContext(context.Background())
+	defer cancel()
+	start := time.Now()
+	lease, err := safeRouteCall(func() (SessionLease, error) { return r.persistence.OpenSession(ctx, node.Name(), r.options.SessionTTL) })
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.node = node
+	r.session = lease.SessionID
+	r.deadline = start.Add(lease.ValidFor - r.options.LeaseSafetyMargin)
+	if r.state != routerUnbound || ctx.Err() != nil || !time.Now().Before(r.deadline) {
+		if r.state == routerUnbound {
+			r.state = routerLost
+		}
+		r.mu.Unlock()
+		r.closeSession()
+		return ErrSessionLost
+	}
+	r.state = routerActive
+	r.manager = newRouteLeaseManager(r)
+	m := r.manager
+	r.mu.Unlock()
+	m.start()
+	return nil
+}
+func (r *ActorRouter) boundNode() (gen.Node, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.node == nil {
-		r.node = node
-		return nil
+		return nil, ErrActorRouterUnbound
 	}
-	if r.node.Name() != node.Name() {
-		return fmt.Errorf("%w: have %s, got %s", ErrActorRouterBound, r.node.Name(), node.Name())
+	return r.node, nil
+}
+func (r *ActorRouter) operationContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(parent, r.options.OperationTimeout)
+}
+func notApplied(err error) error { return errors.Join(ErrRouteNotApplied, err) }
+func safeRouteCall[T any](f func() (T, error)) (v T, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("actor route persistence panic: %v", p)
+		}
+	}()
+	return f()
+}
+func safeRouteError(f func() error) error {
+	_, err := safeRouteCall(func() (struct{}, error) { return struct{}{}, f() })
+	return err
+}
+
+// Drain stops admitting new routed actors while existing cleanup keeps its session.
+func (r *ActorRouter) Drain() {
+	r.mu.Lock()
+	if r.state == routerActive || r.state == routerUnbound {
+		r.state = routerDraining
+	}
+	r.mu.Unlock()
+}
+
+// Close stops local route management and closes the shared session.
+// Call after stopping the node; business callbacks must finish cooperatively.
+func (r *ActorRouter) Close() {
+	r.closeOnce.Do(func() {
+		r.mu.Lock()
+		m := r.manager
+		r.state = routerClosed
+		r.mu.Unlock()
+		if m != nil {
+			m.close()
+		}
+		r.closeSession()
+	})
+}
+
+// Session closure is independent of actor callbacks and route workers.
+func (r *ActorRouter) closeSession() {
+	r.mu.Lock()
+	id, node := r.session, r.node
+	r.mu.Unlock()
+	if id == "" {
+		return
+	}
+	r.sessionCloseOnce.Do(func() {
+		ctx, cancel := r.operationContext(context.Background())
+		defer cancel()
+		if err := safeRouteError(func() error { return r.persistence.CloseSession(ctx, id) }); err != nil {
+			node.Log().Warning("close actor route session %s failed: %v", id, err)
+		}
+	})
+}
+
+func (r *ActorRouter) lose() {
+	r.mu.Lock()
+	if r.state == routerLost || r.state == routerClosed {
+		r.mu.Unlock()
+		return
+	}
+	r.state = routerLost
+	r.leaseLosses++
+	m := r.manager
+	r.mu.Unlock()
+	if m != nil {
+		m.stopRenew()
+	}
+	go r.closeSession()
+	// Walk in bounded batches so a large node never holds the router lock while killing.
+	for {
+		pids := make([]gen.PID, 0, 128)
+		r.mu.Lock()
+		for _, i := range r.instances {
+			if !i.stopped {
+				i.stopped = true
+				pids = append(pids, i.pid)
+				if len(pids) == cap(pids) {
+					break
+				}
+			}
+		}
+		node := r.node
+		r.mu.Unlock()
+		for _, pid := range pids {
+			_ = node.Kill(pid)
+		}
+		if len(pids) < cap(pids) {
+			return
+		}
+	}
+}
+func (r *ActorRouter) valid(snapshot RouteSnapshot) (bool, error) {
+	if snapshot.ValidFor <= 0 || !snapshot.SessionValid {
+		return false, nil
+	}
+	node, err := r.boundNode()
+	if err != nil {
+		return false, err
+	}
+	if snapshot.Owner.PID.Node == node.Name() {
+		return node.IsAlive(), nil
+	}
+	network := node.Network()
+	if network == nil {
+		return false, gen.ErrNoRoute
+	}
+	registrar, err := network.Registrar()
+	if err != nil {
+		return false, err
+	}
+	nodes, err := registrar.Nodes()
+	if err != nil {
+		return false, err
+	}
+	for _, name := range nodes {
+		if name == snapshot.Owner.PID.Node {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+func (r *ActorRouter) lookup(ctx context.Context, key gen.Atom) (gen.PID, bool, error) {
+	if key == "" {
+		return gen.PID{}, false, ErrActorRouteKeyEmpty
+	}
+	if _, err := r.boundNode(); err != nil {
+		return gen.PID{}, false, err
+	}
+	r.mu.Lock()
+	closed := r.state == routerLost || r.state == routerClosed
+	r.mu.Unlock()
+	if closed {
+		return gen.PID{}, false, ErrActorRouterClosed
+	}
+	op, cancel := r.operationContext(ctx)
+	defer cancel()
+	if err := op.Err(); err != nil {
+		return gen.PID{}, false, err
+	}
+	type result struct {
+		pid   gen.PID
+		found bool
+	}
+	value, err := safeRouteCall(func() (result, error) {
+		snapshot, found, err := r.persistence.ReadRoute(op, key)
+		if err != nil || !found {
+			return result{}, err
+		}
+		valid, err := r.valid(snapshot)
+		return result{snapshot.Owner.PID, valid}, err
+	})
+	if err != nil || !value.found {
+		return gen.PID{}, false, err
+	}
+	return value.pid, true, nil
+}
+func (r *ActorRouter) acquire(ctx context.Context, i *localRouteInstance) error {
+	defer func() {
+		r.mu.Lock()
+		i.acquiring, i.writing = false, false
+		r.finishLocked(i)
+		r.mu.Unlock()
+	}()
+	return func() error {
+		for {
+			if err := ctx.Err(); err != nil {
+				return notApplied(err)
+			}
+			snapshot, found, err := r.persistence.ReadRoute(ctx, i.key)
+			if err != nil {
+				return notApplied(err)
+			}
+			var expected *RouteOwner
+			if found {
+				valid, err := r.valid(snapshot)
+				if err != nil {
+					return notApplied(err)
+				}
+				if valid {
+					released, err := r.releaseCompletedLocal(ctx, snapshot)
+					if err != nil {
+						return notApplied(err)
+					}
+					if released {
+						continue
+					}
+					return ErrActorRouteTaken
+				}
+				owner := snapshot.Owner
+				expected = &owner
+			}
+			r.mu.Lock()
+			active := r.state == routerActive && time.Now().Before(r.deadline) && ctx.Err() == nil
+			i.writing = active
+			id := r.session
+			r.mu.Unlock()
+			if !active {
+				if err := ctx.Err(); err != nil {
+					return notApplied(err)
+				}
+				return notApplied(ErrSessionLost)
+			}
+			start := time.Now()
+			result, err := safeRouteCall(func() (AcquireRouteResult, error) {
+				return r.persistence.AcquireRoute(ctx, id, i.key, i.pid, expected, r.options.RouteTTL)
+			})
+			if err != nil {
+				if !errors.Is(err, ErrRouteNotApplied) || errors.Is(err, ErrSessionLost) {
+					r.lose()
+				}
+				return err
+			}
+			r.mu.Lock()
+			i.writing = false
+			if result.Status != RouteAcquired {
+				r.mu.Unlock()
+				continue
+			}
+			i.acquired = true
+			i.deadline = start.Add(result.ValidFor - r.options.LeaseSafetyMargin)
+			if r.state == routerActive || r.state == routerDraining {
+				r.manager.scheduleLocked(i)
+			}
+			active = r.state == routerActive && time.Now().Before(r.deadline) && time.Now().Before(i.deadline)
+			r.mu.Unlock()
+			if !active {
+				if err := r.instanceError(i); err != nil {
+					return err
+				}
+				return ErrActorRouterClosed
+			}
+			return nil
+		}
+	}()
+}
+
+// A supervisor can receive an exit before Ergo invokes business Terminate.
+// Finish the owner's exact cleanup before allowing its replacement to acquire.
+func (r *ActorRouter) releaseCompletedLocal(ctx context.Context, snapshot RouteSnapshot) (bool, error) {
+	r.mu.Lock()
+	id, node := r.session, r.node
+	previous := r.instances[snapshot.Owner.PID]
+	r.mu.Unlock()
+	if snapshot.Owner.SessionID != id {
+		return false, nil
+	}
+	if previous == nil {
+		// Release may have completed between ReadRoute and the local lookup.
+		current, found, err := r.persistence.ReadRoute(ctx, snapshot.Key)
+		return !found || current.Owner != snapshot.Owner, err
+	}
+	if previous.key != snapshot.Key {
+		return false, nil
+	}
+	state, err := node.ProcessState(snapshot.Owner.PID)
+	if err == nil && state != gen.ProcessStateTerminated && state != gen.ProcessStateZombee {
+		return false, nil
+	}
+	if err != nil && !errors.Is(err, gen.ErrProcessUnknown) {
+		return false, err
+	}
+	select {
+	case <-previous.done:
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+	err = safeRouteError(func() error { return r.persistence.ReleaseRoute(ctx, id, snapshot.Key, snapshot.Owner.PID) })
+	return err == nil, err
+}
+
+func (r *ActorRouter) finishLocked(i *localRouteInstance) {
+	if !i.cleanup {
+		return
+	}
+	if r.state == routerLost || r.state == routerClosed {
+		r.manager.removeLocked(i)
+		delete(r.instances, i.pid)
+		return
+	}
+	if i.acquiring {
+		return
+	}
+	r.manager.removeLocked(i)
+	if !i.acquired || r.state == routerLost || r.state == routerClosed {
+		delete(r.instances, i.pid)
+		return
+	}
+	if i.release == nil && !i.releasing {
+		i.release = r.pending.PushBack(i)
+		r.releaseCount++
+	}
+}
+func (r *ActorRouter) releaseExitedRoute(ctx context.Context, key gen.Atom, pid gen.PID) error {
+	r.mu.Lock()
+	id := r.session
+	r.mu.Unlock()
+	op, cancel := r.operationContext(ctx)
+	defer cancel()
+	_, err := routeWork(r, op, func() (struct{}, error) {
+		return struct{}{}, r.persistence.ReleaseRoute(op, id, key, pid)
+	})
+	return err
+}
+func (r *ActorRouter) instanceError(i *localRouteInstance) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	if r.state == routerLost || r.state == routerClosed || !now.Before(r.deadline) {
+		return ErrSessionLost
+	}
+	if i.stopped || !now.Before(i.deadline) {
+		return ErrRouteExpired
 	}
 	return nil
+}
+
+// ActorRouterStats reports current work and cumulative storage failures.
+type ActorRouterStats struct {
+	Tracked, RouteQueued, ReleaseQueued         int
+	RenewFailures, LeaseLosses, ReleaseFailures uint64
+}
+
+func (r *ActorRouter) Stats() ActorRouterStats {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s := ActorRouterStats{Tracked: len(r.instances), ReleaseQueued: r.releaseCount, RenewFailures: r.renewFailures, LeaseLosses: r.leaseLosses, ReleaseFailures: r.releaseFailures}
+	if r.manager != nil {
+		s.RouteQueued = len(r.manager.jobs)
+	}
+	return s
+}
+
+// Preserve the concrete behavior so Ergo can discover its optional callbacks.
+type behaviorPreservingProcess struct {
+	gen.Process
+	behavior gen.ProcessBehavior
+	router   *ActorRouter
+	instance *localRouteInstance
+}
+
+func (p behaviorPreservingProcess) Behavior() gen.ProcessBehavior { return p.behavior }
+func (p behaviorPreservingProcess) State() gen.ProcessState {
+	if p.router.instanceError(p.instance) != nil {
+		return gen.ProcessStateZombee
+	}
+	return p.Process.State()
+}
+
+type routeLifecycle struct {
+	router      *ActorRouter
+	key         gen.Atom
+	behavior    gen.ProcessBehavior
+	instance    *localRouteInstance
+	initialized bool
+	initErr     error
+}
+
+func newRouteLifecycle(router *ActorRouter, key gen.Atom, b gen.ProcessBehavior) routeLifecycle {
+	r := routeLifecycle{router: router, key: key, behavior: b}
+	if key == "" {
+		r.initErr = ErrActorRouteKeyEmpty
+	} else if isNilBehavior(b) {
+		r.initErr = ErrActorRouteBehaviorNil
+	}
+	return r
+}
+func isNilBehavior(b gen.ProcessBehavior) bool {
+	if b == nil {
+		return true
+	}
+	v := reflect.ValueOf(b)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return v.IsNil()
+	}
+	return false
+}
+func (l *routeLifecycle) init(p gen.Process, args ...any) (err error) {
+	defer func() { l.initErr = err }()
+	if l.initErr != nil {
+		return l.initErr
+	}
+	if l.router == nil {
+		return ErrActorRoutePersistenceNil
+	}
+	r := l.router
+	if err = r.Bind(p.Node()); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	if r.state != routerActive {
+		r.mu.Unlock()
+		return ErrActorRouterClosed
+	}
+	if r.releaseCount >= r.options.ReleaseQueueSize {
+		r.mu.Unlock()
+		return ErrActorRouterBusy
+	}
+	i := &localRouteInstance{key: l.key, pid: p.PID(), acquiring: true, done: make(chan struct{})}
+	l.instance = i
+	r.instances[i.pid] = i
+	r.mu.Unlock()
+	ctx, cancel := r.operationContext(context.Background())
+	defer cancel()
+	_, err = routeWork(r, ctx, func() (struct{}, error) { return struct{}{}, r.acquire(ctx, i) })
+	if err != nil {
+		r.mu.Lock()
+		if errors.Is(err, ErrActorRouterBusy) || errors.Is(err, ErrRouteNotApplied) {
+			i.acquiring = false
+		}
+		if i.writing {
+			r.mu.Unlock()
+			r.lose()
+		} else {
+			r.mu.Unlock()
+		}
+		return err
+	}
+	if err := r.instanceError(i); err != nil {
+		return err
+	}
+	l.initialized = true
+	err = l.behavior.ProcessInit(behaviorPreservingProcess{Process: p, behavior: l.behavior, router: r, instance: i}, args...)
+	if err == nil {
+		if err = r.instanceError(i); err != nil {
+			return err
+		}
+		if p.State() == gen.ProcessStateZombee || p.State() == gen.ProcessStateTerminated {
+			return gen.TerminateReasonKill
+		}
+	}
+	return err
+}
+func (l *routeLifecycle) terminate(reason error) {
+	defer func() {
+		if l.instance != nil {
+			r := l.router
+			r.mu.Lock()
+			if !l.instance.cleanup {
+				l.instance.cleanup = true
+				close(l.instance.done)
+			}
+			r.finishLocked(l.instance)
+			r.mu.Unlock()
+		}
+	}()
+	if l.initialized {
+		l.behavior.ProcessTerminate(reason)
+	}
 }
 
 // IActor is an Actor behavior instance with the Process API promoted by an
@@ -321,253 +711,6 @@ func (r *ActorRouter) routeFactory(key gen.Atom, factory gen.ProcessFactory) gen
 		default:
 			return routeErrorBehavior{err: fmt.Errorf("%w: got %T", ErrActorRouteBehaviorMismatch, behavior)}
 		}
-	}
-}
-
-// acquire reclaims exited local owners and nodes absent from the registrar.
-func (r *ActorRouter) acquire(ctx context.Context, key gen.Atom, pid gen.PID) (bool, error) {
-	acquired, err := r.persistence.Acquire(ctx, key, pid, r.options.LeaseTTL)
-	if err != nil || acquired {
-		return acquired, err
-	}
-	owner, found, err := r.persistence.Lookup(ctx, key)
-	if err != nil {
-		return false, err
-	}
-	if !found {
-		return r.persistence.Acquire(ctx, key, pid, r.options.LeaseTTL)
-	}
-	node, err := r.boundNode()
-	if err != nil {
-		return false, err
-	}
-	if owner.Node == pid.Node {
-		_, err = node.ProcessState(owner)
-		if err == nil {
-			return false, nil
-		}
-		if !errors.Is(err, gen.ErrProcessUnknown) {
-			return false, err
-		}
-		// Ergo removes the PID before invoking business Terminate.
-		if value, ok := r.instances.Load(owner); ok {
-			instance := value.(*localRouteInstance)
-			select {
-			case <-instance.done:
-			case <-ctx.Done():
-				return false, ctx.Err()
-			}
-		}
-	} else {
-		network := node.Network()
-		if network == nil {
-			return false, gen.ErrNoRoute
-		}
-		registrar, err := network.Registrar()
-		if err != nil {
-			return false, err
-		}
-		nodes, err := registrar.Nodes()
-		if err != nil {
-			return false, err
-		}
-		for _, name := range nodes {
-			if name == owner.Node {
-				return false, nil
-			}
-		}
-	}
-	replaced, err := r.persistence.Replace(ctx, key, owner, pid, r.options.LeaseTTL)
-	if err != nil || replaced {
-		return replaced, err
-	}
-	return r.persistence.Acquire(ctx, key, pid, r.options.LeaseTTL)
-}
-
-// restoreRoute is used by daemon recovery for an existing routed local instance.
-func (r *ActorRouter) restoreRoute(ctx context.Context, key gen.Atom, pid gen.PID) (bool, error) {
-	value, ok := r.instances.Load(pid)
-	if !ok {
-		return false, nil
-	}
-	instance := value.(*localRouteInstance)
-	instance.mu.Lock()
-	defer instance.mu.Unlock()
-	if instance.stopped || instance.key != key {
-		return false, nil
-	}
-	node, err := r.boundNode()
-	if err != nil {
-		return false, err
-	}
-	if _, err := node.ProcessState(pid); err != nil {
-		return false, err
-	}
-	opctx, cancel := r.operationContext(ctx)
-	defer cancel()
-	acquired, err := r.acquire(opctx, key, pid)
-	if err != nil {
-		return false, err
-	}
-	if !acquired {
-		return false, ErrActorRouteTaken
-	}
-	if err := r.trackRoute(key, pid); err != nil {
-		_ = r.persistence.Release(opctx, key, pid)
-		return false, err
-	}
-	return true, nil
-}
-
-// releaseExitedRoute is used only after the daemon's termination hook completes.
-func (r *ActorRouter) releaseExitedRoute(ctx context.Context, key gen.Atom, pid gen.PID) error {
-	opctx, cancel := r.operationContext(ctx)
-	defer cancel()
-	return r.persistence.Release(opctx, key, pid)
-}
-
-func (r *ActorRouter) lookup(ctx context.Context, key gen.Atom) (gen.PID, bool, error) {
-	if key == "" {
-		return gen.PID{}, false, ErrActorRouteKeyEmpty
-	}
-	if _, err := r.boundNode(); err != nil {
-		return gen.PID{}, false, err
-	}
-	opctx, cancel := r.operationContext(ctx)
-	defer cancel()
-	pid, found, err := r.persistence.Lookup(opctx, key)
-	if err != nil || !found {
-		return gen.PID{}, false, err
-	}
-	return pid, found, nil
-}
-
-func (r *ActorRouter) boundNode() (gen.Node, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.node == nil {
-		return nil, ErrActorRouterUnbound
-	}
-	return r.node, nil
-}
-
-func (r *ActorRouter) operationContext(parent context.Context) (context.Context, context.CancelFunc) {
-	if parent == nil {
-		parent = context.Background()
-	}
-	return context.WithTimeout(parent, r.options.OperationTimeout)
-}
-
-func (r *ActorRouter) shouldLogRenewFailure(now time.Time) bool {
-	next := now.Add(-routeLogInterval).UnixNano()
-	for {
-		last := r.lastRenewLog.Load()
-		if last > next {
-			return false
-		}
-		if r.lastRenewLog.CompareAndSwap(last, now.UnixNano()) {
-			return true
-		}
-	}
-}
-
-func (r *ActorRouter) boundLogWarning(format string, args ...any) {
-	node, err := r.boundNode()
-	if err != nil {
-		return
-	}
-	defer func() { _ = recover() }()
-	node.Log().Warning(format, args...)
-}
-
-// behaviorPreservingProcess makes Ergo's built-in Actor, Supervisor, and Pool
-// discover the original concrete behavior during ProcessInit. Returning the
-// route wrapper here would hide their optional callback methods.
-type behaviorPreservingProcess struct {
-	gen.Process
-	behavior gen.ProcessBehavior
-}
-
-func (p behaviorPreservingProcess) Behavior() gen.ProcessBehavior {
-	return p.behavior
-}
-
-type routeLifecycle struct {
-	router      *ActorRouter
-	key         gen.Atom
-	behavior    gen.ProcessBehavior
-	pid         gen.PID
-	acquired    bool
-	initialized bool
-	initErr     error
-}
-
-func newRouteLifecycle(router *ActorRouter, key gen.Atom, behavior gen.ProcessBehavior) routeLifecycle {
-	lifecycle := routeLifecycle{router: router, key: key, behavior: behavior}
-	switch {
-	case key == "":
-		lifecycle.initErr = ErrActorRouteKeyEmpty
-	case isNilBehavior(behavior):
-		lifecycle.initErr = ErrActorRouteBehaviorNil
-	}
-	return lifecycle
-}
-
-func isNilBehavior(behavior gen.ProcessBehavior) bool {
-	if behavior == nil {
-		return true
-	}
-	value := reflect.ValueOf(behavior)
-	switch value.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
-		return value.IsNil()
-	default:
-		return false
-	}
-}
-
-func (r *routeLifecycle) init(process gen.Process, args ...any) error {
-	r.pid = process.PID()
-	if r.initErr != nil {
-		return r.initErr
-	}
-	if r.router == nil {
-		return ErrActorRoutePersistenceNil
-	}
-	if err := r.router.Bind(process.Node()); err != nil {
-		return err
-	}
-	ctx, cancel := r.router.operationContext(context.Background())
-	acquired, err := r.router.acquire(ctx, r.key, r.pid)
-	cancel()
-	if err != nil {
-		return fmt.Errorf("acquire actor route %s: %w", r.key, err)
-	}
-	if !acquired {
-		return fmt.Errorf("%w: %s", ErrActorRouteTaken, r.key)
-	}
-	r.acquired = true
-	if err := r.router.trackRoute(r.key, r.pid); err != nil {
-		ctx, cancel := r.router.operationContext(context.Background())
-		_ = r.router.persistence.Release(ctx, r.key, r.pid)
-		cancel()
-		r.acquired = false
-		return err
-	}
-	r.initialized = true
-	view := behaviorPreservingProcess{Process: process, behavior: r.behavior}
-	return r.behavior.ProcessInit(view, args...)
-}
-
-func (r *routeLifecycle) terminate(reason error) {
-	defer func() {
-		if r.acquired {
-			r.router.untrackRoute(r.key, r.pid)
-			r.acquired = false
-		}
-	}()
-	if r.initialized {
-		r.behavior.ProcessTerminate(reason)
 	}
 }
 
@@ -676,24 +819,4 @@ func routeJitterSeed(key gen.Atom, owner gen.PID) uint64 {
 		return offset64
 	}
 	return value
-}
-
-// ActorRouterStats describes lease work and cumulative failures on this node.
-type ActorRouterStats struct {
-	Tracked, RenewQueued, ReleaseQueued                         int
-	RenewFailures, LeaseLosses, ReleaseFailures, ReleaseDropped uint64
-	MaxRenewDelay                                               time.Duration
-}
-
-func (r *ActorRouter) Stats() ActorRouterStats {
-	stats := ActorRouterStats{RenewFailures: r.renewFailures.Load(), LeaseLosses: r.leaseLosses.Load(), ReleaseFailures: r.releaseFailures.Load(), ReleaseDropped: r.releaseDropped.Load(), MaxRenewDelay: time.Duration(r.maxRenewDelay.Load())}
-	r.managerMu.Lock()
-	manager := r.manager
-	r.managerMu.Unlock()
-	if manager != nil {
-		stats.Tracked = manager.trackedCount()
-		stats.RenewQueued = len(manager.renewJobs)
-		stats.ReleaseQueued = len(manager.releaseJobs)
-	}
-	return stats
 }

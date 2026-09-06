@@ -54,43 +54,60 @@ Use `WithActorRoute`, `WithSupervisorRoute`, or `WithPoolRoute` inside a factory
 
 ## Persistence contract
 
-Implement all five operations in the shared backend:
+Implement the shared session and route operations in `system.ActorRoutePersistence`:
 
 ```go
 type ActorRoutePersistence interface {
-    Acquire(ctx context.Context, key gen.Atom, pid gen.PID, ttl time.Duration) (bool, error)
-    Replace(ctx context.Context, key gen.Atom, old, pid gen.PID, ttl time.Duration) (bool, error)
-    Renew(ctx context.Context, key gen.Atom, pid gen.PID, ttl time.Duration) (bool, error)
-    Release(ctx context.Context, key gen.Atom, pid gen.PID) error
-    Lookup(ctx context.Context, key gen.Atom) (gen.PID, bool, error)
+    OpenSession(context.Context, gen.Atom, time.Duration) (SessionLease, error)
+    RenewSession(context.Context, SessionID, time.Duration) (SessionLease, error)
+    CloseSession(context.Context, SessionID) error
+    ReadRoute(context.Context, gen.Atom) (RouteSnapshot, bool, error)
+    AcquireRoute(context.Context, SessionID, gen.Atom, gen.PID, *RouteOwner, time.Duration) (AcquireRouteResult, error)
+    ReleaseRoute(context.Context, SessionID, gen.Atom, gen.PID) error
 }
 ```
 
-Operations must be concurrent-safe and honor context cancellation and deadlines. Store the full PID, including creation, in a shared namespace.
+Each node instance opens a fresh `SessionID`. A route stores its key and `RouteOwner{SessionID, PID}`, including the full PID creation value. Sessions and routes expire independently. Operations must be concurrent-safe and honor their contexts. The backend must reclaim expired records even when they are never read again.
 
-- `Acquire` succeeds for an absent/expired lease or the same owner. Another live lease returns `false, nil`.
-- `Replace` atomically compares the existing full PID with `old` and replaces it with `pid` and a fresh TTL. An absent key or a different owner returns `false, nil`. Implement this as one conditional storage operation, not separate release and acquire calls.
-- `Renew` extends only a live lease belonging to the exact PID.
-- `Release` deletes only the exact PID's lease and is idempotent.
-- `Lookup` treats absent and expired leases as not found.
+- `OpenSession` allocates a new identity. `RenewSession` extends only a live existing session. `CloseSession` is idempotent and terminal, including against concurrent renewal and acquisition.
+- `ReadRoute` returns a consistent route/session snapshot, with the route's remaining `ValidFor` and `SessionValid`.
+- `AcquireRoute` atomically verifies the requesting session and the expected owner. A nil expected owner requires an absent or expired route. A supplied owner requires an exact match. Results distinguish acquisition, occupation, and a failed comparison. Repeating acquisition for the same session and full PID succeeds and resets the route TTL.
+- `ReleaseRoute` removes only the exact session and full PID; absence or replacement is success.
+- `ValidFor` describes remaining validity when the operation executes. Local deadlines use the request start time plus `ValidFor`, less a safety margin.
+- An acquisition error has an uncertain outcome unless it wraps `ErrRouteNotApplied`, which certifies that the operation did not write. Backends must preserve that distinction and avoid implicitly replaying uncertain acquisitions. Successful operations must remain durable within the backend's documented failure model.
 
-When Acquire conflicts, the router can replace an exited local PID after its business cleanup completes. For a remote owner, the router queries the registrar's current `Nodes()` result. Absence means offline and permits replacement before TTL expiry. Registrar query errors are returned to the caller; the AddressBook cache does not authorize takeover.
+Lookup and takeover use the same validity rule: an unexpired route, a live session, and an online owner node. Remote owners are checked through a direct `registrar.Nodes()` call on every check. The local node is checked through `node.IsAlive()` because registrars can omit self. Registrar errors propagate to callers. A router uses the result returned by the registrar, including any caching internal to that registrar.
 
-Existing persistence implementations must add `Replace` before adopting this version.
+An invalid route can be replaced by comparing its exact observed owner. This replacement affects that route; the owner closes its own session. A registrar that returns names cannot distinguish two incarnations with the same node name, so a prior incarnation's session must expire or be closed before that case becomes reclaimable.
 
-## Lifecycle and lease timing
+The new contract replaces the previous per-actor lease interface. Custom persistence implementations must implement all six operations. `system.NewMemoryActorRoutePersistence()` supplies an in-process backend for examples and tests; call its `Close` when finished.
 
-The wrapper acquires and starts renewing its route before business initialization. A conflict therefore fails before business Init executes. During initialization, messages can reach the Ergo mailbox; business processing starts after Init succeeds. Init failures run business termination cleanup and release the lease. A spawn timeout does not cancel a running user Init callback.
+## Lifecycle and timing
 
-On termination, renewal continues while business cleanup runs. The wrapper then queues the conditional release. Failed or dropped releases expire through TTL, and offline nodes can be taken over earlier through the registrar rule above.
+Acquisition completes before business Init. The route remains associated with the instance through Init and business Terminate; after cleanup, an exact-owner release is queued. Failed releases remain queued for retry. Admission returns `ErrActorRouterBusy` when pending cleanup reaches `ReleaseQueueSize`, or the route operation queue is full.
 
-Each node uses one sharded timing wheel and a fixed worker pool. Renewals are individual storage operations. Default timing remains TTL 30 seconds, renewal interval 10 seconds, and operation timeout 3 seconds. Larger deployments can use longer TTLs together with longer renewal intervals, sized from measured latency and actor counts. Steady renewal demand is approximately `routed actors / renewal interval` per node. Increasing TTL alone does not reduce that demand.
+One heartbeat renews the node session, independently of the bounded route operation workers. A shared timing wheel schedules each route's local expiration. Defaults are:
 
-`ActorRoutes().Stats()` exposes tracked leases, queue depths, maximum observed renewal scheduling delay, renewal/release failures, lease losses, and dropped releases. Release work gets priority in bounded bursts so renewals can progress.
+| Option | Default |
+| --- | --- |
+| `SessionTTL` | 30 seconds |
+| `SessionRenewInterval` | 10 seconds, with bounded jitter |
+| `OperationTimeout` | 3 seconds |
+| `LeaseSafetyMargin` | 3 seconds |
+| `RouteTTL` | 24 hours |
+| `RouteChangeWorkers` | 16 |
+| `RouteChangeQueueSize` | 65,536 |
+| `ReleaseQueueSize` | 65,536 pending releases before admission backpressure |
 
-When Renew reports that the PID no longer owns its lease, the router kills that exact actor incarnation and runs its existing termination lifecycle. Daemons then recover through their exit hook. Temporary storage errors retry without killing the actor. Termination cannot undo external work already performed.
+Renewal traffic is approximately `nodes / SessionRenewInterval`. Routes retain their initial independent TTL; reaching the route deadline stops that actor and lets daemon recovery start a fresh instance where configured. Repeated acquisition by the same owner extends TTL at the persistence API.
 
-Shutdown allows business cleanup callbacks one operation-timeout budget, waits for current worker operations, and drains queued releases with another operation-timeout budget. Persistence methods must honor their contexts. Any remaining cleanup falls back to expiration. Custom bootstrap must stop its node before calling `router.Close()`.
+A confirmed lost session, an uncertain acquisition, or the local session deadline moves the router to Lost. It stops admissions and renewal, kills its exact managed PIDs, and independently closes its own session with an operation timeout. Temporary renewal errors retain the last confirmed deadline. A late response cannot reactivate a Lost router. Routed admission resumes with a fresh node/router instance. Business dispatch checks both local deadlines before processing another mailbox item; a route deadline stops only that actor.
+
+Already-running Init, callbacks, and application goroutines cannot be forcibly interrupted by these checks. Likewise, a registrar-based takeover can overlap an old actor that still has a valid local session and route deadline. That overlap can last until the old route deadline, up to the configured route TTL. Applications must account for this behavior when performing external side effects; routing does not provide exactly-once business execution.
+
+Shutdown enters Draining before stopping the node, then `router.Close()` stops local route management and closes the shared session. Session closure invalidates all associated routes; their records expire through their own TTLs. Session closure is bounded by `OperationTimeout`; a failure is logged and the session expires naturally. Custom bootstrap should call `router.Drain()`, stop the node, then call `router.Close()`. Business cleanup belongs to the node/application shutdown flow: `node.Wait()` can finish before Terminate callbacks return, and closing the session permits takeover while those callbacks are still running.
+
+`ActorRoutes().Stats()` reports tracked lifecycle records, route queue depth, pending releases, session renewal failures, session losses, and release failures.
 
 ## Sending and calling
 
@@ -140,4 +157,4 @@ v1 imports remain available at the root module. In v2, durable route persistence
 
 MIT. See [LICENSE](LICENSE).
 
-Recovery scans pace batches with `DaemonOptions.ScanBatchInterval` (default 50 ms). With the default batch size of 32, each leader admits at most about 640 scanned items per second, plus the initial batch; completion messages do not bypass this interval. This trades recovery speed for lower persistence load. Lease renewals remain proportional to active actors divided by the renewal interval; size that interval and Redis capacity together.
+Recovery scans pace batches with `DaemonOptions.ScanBatchInterval` (default 50 ms). With the default batch size of 32, each leader admits at most about 640 scanned items per second, plus the initial batch; completion messages do not bypass this interval. This trades recovery speed for lower persistence load. Session renewals scale with the number of nodes; route acquisition, lookup, release, and TTL reclamation account for the remaining backend load.

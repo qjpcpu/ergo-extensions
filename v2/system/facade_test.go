@@ -44,10 +44,11 @@ func TestFacadeConstructorsAndLauncherHelpers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("spawn parent: %v", err)
 	}
-	router, err := NewActorRouter(newMemoryActorRoutePersistence(), ActorRouterOptions{})
+	router, err := NewActorRouter(routeStore(t), ActorRouterOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(router.Close)
 	book := NewAddressBook()
 	if err := router.Bind(parent.Node()); err != nil {
 		t.Fatal(err)

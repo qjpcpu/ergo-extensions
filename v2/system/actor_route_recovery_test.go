@@ -2,157 +2,155 @@ package system
 
 import (
 	"context"
+	"ergo.services/ergo/gen"
+	"ergo.services/ergo/testing/unit"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"ergo.services/ergo/gen"
-	"ergo.services/ergo/testing/unit"
 )
 
-type routeStateNode struct {
-	gen.Node
-	stateErr error
-}
-
-func (n routeStateNode) ProcessState(gen.PID) (gen.ProcessState, error) {
-	return gen.ProcessStateRunning, n.stateErr
-}
-
-func TestActorRouteAcquireHandlesExitedLocalOwner(t *testing.T) {
-	for _, test := range []struct {
-		name     string
-		remote   bool
-		stateErr error
-		acquired bool
-	}{
-		{name: "exited local owner", stateErr: gen.ErrProcessUnknown, acquired: true},
-		{name: "live local owner"},
-		{name: "remote owner", remote: true, stateErr: gen.ErrProcessUnknown},
-		{name: "node stopped", stateErr: gen.ErrNodeTerminated},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			actor, err := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} })
-			if err != nil {
-				t.Fatal(err)
+func TestActorRouteLookupAndTakeoverShareValidity(t *testing.T) {
+	for _, mode := range []string{"online", "offline", "session closed", "expired route", "local"} {
+		t.Run(mode, func(t *testing.T) {
+			s := routeStore(t)
+			r := routeRouter(t, s, ActorRouterOptions{})
+			n := routeNode(t)
+			if e := r.Bind(n); e != nil {
+				t.Fatal(e)
 			}
-			store := newMemoryActorRoutePersistence()
-			router, err := NewActorRouter(store, ActorRouterOptions{})
-			if err != nil {
-				t.Fatal(err)
+			old := gen.PID{Node: "owner@localhost", ID: 1, Creation: 1}
+			if mode == "local" {
+				old.Node = n.Name()
 			}
-			defer router.Close()
-			if err := router.Bind(routeStateNode{Node: actor.Node(), stateErr: test.stateErr}); err != nil {
-				t.Fatal(err)
+			id := routeSeed(t, s, "key", old)
+			reg, _ := n.Network().Registrar()
+			if mode != "offline" {
+				reg.(*unit.TestRegistrar).AddNode(old.Node, nil)
 			}
-			old := gen.PID{Node: actor.Node().Name(), ID: 100, Creation: 1}
-			if test.remote {
-				old.Node = "remote@localhost"
-				registrar, _ := actor.Node().Network().Registrar()
-				registrar.(*unit.TestRegistrar).AddNode(old.Node, nil)
+			if mode == "session closed" {
+				s.CloseSession(context.Background(), id)
 			}
-			current := gen.PID{Node: actor.Node().Name(), ID: 101, Creation: 1}
-			store.Acquire(context.Background(), "key", old, time.Minute)
-			acquired, err := router.acquire(context.Background(), "key", current)
-			if acquired != test.acquired {
-				t.Fatalf("acquired=%v want=%v err=%v", acquired, test.acquired, err)
+			if mode == "expired route" {
+				s.AcquireRoute(context.Background(), id, "key", old, nil, -time.Second)
 			}
-			if test.stateErr == gen.ErrNodeTerminated && !errors.Is(err, gen.ErrNodeTerminated) {
-				t.Fatalf("node state error: %v", err)
+			_, found, e := r.lookup(nil, "key")
+			want := mode == "online" || mode == "local"
+			if e != nil || found != want {
+				t.Fatal(found, e)
 			}
-			if test.acquired {
-				// An outstanding release from the previous incarnation is still safe.
-				store.Release(context.Background(), "key", old)
-				pid, found, err := store.Lookup(context.Background(), "key")
-				if err != nil || !found || pid != current {
-					t.Fatalf("replacement route: %v %v %v", pid, found, err)
+			i := &localRouteInstance{key: "key", pid: gen.PID{Node: n.Name(), ID: 9, Creation: 1}, acquiring: true}
+			e = r.acquire(context.Background(), i)
+			if want {
+				if !errors.Is(e, ErrActorRouteTaken) {
+					t.Fatal(e)
+				}
+			} else {
+				if e != nil {
+					t.Fatal(e)
+				}
+				s.ReleaseRoute(context.Background(), id, "key", old)
+				snapshot, found, e := s.ReadRoute(context.Background(), "key")
+				if e != nil || !found || snapshot.Owner.PID != i.pid {
+					t.Fatal(snapshot, found, e)
 				}
 			}
 		})
 	}
 }
-
-type lateRouteRenewStore struct {
-	*memoryActorRoutePersistence
-	entered chan struct{}
-	finish  chan struct{}
-	first   atomic.Bool
+func TestActorRouteRegistrarChangesAreReadDirectly(t *testing.T) {
+	s := routeStore(t)
+	r := routeRouter(t, s, ActorRouterOptions{})
+	n := routeNode(t)
+	r.Bind(n)
+	pid := gen.PID{Node: "remote@localhost", ID: 1}
+	routeSeed(t, s, "key", pid)
+	reg, _ := n.Network().Registrar()
+	registrar := reg.(*unit.TestRegistrar)
+	registrar.AddNode(pid.Node, nil)
+	if _, found, e := r.lookup(nil, "key"); e != nil || !found {
+		t.Fatal(found, e)
+	}
+	registrar.RemoveNode(pid.Node)
+	if _, found, e := r.lookup(nil, "key"); e != nil || found {
+		t.Fatal(found, e)
+	}
 }
 
-func (s *lateRouteRenewStore) Renew(ctx context.Context, key gen.Atom, pid gen.PID, ttl time.Duration) (bool, error) {
-	if s.first.CompareAndSwap(false, true) {
-		s.Release(ctx, key, pid)
-		close(s.entered)
-		select {
-		case <-s.finish:
-		case <-ctx.Done():
-			return false, ctx.Err()
+type routeNetworkNode struct {
+	gen.Node
+	network gen.Network
+}
+
+func (n *routeNetworkNode) Network() gen.Network { return n.network }
+
+type routeFailNetwork struct {
+	gen.Network
+	registrar gen.Registrar
+	err       error
+}
+
+func (n routeFailNetwork) Registrar() (gen.Registrar, error) { return n.registrar, n.err }
+
+type routeFailRegistrar struct {
+	gen.Registrar
+	err error
+}
+
+func (r routeFailRegistrar) Nodes() ([]gen.Atom, error) { return nil, r.err }
+func TestActorRouteRegistrarFailuresPreventTakeover(t *testing.T) {
+	want := errors.New("registrar unavailable")
+	for _, network := range []gen.Network{nil, routeFailNetwork{err: want}, routeFailNetwork{registrar: routeFailRegistrar{err: want}}} {
+		s := routeStore(t)
+		r := routeRouter(t, s, ActorRouterOptions{})
+		n := &routeNetworkNode{Node: routeNode(t), network: network}
+		r.Bind(n)
+		pid := gen.PID{Node: "remote", ID: 1}
+		routeSeed(t, s, "key", pid)
+		if _, _, e := r.lookup(nil, "key"); e == nil {
+			t.Fatal("lookup hid registrar failure")
 		}
-		return false, nil
-	}
-	return s.memoryActorRoutePersistence.Renew(ctx, key, pid, ttl)
-}
-
-func TestActorRouteRestoreSurvivesLateRenewResult(t *testing.T) {
-	store := &lateRouteRenewStore{memoryActorRoutePersistence: newMemoryActorRoutePersistence(), entered: make(chan struct{}), finish: make(chan struct{})}
-	router, err := NewActorRouter(store, ActorRouterOptions{RenewInterval: time.Minute, LeaseTTL: 2 * time.Minute})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer router.Close()
-	actor, err := unit.Spawn(t, func() gen.ProcessBehavior { return router.WithActorRoute("key", &routerTestActor{}) })
-	if err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan struct{})
-	go func() {
-		router.manager.renew(routeLeaseJob{kind: routeLeaseRenew, key: "key", pid: actor.PID()})
-		close(done)
-	}()
-	<-store.entered
-	restored, err := router.restoreRoute(context.Background(), "key", actor.PID())
-	close(store.finish)
-	<-done
-	if err != nil || !restored {
-		t.Fatalf("restore: %v %v", restored, err)
-	}
-	if !router.manager.isTracked("key", actor.PID()) {
-		t.Fatal("restored route is not renewing")
-	}
-	router.manager.renew(routeLeaseJob{kind: routeLeaseRenew, key: "key", pid: actor.PID()})
-	pid, found, err := router.lookup(context.Background(), "key")
-	if err != nil || !found || pid != actor.PID() {
-		t.Fatalf("restored lookup: %v %v %v", pid, found, err)
-	}
-	actor.Behavior().ProcessTerminate(gen.TerminateReasonNormal)
-	if restored, err := router.restoreRoute(context.Background(), "key", actor.PID()); err != nil || restored {
-		t.Fatalf("terminated restore: %v %v", restored, err)
+		i := &localRouteInstance{key: "key", pid: gen.PID{Node: n.Name(), ID: 2}, acquiring: true}
+		if e := r.acquire(context.Background(), i); !errors.Is(e, ErrRouteNotApplied) {
+			t.Fatal(e)
+		}
+		snapshot, _, _ := s.ReadRoute(context.Background(), "key")
+		if snapshot.Owner.PID != pid {
+			t.Fatal("registrar failure permitted takeover")
+		}
 	}
 }
-
-func TestActorRouteRestorePreservesOtherOwner(t *testing.T) {
-	store := newMemoryActorRoutePersistence()
-	router, err := NewActorRouter(store, ActorRouterOptions{})
-	if err != nil {
-		t.Fatal(err)
+func TestActorRouteConcurrentAcquisitionRetriesComparison(t *testing.T) {
+	s := &faultRouteStore{MemoryActorRoutePersistence: routeStore(t)}
+	r := routeRouter(t, s, ActorRouterOptions{})
+	r.Bind(routeNode(t))
+	routeSeed(t, s, "key", gen.PID{Node: "offline", ID: 1})
+	const count = 16
+	var ready sync.WaitGroup
+	ready.Add(count)
+	s.acquire = func(c context.Context, id SessionID, k gen.Atom, p gen.PID, o *RouteOwner, d time.Duration) (AcquireRouteResult, error) {
+		ready.Done()
+		ready.Wait()
+		return s.MemoryActorRoutePersistence.AcquireRoute(c, id, k, p, o, d)
 	}
-	defer router.Close()
-	actor, err := unit.Spawn(t, func() gen.ProcessBehavior { return router.WithActorRoute("key", &routerTestActor{}) })
-	if err != nil {
-		t.Fatal(err)
+	var wg sync.WaitGroup
+	var won atomic.Int64
+	for j := range count {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			i := &localRouteInstance{key: "key", pid: gen.PID{Node: r.node.Name(), ID: uint64(j + 10)}, acquiring: true}
+			e := r.acquire(context.Background(), i)
+			if e == nil {
+				won.Add(1)
+			} else if !errors.Is(e, ErrActorRouteTaken) {
+				t.Error(e)
+			}
+		}()
 	}
-	other := gen.PID{Node: "other@localhost", ID: 1, Creation: 1}
-	registrar, _ := actor.Node().Network().Registrar()
-	registrar.(*unit.TestRegistrar).AddNode(other.Node, nil)
-	store.Release(context.Background(), "key", actor.PID())
-	store.Acquire(context.Background(), "key", other, time.Minute)
-	restored, err := router.restoreRoute(context.Background(), "key", actor.PID())
-	if restored || !errors.Is(err, ErrActorRouteTaken) {
-		t.Fatalf("restore conflict: %v %v", restored, err)
-	}
-	pid, found, err := store.Lookup(context.Background(), "key")
-	if err != nil || !found || pid != other {
-		t.Fatalf("current owner: %v %v %v", pid, found, err)
+	wg.Wait()
+	if won.Load() != 1 {
+		t.Fatal(won.Load())
 	}
 }

@@ -30,138 +30,6 @@ func awaitRouteCondition(t *testing.T, check func() bool) {
 	}
 }
 
-type queuedReleaseStore struct {
-	*testRoutePersistence
-	entered     chan struct{}
-	unblock     chan struct{}
-	oldReleased chan struct{}
-	oldPID      gen.PID
-}
-
-func (s *queuedReleaseStore) Release(ctx context.Context, key gen.Atom, pid gen.PID) error {
-	if key == "occupy-release-worker" {
-		close(s.entered)
-		select {
-		case <-s.unblock:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	err := s.testRoutePersistence.Release(ctx, key, pid)
-	if key == "restart-child" && pid == s.oldPID {
-		select {
-		case s.oldReleased <- struct{}{}:
-		default:
-		}
-	}
-	return err
-}
-
-type restartingRouteActor struct{ act.Actor }
-
-func (*restartingRouteActor) HandleMessage(gen.PID, any) error {
-	return errors.New("restart requested")
-}
-
-type restartingRouteSupervisor struct {
-	act.Supervisor
-	routes ActorRoutes
-}
-
-func (s *restartingRouteSupervisor) Init(...any) (act.SupervisorSpec, error) {
-	return act.SupervisorSpec{
-		Type:    act.SupervisorTypeOneForOne,
-		Restart: act.SupervisorRestart{Strategy: act.SupervisorStrategyPermanent, Intensity: 2, Period: 5},
-		Children: []act.SupervisorChildSpec{{Name: "restart-child", Factory: func() gen.ProcessBehavior {
-			return s.routes.WithActorRoute("restart-child", &restartingRouteActor{})
-		}}},
-	}, nil
-}
-
-func TestRoutedChildRestartsWhileReleaseQueueIsBlocked(t *testing.T) {
-	store := &queuedReleaseStore{testRoutePersistence: newTestRoutePersistence(), entered: make(chan struct{}), unblock: make(chan struct{}), oldReleased: make(chan struct{}, 2)}
-	node, err := StartSimpleNode(SimpleNodeOptions{Registrar: mem.Create(), NodeName: "route-restart@localhost", Port: 11911, ActorRoutePersistence: store, NodeForwardWorker: 1, LogLevel: gen.LogLevelDisabled,
-		ActorRouterOptions: system.ActorRouterOptions{RenewWorkers: 1, OperationTimeout: 10 * time.Second}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var release sync.Once
-	defer func() { release.Do(func() { close(store.unblock) }); node.Stop() }()
-	blocker, err := node.Spawn(func() gen.ProcessBehavior {
-		return node.ActorRoutes().WithActorRoute("occupy-release-worker", &restartingRouteActor{})
-	}, gen.ProcessOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := node.Send(blocker, "exit"); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-store.entered:
-	case <-time.After(time.Second):
-		t.Fatal("release worker was not occupied")
-	}
-	sup, err := node.Spawn(func() gen.ProcessBehavior { return &restartingRouteSupervisor{routes: node.ActorRoutes()} }, gen.ProcessOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	old, err := node.ProcessPID("restart-child")
-	if err != nil {
-		t.Fatal(err)
-	}
-	store.oldPID = old
-	if err := node.Send(old, "restart"); err != nil {
-		t.Fatal(err)
-	}
-	var current gen.PID
-	awaitRouteCondition(t, func() bool {
-		current, err = node.ProcessPID("restart-child")
-		if err != nil || current == old {
-			return false
-		}
-		routed, found, _ := node.ActorRoutes().Locate(context.Background(), "restart-child")
-		return found && routed == current
-	})
-	if _, err := node.ProcessState(sup); err != nil {
-		t.Fatalf("supervisor stopped: %v", err)
-	}
-	release.Do(func() { close(store.unblock) })
-	// The queued release must preserve the replacement owner.
-	for i := 0; i < 1; i++ {
-		select {
-		case <-store.oldReleased:
-		case <-time.After(time.Second):
-			t.Fatal("old release did not finish")
-		}
-	}
-	routed, found, err := node.ActorRoutes().Locate(context.Background(), "restart-child")
-	if err != nil || !found || routed != current {
-		t.Fatalf("new route after old release: %v %v %v", routed, found, err)
-	}
-}
-
-type recoverableRouteStore struct {
-	*testRoutePersistence
-	lose   atomic.Bool
-	lost   chan struct{}
-	renews atomic.Int64
-}
-
-func (s *recoverableRouteStore) Renew(ctx context.Context, key gen.Atom, pid gen.PID, ttl time.Duration) (bool, error) {
-	if key == "recover-daemon" && s.lose.CompareAndSwap(true, false) {
-		s.mu.Lock()
-		delete(s.routes, key)
-		s.mu.Unlock()
-		close(s.lost)
-		return false, nil
-	}
-	owned, err := s.testRoutePersistence.Renew(ctx, key, pid, ttl)
-	if key == "recover-daemon" && owned {
-		s.renews.Add(1)
-	}
-	return owned, err
-}
-
 type persistentLaunchActor struct {
 	act.Actor
 	inits *atomic.Int64
@@ -169,61 +37,6 @@ type persistentLaunchActor struct {
 
 func (a *persistentLaunchActor) Init(...any) error                             { a.inits.Add(1); return nil }
 func (a *persistentLaunchActor) HandleCall(gen.PID, gen.Ref, any) (any, error) { return "alive", nil }
-
-func TestDaemonReplacesLostLeaseAndKeepsLinkedParent(t *testing.T) {
-	store := &recoverableRouteStore{testRoutePersistence: newTestRoutePersistence(), lost: make(chan struct{})}
-	var inits atomic.Int64
-	if err := system.RegisterLauncher("recover-launcher", system.Launcher{
-		Factory:         func() gen.ProcessBehavior { return &persistentLaunchActor{inits: &inits} },
-		Option:          gen.ProcessOptions{LinkParent: true},
-		RecoveryScanner: system.SingletonDaemon("recover-daemon", nil),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	defer system.UnregisterLauncher("recover-launcher")
-	node, err := StartSimpleNode(SimpleNodeOptions{Registrar: mem.Create(), NodeName: "route-recover@localhost", Port: 11912, ActorRoutePersistence: store, NodeForwardWorker: 1, LogLevel: gen.LogLevelDisabled,
-		ActorRouterOptions: system.ActorRouterOptions{LeaseTTL: time.Second, RenewInterval: 20 * time.Millisecond},
-		DaemonOptions:      system.DaemonOptions{InitialRecoveryDelay: time.Millisecond, FullRecoveryInterval: 20 * time.Millisecond, RunningGrace: time.Millisecond, LaunchTimeout: 20 * time.Millisecond, RetryInitialDelay: time.Millisecond, RetryMaxDelay: 5 * time.Millisecond, RecoveryJitterMax: -1, RetryJitterMax: -1}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer node.Stop()
-	var original gen.PID
-	awaitRouteCondition(t, func() bool {
-		var found bool
-		original, found, _ = node.ActorRoutes().Locate(context.Background(), "recover-daemon")
-		return found
-	})
-	info, err := node.ProcessInfo(original)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store.lose.Store(true)
-	select {
-	case <-store.lost:
-	case <-time.After(time.Second):
-		t.Fatal("route loss was not injected")
-	}
-	before := store.renews.Load()
-	var replacement gen.PID
-	awaitRouteCondition(t, func() bool {
-		pid, found, _ := node.ActorRoutes().Locate(context.Background(), "recover-daemon")
-		replacement = pid
-		return found && pid != original && store.renews.Load() > before
-	})
-	if inits.Load() != 2 {
-		t.Fatalf("daemon initialized %d times", inits.Load())
-	}
-	if _, err := node.ProcessState(original); !errors.Is(err, gen.ErrProcessUnknown) {
-		t.Fatalf("old actor still exists: %v", err)
-	}
-	if _, err := node.ProcessState(info.Parent); err != nil {
-		t.Fatalf("launch parent exited: %v", err)
-	}
-	if response, err := node.CallPID(replacement, "ping", 1); err != nil || response != "alive" {
-		t.Fatalf("daemon call: %v %v", response, err)
-	}
-}
 
 type concurrentLaunchActor struct {
 	act.Actor
@@ -245,6 +58,85 @@ func (a *concurrentLaunchActor) Init(...any) error {
 	a.entered <- a.Parent()
 	<-a.gate
 	return nil
+}
+
+func TestRoutedChildRestartsAfterBusinessCleanup(t *testing.T) {
+	store := newTestRoutePersistence(t)
+	defer store.Close()
+	n, e := StartSimpleNode(SimpleNodeOptions{Registrar: mem.Create(), NodeName: "supervised-route@localhost", Port: 11922, ActorRoutePersistence: store, NodeForwardWorker: 1, LogLevel: gen.LogLevelDisabled})
+	if e != nil {
+		t.Fatal(e)
+	}
+	entered := make(chan struct{})
+	finish := make(chan struct{})
+	var once sync.Once
+	defer func() { once.Do(func() { close(finish) }); n.Stop() }()
+	sup, e := n.Spawn(func() gen.ProcessBehavior {
+		return &restartingRouteSupervisor{routes: n.ActorRoutes(), entered: entered, finish: finish}
+	}, gen.ProcessOptions{})
+	if e != nil {
+		t.Fatal(e)
+	}
+	old, e := n.ProcessPID("restart-child")
+	if e != nil {
+		t.Fatal(e)
+	}
+	n.Send(old, "restart")
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("business cleanup did not start")
+	}
+	pid, found, e := routePID(store, "restart-child")
+	if e != nil || !found || pid != old {
+		t.Fatal("route released before business cleanup", pid, found, e)
+	}
+	once.Do(func() { close(finish) })
+	awaitRouteCondition(t, func() bool {
+		pid, found, e := n.ActorRoutes().Locate(context.Background(), "restart-child")
+		return e == nil && found && pid != old
+	})
+	if _, e := n.ProcessState(sup); e != nil {
+		t.Fatal("supervisor stopped", e)
+	}
+}
+
+func TestDaemonRouteExpirationCreatesFreshInstance(t *testing.T) {
+	s := newTestRoutePersistence(t)
+	var inits atomic.Int64
+	name := gen.Atom("ttl-daemon")
+	system.RegisterLauncher("ttl-launcher", system.Launcher{Factory: func() gen.ProcessBehavior { return &persistentLaunchActor{inits: &inits} }, Option: gen.ProcessOptions{LinkParent: true}, RecoveryScanner: system.SingletonDaemon(name, nil)})
+	defer system.UnregisterLauncher("ttl-launcher")
+	n, e := StartSimpleNode(SimpleNodeOptions{NodeName: "route-ttl@localhost", Port: 11923, Registrar: mem.Create(), ActorRoutePersistence: s, NodeForwardWorker: 1, LogLevel: gen.LogLevelDisabled, ActorRouterOptions: system.ActorRouterOptions{RouteTTL: 500 * time.Millisecond, LeaseSafetyMargin: 20 * time.Millisecond}, DaemonOptions: system.DaemonOptions{InitialRecoveryDelay: time.Millisecond, LeaderRecoveryDelay: time.Millisecond, FullRecoveryInterval: time.Hour, RetryInitialDelay: time.Millisecond, RetryMaxDelay: 20 * time.Millisecond, RecoveryJitterMax: -1, RetryJitterMax: -1}})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer n.Stop()
+	var old gen.PID
+	awaitRouteCondition(t, func() bool {
+		var found bool
+		old, found, _ = n.ActorRoutes().Locate(context.Background(), name)
+		return found && inits.Load() == 1
+	})
+	info, e := n.ProcessInfo(old)
+	if e != nil {
+		t.Fatal(e)
+	}
+	var next gen.PID
+	awaitRouteCondition(t, func() bool {
+		var found bool
+		next, found, _ = n.ActorRoutes().Locate(context.Background(), name)
+		return found && next != old && inits.Load() >= 2
+	})
+	if _, e := n.ProcessState(old); !errors.Is(e, gen.ErrProcessUnknown) {
+		t.Fatal("expired actor remains", e)
+	}
+	if _, e := n.ProcessState(info.Parent); e != nil {
+		t.Fatal("launch parent stopped", e)
+	}
+	if st := n.ActorRoutes().Stats(); st.LeaseLosses != 0 {
+		t.Fatal(st)
+	}
 }
 
 func TestDaemonLaunchConcurrencyUsesPersistentWorkers(t *testing.T) {
@@ -276,8 +168,8 @@ func testDaemonLaunchConcurrency(t *testing.T, initTimeout int) {
 		t.Fatal(err)
 	}
 	defer system.UnregisterLauncher("bounded-launcher")
-	node, err := StartSimpleNode(SimpleNodeOptions{Registrar: mem.Create(), NodeName: "bounded-launch@localhost", Port: 11913, ActorRoutePersistence: newTestRoutePersistence(), NodeForwardWorker: 1, LogLevel: gen.LogLevelDisabled,
-		DaemonOptions: system.DaemonOptions{InitialRecoveryDelay: time.Millisecond, FullRecoveryInterval: time.Hour, LaunchTimeout: 5 * time.Second, RetryMaxDelay: 100 * time.Millisecond, RecoveryJitterMax: -1}})
+	node, err := StartSimpleNode(SimpleNodeOptions{Registrar: mem.Create(), NodeName: "bounded-launch@localhost", Port: 11913, ActorRoutePersistence: newTestRoutePersistence(t), NodeForwardWorker: 1, LogLevel: gen.LogLevelDisabled,
+		DaemonOptions: system.DaemonOptions{LeaderRecoveryDelay: time.Millisecond, InitialRecoveryDelay: time.Millisecond, FullRecoveryInterval: time.Hour, LaunchTimeout: 5 * time.Second, RetryMaxDelay: 100 * time.Millisecond, RecoveryJitterMax: -1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +180,7 @@ func testDaemonLaunchConcurrency(t *testing.T, initTimeout int) {
 		case parent := <-entered:
 			parents[parent] = true
 		case <-time.After(5 * time.Second):
-			t.Fatal("launch workers did not start")
+			t.Fatalf("launch workers did not start: entered=%d active=%d routes=%+v", i, active.Load(), node.ActorRoutes().Stats())
 		}
 	}
 	if initTimeout > 0 {
@@ -331,9 +223,10 @@ func testDaemonLaunchConcurrency(t *testing.T, initTimeout int) {
 func TestDaemonReplacesLeaseFromPriorNodeIncarnation(t *testing.T) {
 	const name = gen.Atom("stale-daemon")
 	const nodeName = gen.Atom("stale-daemon@localhost")
-	store := newTestRoutePersistence()
+	store := newTestRoutePersistence(t)
 	old := gen.PID{Node: nodeName, ID: 99999, Creation: 1}
-	if _, err := store.Acquire(context.Background(), name, old, time.Minute); err != nil {
+	session, _ := store.OpenSession(context.Background(), old.Node, 100*time.Millisecond)
+	if _, err := store.AcquireRoute(context.Background(), session.SessionID, name, old, nil, time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	var inits atomic.Int64
@@ -346,7 +239,7 @@ func TestDaemonReplacesLeaseFromPriorNodeIncarnation(t *testing.T) {
 	defer system.UnregisterLauncher("stale-launcher")
 	node, err := StartSimpleNode(SimpleNodeOptions{Registrar: mem.Create(), NodeName: string(nodeName), Port: 11914,
 		ActorRoutePersistence: store, NodeForwardWorker: 1, LogLevel: gen.LogLevelDisabled,
-		DaemonOptions: system.DaemonOptions{InitialRecoveryDelay: time.Millisecond, FullRecoveryInterval: time.Hour, RecoveryJitterMax: -1}})
+		DaemonOptions: system.DaemonOptions{LeaderRecoveryDelay: time.Millisecond, InitialRecoveryDelay: time.Millisecond, FullRecoveryInterval: time.Hour, RecoveryJitterMax: -1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +274,7 @@ func TestDaemonExitRecoversWithoutFullScan(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer system.UnregisterLauncher(launcher)
-	node, err := StartSimpleNode(SimpleNodeOptions{NodeName: "daemon-exit-recovery@localhost", Registrar: mem.Create(), ActorRoutePersistence: newTestRoutePersistence(), NodeForwardWorker: 1, LogLevel: gen.LogLevelDisabled, DaemonOptions: system.DaemonOptions{InitialRecoveryDelay: time.Millisecond, FullRecoveryInterval: time.Hour, RetryInitialDelay: 10 * time.Millisecond, RecoveryJitterMax: -1, RetryJitterMax: -1}})
+	node, err := StartSimpleNode(SimpleNodeOptions{NodeName: "daemon-exit-recovery@localhost", Registrar: mem.Create(), ActorRoutePersistence: newTestRoutePersistence(t), NodeForwardWorker: 1, LogLevel: gen.LogLevelDisabled, DaemonOptions: system.DaemonOptions{LeaderRecoveryDelay: time.Millisecond, InitialRecoveryDelay: time.Millisecond, FullRecoveryInterval: time.Hour, RetryInitialDelay: 10 * time.Millisecond, RecoveryJitterMax: -1, RetryJitterMax: -1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,7 +314,7 @@ func (a *desiredResourceActor) Init(...any) error {
 func (a *desiredResourceActor) HandleMessage(gen.PID, any) error { return gen.TerminateReasonNormal }
 
 func TestDaemonNormalInitRefusalEndsRecovery(t *testing.T) {
-	store := newTestRoutePersistence()
+	store := newTestRoutePersistence(t)
 	var desired atomic.Bool
 	desired.Store(true)
 	var inits atomic.Int64
@@ -434,14 +327,14 @@ func TestDaemonNormalInitRefusalEndsRecovery(t *testing.T) {
 		}
 	}})
 	defer system.UnregisterLauncher("desired-resource-launcher")
-	n, err := StartSimpleNode(SimpleNodeOptions{Registrar: mem.Create(), NodeName: "desired-resource@localhost", Port: 11920, ActorRoutePersistence: store, NodeForwardWorker: 1, LogLevel: gen.LogLevelDisabled, DaemonOptions: system.DaemonOptions{InitialRecoveryDelay: time.Millisecond, FullRecoveryInterval: time.Hour, RetryInitialDelay: time.Millisecond, RetryMaxDelay: 5 * time.Millisecond, RecoveryJitterMax: -1, RetryJitterMax: -1}})
+	n, err := StartSimpleNode(SimpleNodeOptions{Registrar: mem.Create(), NodeName: "desired-resource@localhost", Port: 11920, ActorRoutePersistence: store, NodeForwardWorker: 1, LogLevel: gen.LogLevelDisabled, DaemonOptions: system.DaemonOptions{LeaderRecoveryDelay: time.Millisecond, InitialRecoveryDelay: time.Millisecond, FullRecoveryInterval: time.Hour, RetryInitialDelay: time.Millisecond, RetryMaxDelay: 5 * time.Millisecond, RecoveryJitterMax: -1, RetryJitterMax: -1}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer n.Stop()
 	var original gen.PID
 	awaitRouteCondition(t, func() bool {
-		original, _, _ = store.Lookup(context.Background(), "desired-resource")
+		original, _, _ = routePID(store, "desired-resource")
 		return inits.Load() == 1 && original != (gen.PID{})
 	})
 	desired.Store(false)
@@ -460,26 +353,26 @@ type failedExitReleaseStore struct {
 	failures atomic.Int64
 }
 
-func (s *failedExitReleaseStore) Release(ctx context.Context, key gen.Atom, pid gen.PID) error {
+func (s *failedExitReleaseStore) ReleaseRoute(ctx context.Context, id system.SessionID, key gen.Atom, pid gen.PID) error {
 	if s.fail.Load() && pid == s.old {
 		s.failures.Add(1)
 		return errors.New("release temporarily unavailable")
 	}
-	return s.testRoutePersistence.Release(ctx, key, pid)
+	return s.testRoutePersistence.ReleaseRoute(ctx, id, key, pid)
 }
 func TestDaemonRetriesExactExitCleanupWithHourLease(t *testing.T) {
-	store := &failedExitReleaseStore{testRoutePersistence: newTestRoutePersistence()}
+	store := &failedExitReleaseStore{testRoutePersistence: newTestRoutePersistence(t)}
 	var inits atomic.Int64
 	system.RegisterLauncher("release-retry-launcher", system.Launcher{Factory: func() gen.ProcessBehavior { return &persistentLaunchActor{inits: &inits} }, RecoveryScanner: system.SingletonDaemon("release-retry", nil)})
 	defer system.UnregisterLauncher("release-retry-launcher")
-	n, err := StartSimpleNode(SimpleNodeOptions{Registrar: mem.Create(), NodeName: "release-retry@localhost", Port: 11921, ActorRoutePersistence: store, NodeForwardWorker: 1, LogLevel: gen.LogLevelDisabled, ActorRouterOptions: system.ActorRouterOptions{LeaseTTL: time.Hour, RenewInterval: time.Minute}, DaemonOptions: system.DaemonOptions{InitialRecoveryDelay: time.Millisecond, FullRecoveryInterval: time.Hour, RetryInitialDelay: 10 * time.Millisecond, RetryMaxDelay: 20 * time.Millisecond, RecoveryJitterMax: -1, RetryJitterMax: -1}})
+	n, err := StartSimpleNode(SimpleNodeOptions{Registrar: mem.Create(), NodeName: "release-retry@localhost", Port: 11921, ActorRoutePersistence: store, NodeForwardWorker: 1, LogLevel: gen.LogLevelDisabled, ActorRouterOptions: system.ActorRouterOptions{RouteTTL: time.Hour}, DaemonOptions: system.DaemonOptions{LeaderRecoveryDelay: time.Millisecond, InitialRecoveryDelay: time.Millisecond, FullRecoveryInterval: time.Hour, RetryInitialDelay: 10 * time.Millisecond, RetryMaxDelay: 20 * time.Millisecond, RecoveryJitterMax: -1, RetryJitterMax: -1}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer n.Stop()
 	var original gen.PID
 	awaitRouteCondition(t, func() bool {
-		original, _, _ = store.Lookup(context.Background(), "release-retry")
+		original, _, _ = routePID(store, "release-retry")
 		return inits.Load() == 1 && original != (gen.PID{})
 	})
 	store.old = original
@@ -488,7 +381,43 @@ func TestDaemonRetriesExactExitCleanupWithHourLease(t *testing.T) {
 	awaitRouteCondition(t, func() bool { return store.failures.Load() >= 2 })
 	store.fail.Store(false)
 	awaitRouteCondition(t, func() bool {
-		pid, found, _ := store.Lookup(context.Background(), "release-retry")
+		pid, found, _ := routePID(store, "release-retry")
 		return found && pid != original && inits.Load() == 2
 	})
+}
+
+type restartingRouteActor struct {
+	act.Actor
+	entered chan struct{}
+	finish  <-chan struct{}
+}
+
+func (*restartingRouteActor) HandleMessage(gen.PID, any) error {
+	return errors.New("restart requested")
+}
+func (a *restartingRouteActor) Terminate(error) {
+	if a.entered != nil {
+		close(a.entered)
+		<-a.finish
+	}
+}
+
+type restartingRouteSupervisor struct {
+	act.Supervisor
+	routes  ActorRoutes
+	entered chan struct{}
+	finish  <-chan struct{}
+	spawns  int
+}
+
+func (s *restartingRouteSupervisor) Init(...any) (act.SupervisorSpec, error) {
+	return act.SupervisorSpec{Type: act.SupervisorTypeOneForOne, Restart: act.SupervisorRestart{Strategy: act.SupervisorStrategyPermanent, Intensity: 2, Period: 5}, Children: []act.SupervisorChildSpec{{Name: "restart-child", Factory: func() gen.ProcessBehavior {
+		s.spawns++
+		a := &restartingRouteActor{}
+		if s.spawns == 1 {
+			a.entered = s.entered
+			a.finish = s.finish
+		}
+		return s.routes.WithActorRoute("restart-child", a)
+	}}}}, nil
 }

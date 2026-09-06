@@ -5,6 +5,7 @@ import (
 	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
 	"github.com/qjpcpu/ergo-extensions/v2/registrar/mem"
+	"github.com/qjpcpu/ergo-extensions/v2/system"
 	"testing"
 	"time"
 )
@@ -14,17 +15,17 @@ type deadlineStore struct {
 	entered, release chan struct{}
 }
 
-func (s *deadlineStore) Lookup(ctx context.Context, key gen.Atom) (gen.PID, bool, error) {
+func (s *deadlineStore) ReadRoute(ctx context.Context, key gen.Atom) (system.RouteSnapshot, bool, error) {
 	if key == "slow" {
 		close(s.entered)
 		select {
 		case <-s.release:
 		case <-ctx.Done():
-			return gen.PID{}, false, ctx.Err()
+			return system.RouteSnapshot{}, false, ctx.Err()
 		}
 		key = "target"
 	}
-	return s.testRoutePersistence.Lookup(ctx, key)
+	return s.testRoutePersistence.ReadRoute(ctx, key)
 }
 
 type deadlineReceiver struct {
@@ -36,7 +37,7 @@ func (a *deadlineReceiver) Init(...any) error                      { return nil 
 func (a *deadlineReceiver) HandleMessage(_ gen.PID, msg any) error { a.received <- msg; return nil }
 
 func TestForwardDeadlineIncludesQueueAndDiscardsExpiredWork(t *testing.T) {
-	store := &deadlineStore{testRoutePersistence: newTestRoutePersistence(), entered: make(chan struct{}), release: make(chan struct{})}
+	store := &deadlineStore{testRoutePersistence: newTestRoutePersistence(t), entered: make(chan struct{}), release: make(chan struct{})}
 	node, err := StartSimpleNode(SimpleNodeOptions{NodeName: "forward-deadline@localhost", Registrar: mem.Create(), ActorRoutePersistence: store, NodeForwardWorker: 1, LogLevel: gen.LogLevelDisabled})
 	if err != nil {
 		t.Fatal(err)
@@ -82,7 +83,7 @@ func TestForwardDeadlineIncludesQueueAndDiscardsExpiredWork(t *testing.T) {
 }
 
 func TestForwardReturnsWhenNodeStops(t *testing.T) {
-	store := &deadlineStore{testRoutePersistence: newTestRoutePersistence(), entered: make(chan struct{}), release: make(chan struct{})}
+	store := &deadlineStore{testRoutePersistence: newTestRoutePersistence(t), entered: make(chan struct{}), release: make(chan struct{})}
 	node, err := StartSimpleNode(SimpleNodeOptions{NodeName: "forward-stop@localhost", Registrar: mem.Create(), ActorRoutePersistence: store, NodeForwardWorker: 1, LogLevel: gen.LogLevelDisabled})
 	if err != nil {
 		t.Fatal(err)

@@ -57,22 +57,12 @@ func (book *AddressBook) BindLocator(self gen.Atom, locator func(context.Context
 // Locate resolves a route key and rejects PIDs hosted by offline nodes.
 func (book *AddressBook) Locate(ctx context.Context, key gen.Atom) (gen.PID, bool, error) {
 	book.locatorMu.RLock()
-	self, locator := book.self, book.locator
+	locator := book.locator
 	book.locatorMu.RUnlock()
 	if locator == nil {
 		return gen.PID{}, false, errors.New("address book locator is not bound")
 	}
-	pid, found, err := locator(ctx, key)
-	if err != nil || !found {
-		return gen.PID{}, false, err
-	}
-	if pid == (gen.PID{}) || pid.Node == "" {
-		return gen.PID{}, false, nil
-	}
-	if pid.Node == self || book.GetAvailableNodes().Exist(pid.Node) {
-		return pid, true, nil
-	}
-	return gen.PID{}, false, nil
+	return locator(ctx, key)
 }
 
 func NewAddressBook() *AddressBook {

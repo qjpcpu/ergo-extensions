@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,71 +17,7 @@ import (
 
 var integrationNodeSequence atomic.Int64
 
-type integrationRoute struct {
-	pid       gen.PID
-	expiresAt time.Time
-}
-
-type integrationRoutePersistence struct {
-	mu     sync.Mutex
-	routes map[gen.Atom]integrationRoute
-}
-
-var sharedIntegrationRoutes = &integrationRoutePersistence{routes: make(map[gen.Atom]integrationRoute)}
-
-func (p *integrationRoutePersistence) Acquire(ctx context.Context, key gen.Atom, pid gen.PID, ttl time.Duration) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	current, found := p.routes[key]
-	if found && time.Now().Before(current.expiresAt) && current.pid != pid {
-		return false, nil
-	}
-	p.routes[key] = integrationRoute{pid: pid, expiresAt: time.Now().Add(ttl)}
-	return true, nil
-}
-
-func (p *integrationRoutePersistence) Renew(ctx context.Context, key gen.Atom, pid gen.PID, ttl time.Duration) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	current, found := p.routes[key]
-	if !found || current.pid != pid || !time.Now().Before(current.expiresAt) {
-		return false, nil
-	}
-	current.expiresAt = time.Now().Add(ttl)
-	p.routes[key] = current
-	return true, nil
-}
-
-func (p *integrationRoutePersistence) Release(ctx context.Context, key gen.Atom, pid gen.PID) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if current, found := p.routes[key]; found && current.pid == pid {
-		delete(p.routes, key)
-	}
-	return nil
-}
-
-func (p *integrationRoutePersistence) Lookup(ctx context.Context, key gen.Atom) (gen.PID, bool, error) {
-	if err := ctx.Err(); err != nil {
-		return gen.PID{}, false, err
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	current, found := p.routes[key]
-	if !found || !time.Now().Before(current.expiresAt) {
-		return gen.PID{}, false, nil
-	}
-	return current.pid, true, nil
-}
+var sharedIntegrationRoutes = system.NewMemoryActorRoutePersistence()
 
 func uniqueNodeName(base string) string {
 	sequence := integrationNodeSequence.Add(1)
@@ -138,18 +73,4 @@ func locateNode(node app.Node, key gen.Atom) (gen.Atom, bool) {
 		return "", false
 	}
 	return pid.Node, true
-}
-
-func (p *integrationRoutePersistence) Replace(ctx context.Context, key gen.Atom, old, pid gen.PID, ttl time.Duration) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	current, found := p.routes[key]
-	if !found || current.pid != old {
-		return false, nil
-	}
-	p.routes[key] = integrationRoute{pid: pid, expiresAt: time.Now().Add(ttl)}
-	return true, nil
 }

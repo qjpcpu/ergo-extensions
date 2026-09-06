@@ -56,7 +56,7 @@ func TestAddressBookTopology(t *testing.T) {
 	}
 }
 
-func TestAddressBookLocateFiltersInvalidAndOfflineRoutes(t *testing.T) {
+func TestAddressBookLocateDelegatesValidity(t *testing.T) {
 	book := NewAddressBook()
 	if _, _, err := book.Locate(context.Background(), "key"); err == nil {
 		t.Fatal("expected an unbound locator error")
@@ -90,12 +90,12 @@ func TestAddressBookLocateFiltersInvalidAndOfflineRoutes(t *testing.T) {
 	if err := book.SetAvailableNodes(NewNodeList("node-a", "node-b")); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []gen.Atom{"self", "remote"} {
+	for _, key := range []gen.Atom{"self", "remote", "offline", "invalid"} {
 		if pid, found, err := book.Locate(context.Background(), key); err != nil || !found || pid != routes[key] {
 			t.Fatalf("locate %s: pid=%s found=%v err=%v", key, pid, found, err)
 		}
 	}
-	for _, key := range []gen.Atom{"missing", "offline", "invalid"} {
+	for _, key := range []gen.Atom{"missing"} {
 		if _, found, err := book.Locate(context.Background(), key); err != nil || found {
 			t.Fatalf("locate %s: found=%v err=%v", key, found, err)
 		}

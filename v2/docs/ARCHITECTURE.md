@@ -2,49 +2,35 @@
 
 ## Responsibilities
 
-v2 separates actor routing from cluster topology:
+- `ActorRoutePersistence` stores node sessions and independent `key -> (session, PID)` routes.
+- `ActorRouter` binds one session to a node instance and decorates Actor, Supervisor, and Pool behaviors.
+- `AddressBook` delegates actor resolution to the router and maintains the topology snapshot for placement.
+- `membership` publishes topology from registrar events and refreshes.
+- `daemon` coordinates recovery; `cron` distributes scheduler shards using that topology.
 
-- `ActorRoutePersistence` is the external source of truth for leased `key -> PID` mappings.
-- `ActorRouter` decorates Actor, Supervisor, and Pool behavior instances and manages route lease lifecycle.
-- `AddressBook` internally combines actor lookup filtering with the local node-topology snapshot. `StartSimpleNode` exposes those capabilities separately through `ActorRoutes` and `Topology`.
-- `membership` updates that topology from registrar events and periodic refreshes.
-- `daemon` coordinates recovery and wraps launched actors with routes.
-- `cron` assigns scheduler shards from the node topology and keeps its v1 scheduling model.
+## Session and actor lifecycle
 
-There is no whereis actor, process scan, process directory, route broadcast, placement monitor, or in-memory `key -> PID` table.
+Binding opens a fresh session and starts an independent heartbeat and deadline watchdog. All routed actors on that node share its session. The router progresses through Active, Draining, Lost, and Closed. A Lost session remains terminal, even if an earlier renewal succeeds late.
 
-## Actor lifecycle
+Acquisition runs through a bounded worker pool before business Init. `AcquireRoute` atomically checks the requesting session and the expected `(SessionID, full PID)` owner. Concurrent contenders re-read after comparison failure. A storage error certified with `ErrRouteNotApplied` leaves the session usable; an uncertain write stops the router and initiates owner-side session closure.
 
-For a factory that returns `router.WithActorRoute(key, actor)` (or the Supervisor/Pool equivalent):
+The process view preserves the original behavior for Ergo's callback discovery and checks session/route deadlines through `Process.State`. This prevents another mailbox item from entering business dispatch after a local deadline. Each route has one timing-wheel entry for its deadline. Due work is handled in bounded batches, continuing immediately while more expired work remains. Already-running callbacks and goroutines must finish cooperatively.
 
-1. The wrapper binds to the node and atomically acquires the route before executing business Init.
-2. On conflict, it may replace an exited local owner after business cleanup completes, or a remote owner absent from the registrar's current node set. `Replace` compares the full old PID atomically.
-3. The lease is registered with the node's renewal manager. Business Init receives a process view exposing the original behavior so Ergo discovers its complete callback interfaces.
-4. The manager renews leases through a sharded timing wheel, bounded queues, and fixed workers. Transient failures retry; confirmed lease loss kills that exact actor incarnation and invokes its termination lifecycle.
-5. Business Terminate runs while renewal remains active. Its completion removes local instance tracking and queues a conditional release, including when business cleanup panics.
-6. Daemon termination wrappers notify recovery after route cleanup has been queued. Recovery retries if the departed PID's remote lease is still present.
-7. Shutdown gives outstanding business cleanup a bounded wait and drains pending releases. Node absence permits early takeover; TTL remains the cleanup fallback.
+Lifecycle records remain associated through acquisition, Init, and business Terminate. After cleanup, exact-owner release enters a retained retry queue. Release work receives bounded priority bursts. When pending cleanup reaches the configured threshold, new actor admission applies backpressure. Session renewal runs separately from route workers, so slow lookup, acquisition, or release cannot occupy the heartbeat worker.
 
-Router options require the lease TTL to exceed the renewal interval plus maximum jitter and timing-wheel rounding. Allow additional headroom for persistence latency and queueing.
+Normal shutdown enters Draining, stops the node, then closes the router. Router closure stops local route management and closes the shared session with an operation timeout, invalidating all associated routes. Remaining route records expire through their own TTLs; closure failures are logged and fall back to session expiration. Business cleanup belongs to the node/application shutdown flow. Ergo's node wait can finish before business termination, so callbacks still running when the session closes may overlap a replacement actor. Lost-session closure also proceeds independently of callbacks.
 
-Conditional persistence operations prevent an older actor incarnation from renewing or deleting a newer owner's route.
+## Lookup and takeover
 
-There is no companion actor, per-route goroutine, per-route mailbox, per-route timer, or periodic full-table scan. Lease metadata and timing-wheel buckets are sharded to limit lock contention. Pending flags suppress duplicate renewal jobs. Release work has priority in bounded bursts, allowing renewal work to progress. When either bounded queue is saturated, work remains bounded; a release that cannot be queued is safely resolved by lease expiry. Persistence panics are recovered per operation, the affected renewal is rescheduled, and the worker continues. `StartSimpleNode` creates the router from its persistence and options, binds it through the system supervisor, exposes it through the returned node, and closes it after stopping the node. Custom bootstrap code must create, bind, and close its `ActorRouter` itself.
+A valid route requires all three conditions:
 
-The public decorators are behavior-family specific and keep their input and output aligned: `IActor -> IActor`, `ISupervisor -> ISupervisor`, and `IPool -> IPool`. Each interface includes the corresponding complete Ergo behavior interface and the promoted `gen.Process` API. The preserving process view also keeps the user's original concrete behavior visible during Ergo initialization.
+1. Its independent route TTL remains live.
+2. The referenced session remains live in the consistent storage snapshot.
+3. Its owner is online: direct `registrar.Nodes()` membership for remote nodes, or `node.IsAlive()` for self.
 
-## Lookup path
+Lookup reads storage synchronously in the caller with an operation timeout, then checks validity. Acquisition and release use the route worker pool. Lookup and acquisition use this same predicate. Invalid routes can be replaced with an exact-owner comparison. Only a session's owning router closes it. Each check consumes the registrar's own current result; implementations may maintain their own internal cache. Name-only membership cannot identify a same-name restart until the old session is closed or expires.
 
-```text
-caller
-  -> ActorRoutes.Locate(ctx, key)
-  -> AddressBook lookup filter
-  -> ActorRoutePersistence.Lookup(ctx, key)
-  -> local immutable membership snapshot check
-  -> full gen.PID or not found
-```
-
-The hot path contains no actor mailbox, registrar query, cluster fan-out, or route cache. The local node is accepted directly. A remote PID is returned only when its node appears in the current AddressBook snapshot. An offline route is ignored but is not deleted, because persistence TTL and exact-owner operations remain authoritative.
+A registrar-based takeover may overlap a still-running old owner until its local deadline, potentially for the route TTL (24 hours by default). Route/session checks govern routing and future dispatch; they cannot reverse or serialize external business side effects.
 
 ## Membership
 
@@ -60,33 +46,14 @@ Every node runs a daemon. The leader fetches one scanner page at a time outside 
 
 Membership notifies recovery after publishing its topology snapshot, including registrar incarnation events that preserve the node-name set. Launched daemons and the custom-bootstrap spawner notify recovery after business termination. Recovery retries conditional cleanup of that exact exited PID before ensuring another instance. Shutdown recovery uses scanner data after membership changes; the 15-minute full scan repairs missed notifications.
 
-When a registered local instance already exists, the launcher attempts to restore its exact route without repeating Init. Renewal jobs carry their scheduled lease identity so old completions cannot remove a restored schedule.
+Expired routed daemons terminate and recover as fresh actor instances through the normal launch path.
 
-## Scaling properties
+## Scaling and persistence
 
-- Lookup work is O(1) locally plus one persistence lookup.
-- Topology membership checks use an immutable set and do not call the registrar.
-- Consistent-hash placement changes only a subset of keys when membership changes.
-- Cron shard preparation uses a fixed-size worker pool rather than one goroutine per shard.
-- Lease renewal load is approximately `routed actors / renewal interval`; persistence must be provisioned for this rate and retry headroom.
-- Renewal jitter spreads steady-state operations. A sharded timing wheel avoids O(N) periodic scans. Bounded priority queues and a fixed worker pool prevent goroutine or message growth during backend outages, while router-wide log limiting prevents one warning per actor.
-- Stress tests register and expire one million routes at once, exercise slow and panicking persistence, and verify bounded queues, fixed concurrency, worker survival, and exit-storm cleanup.
-- Route keys and PIDs are never broadcast between cluster nodes.
+Session renewal traffic is proportional to node count. Acquisition, lookup, release, and garbage collection remain proportional to route activity. Route TTL is independent of session renewal. The default worker count is 16, with a 65,536-entry operation queue and a 65,536 pending-release admission threshold.
 
-## Failure semantics
+The backend must atomically check sessions and compare owners, return remaining validity, honor operation contexts, reclaim unread expired records, and keep session closure terminal against concurrent requests. Local deadlines are anchored to the monotonic request start plus returned validity minus the configured safety margin. Successful persistence operations must remain durable within the backend's stated failure model.
 
-| Failure | Result |
-| --- | --- |
-| Acquire conflict | Actor initialization fails with `ErrActorRouteTaken`. |
-| Acquire storage error | Actor initialization fails with the wrapped storage error. |
-| Temporary renew error | Renewal retries; the last successful lease remains authoritative. |
-| Lost ownership | The exact old PID is killed; its termination lifecycle runs and daemons recover. |
-| Release error | Daemon exit recovery retries exact-PID cleanup; otherwise TTL is the fallback. |
-| Node missing from membership | Lookup reports not found without deleting persistence state. |
-| Node crash | Once the registrar omits the owner node, acquisition can replace the old route before TTL expiry. |
+`MemoryActorRoutePersistence` implements this contract for one process using a mutex and indexed expiration heap. Updating TTL replaces the existing heap entry, so repeated session renewal and same-owner registration retain bounded expiration metadata. A bounded background sweep reclaims unread records.
 
-## Module isolation
-
-The v2 module path is `github.com/qjpcpu/ergo-extensions/v2`. It does not import packages from the root v1 module. v1 source code and behavior remain unchanged.
-
-Recovery scans pace batches with `DaemonOptions.ScanBatchInterval` (default 50 ms). With the default batch size of 32, each leader admits at most about 640 scanned items per second, plus the initial batch; completion messages do not bypass this interval. This trades recovery speed for lower persistence load. Lease renewals remain proportional to active actors divided by the renewal interval; size that interval and Redis capacity together.
+Recovery scans pace batches with `DaemonOptions.ScanBatchInterval` (default 50 ms). At the default batch size of 32, each leader admits about 640 scanned items per second plus the initial batch. This pacing limits recovery storage pressure independently of session heartbeat traffic.

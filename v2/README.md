@@ -37,9 +37,9 @@ if err != nil {
 located, found, err := routes.Locate(context.Background(), key)
 ```
 
-`ActorRoutePersistence` has five operations: `Acquire`, `Replace`, `Renew`, `Release`, and `Lookup`. Ownership changes must compare the exact key and PID atomically. The module does not import or assume Redis, MySQL, or another storage implementation.
+`ActorRoutePersistence` provides `OpenSession`, `RenewSession`, `CloseSession`, `ReadRoute`, `AcquireRoute`, and `ReleaseRoute`. Each node owns one session; each route stores the session and full PID with an independent TTL, defaulting to 24 hours. Acquisition and release compare the exact owner atomically. The storage interface is backend independent.
 
-Each routed behavior owns a leased route. A router-wide sharded timing wheel, separate bounded renewal and high-priority release queues, and a fixed worker pool manage all local leases; there is no companion actor or per-route timer. Background renewal and release panics are isolated per operation. Lookup reads persistence directly, then uses AddressBook's local membership snapshot to reject an offline PID. It does not scan actors, broadcast, query the registrar on the hot path, or enqueue lookup work in a system actor.
+One heartbeat renews each node session. Bounded workers handle route operations and retry pending releases, while a shared timing wheel schedules route expiration. Lookup and takeover both check route/session validity and directly query `registrar.Nodes()` for remote owners. Local owners use node liveness. The topology snapshot continues to serve placement.
 
 See the repository [README](../README.md) for the full persistence contract, forwarding helpers, daemon and cron examples, operational guidance, and the v1 migration table. A runnable local example is in [examples/basic/main.go](examples/basic/main.go), and the internal design is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -56,4 +56,4 @@ See the repository [README](../README.md) for the full persistence contract, for
 
 MIT License. See [LICENSE](LICENSE).
 
-Route acquisition precedes business Init; release follows business Terminate. An owner absent from the registrar can be replaced atomically before its route TTL expires. Add `Replace` to existing persistence implementations when upgrading. Forwarding has an end-to-end deadline, and `ActorRoutes().Stats()` exposes lease scheduling and failure statistics. See the repository README for the full contract and shutdown budgets.
+Route acquisition precedes business Init; release follows business Terminate. Session loss stops all managed actors on that node; route expiration stops its actor. An owner absent from the registrar can be replaced before its session expires, allowing overlap with the old actor until its local deadline. See the repository README for the persistence contract, shutdown lifecycle, and execution limits.

@@ -2,114 +2,59 @@ package system
 
 import (
 	"context"
-	"errors"
-	"strings"
-	"sync"
-	"testing"
-	"time"
-
 	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
 	"ergo.services/ergo/testing/unit"
+	"errors"
+	"strings"
+	"testing"
+	"time"
 )
 
-type memoryActorRoute struct {
-	pid       gen.PID
-	expiresAt time.Time
+func routeStore(t testing.TB) *MemoryActorRoutePersistence {
+	t.Helper()
+	s := NewMemoryActorRoutePersistence()
+	t.Cleanup(s.Close)
+	return s
 }
-
-type memoryActorRoutePersistence struct {
-	mu         sync.Mutex
-	routes     map[gen.Atom]memoryActorRoute
-	renews     int
-	onAcquire  func()
-	acquireErr error
-	renewErr   error
-	releaseErr error
-	lookupErr  error
+func routeRouter(t testing.TB, s ActorRoutePersistence, o ActorRouterOptions) *ActorRouter {
+	t.Helper()
+	r, e := NewActorRouter(s, o)
+	if e != nil {
+		t.Fatal(e)
+	}
+	t.Cleanup(r.Close)
+	return r
 }
-
-func newMemoryActorRoutePersistence() *memoryActorRoutePersistence {
-	return &memoryActorRoutePersistence{routes: make(map[gen.Atom]memoryActorRoute)}
+func routeEventually(t testing.TB, f func() bool) {
+	t.Helper()
+	until := time.Now().Add(3 * time.Second)
+	for !f() {
+		if time.Now().After(until) {
+			t.Fatal("route condition did not converge")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
-
-func (m *memoryActorRoutePersistence) Acquire(ctx context.Context, key gen.Atom, pid gen.PID, ttl time.Duration) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
+func routeNode(t *testing.T) gen.Node {
+	a, e := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} })
+	if e != nil {
+		t.Fatal(e)
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.acquireErr != nil {
-		return false, m.acquireErr
-	}
-	if m.onAcquire != nil {
-		m.onAcquire()
-	}
-	now := time.Now()
-	current, ok := m.routes[key]
-	if ok && now.Before(current.expiresAt) && current.pid != pid {
-		return false, nil
-	}
-	m.routes[key] = memoryActorRoute{pid: pid, expiresAt: now.Add(ttl)}
-	return true, nil
+	return a.Node()
 }
-
-type initErrorActor struct {
-	act.Actor
-	err error
-}
-
-func (a *initErrorActor) Init(...any) error { return a.err }
-
-func (m *memoryActorRoutePersistence) Renew(ctx context.Context, key gen.Atom, pid gen.PID, ttl time.Duration) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
+func routeSeed(t testing.TB, s ActorRoutePersistence, key gen.Atom, pid gen.PID) SessionID {
+	t.Helper()
+	ctx := context.Background()
+	session, e := s.OpenSession(ctx, pid.Node, time.Hour)
+	if e != nil {
+		t.Fatal(e)
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.renews++
-	if m.renewErr != nil {
-		return false, m.renewErr
+	v, e := s.AcquireRoute(ctx, session.SessionID, key, pid, nil, time.Hour)
+	if e != nil || v.Status != RouteAcquired {
+		t.Fatal(v, e)
 	}
-	now := time.Now()
-	current, ok := m.routes[key]
-	if !ok || !now.Before(current.expiresAt) || current.pid != pid {
-		return false, nil
-	}
-	current.expiresAt = now.Add(ttl)
-	m.routes[key] = current
-	return true, nil
-}
-
-func (m *memoryActorRoutePersistence) Release(ctx context.Context, key gen.Atom, pid gen.PID) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.releaseErr != nil {
-		return m.releaseErr
-	}
-	if current, ok := m.routes[key]; ok && current.pid == pid {
-		delete(m.routes, key)
-	}
-	return nil
-}
-
-func (m *memoryActorRoutePersistence) Lookup(ctx context.Context, key gen.Atom) (gen.PID, bool, error) {
-	if err := ctx.Err(); err != nil {
-		return gen.PID{}, false, err
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.lookupErr != nil {
-		return gen.PID{}, false, m.lookupErr
-	}
-	current, ok := m.routes[key]
-	if !ok || !time.Now().Before(current.expiresAt) {
-		return gen.PID{}, false, nil
-	}
-	return current.pid, true, nil
+	return session.SessionID
 }
 
 type routerTestActor struct {
@@ -173,398 +118,117 @@ func (a *routerTestActor) Terminate(reason error) {
 }
 
 func TestActorRouterOptionsAndValidation(t *testing.T) {
-	store := newMemoryActorRoutePersistence()
-	router, err := NewActorRouter(store, ActorRouterOptions{})
-	if err != nil {
-		t.Fatalf("create router: %v", err)
+	s := routeStore(t)
+	r := routeRouter(t, s, ActorRouterOptions{})
+	if r.options != DefaultActorRouterOptions() {
+		t.Fatal(r.options)
 	}
-	if router.options != DefaultActorRouterOptions() {
-		t.Fatalf("unexpected defaults: %+v", router.options)
+	if _, e := NewActorRouter(nil, ActorRouterOptions{}); !errors.Is(e, ErrActorRoutePersistenceNil) {
+		t.Fatal(e)
 	}
-	if _, err := NewActorRouter(nil, ActorRouterOptions{}); !errors.Is(err, ErrActorRoutePersistenceNil) {
-		t.Fatalf("expected nil persistence error, got %v", err)
+	for _, o := range []ActorRouterOptions{{SessionTTL: -1}, {RouteChangeWorkers: -1}, {SessionTTL: time.Second}, {RouteTTL: time.Second}} {
+		if _, e := NewActorRouter(s, o); e == nil {
+			t.Fatal(o)
+		}
 	}
-	if _, err := NewActorRouter(store, ActorRouterOptions{LeaseTTL: time.Second, RenewInterval: time.Second}); err == nil {
-		t.Fatal("expected invalid lease timing")
+	if _, _, e := r.lookup(nil, "key"); !errors.Is(e, ErrActorRouterUnbound) {
+		t.Fatal(e)
 	}
-	if _, err := NewActorRouter(store, ActorRouterOptions{LeaseTTL: -1}); err == nil {
-		t.Fatal("expected negative duration error")
+	if _, _, e := r.lookup(nil, ""); !errors.Is(e, ErrActorRouteKeyEmpty) {
+		t.Fatal(e)
 	}
-	if _, _, err := router.lookup(context.Background(), "key"); !errors.Is(err, ErrActorRouterUnbound) {
-		t.Fatalf("expected unbound error, got %v", err)
+	if e := r.Bind(nil); e == nil {
+		t.Fatal("nil node accepted")
 	}
-	if _, _, err := router.lookup(context.Background(), ""); !errors.Is(err, ErrActorRouteKeyEmpty) {
-		t.Fatalf("expected empty key error, got %v", err)
+	n := routeNode(t)
+	if e := r.Bind(n); e != nil {
+		t.Fatal(e)
+	}
+	id := r.session
+	if e := r.Bind(n); e != nil || r.session != id {
+		t.Fatal(e)
+	}
+	if e := r.Bind(routeNode(t)); !errors.Is(e, ErrActorRouterBound) {
+		t.Fatal(e)
+	}
+	r.Close()
+	if _, _, e := r.lookup(nil, "key"); !errors.Is(e, ErrActorRouterClosed) {
+		t.Fatal(e)
+	}
+	if e := r.Bind(n); !errors.Is(e, ErrActorRouterClosed) {
+		t.Fatal(e)
 	}
 }
-
-func TestActorRouterWithActorRoutePreservesBehavior(t *testing.T) {
-	store := newMemoryActorRoutePersistence()
-	router, err := NewActorRouter(store, ActorRouterOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	original := &routerTestActor{}
-	actor, err := unit.Spawn(t, func() gen.ProcessBehavior {
-		return router.WithActorRoute("business/key", original)
-	})
-	if err != nil {
-		t.Fatalf("spawn routed actor: %v", err)
-	}
-	if !original.initialized || !original.behaviorOK || original.PID() != actor.PID() {
-		t.Fatalf("original behavior was not initialized correctly: initialized=%v behavior=%v pid=%s", original.initialized, original.behaviorOK, original.PID())
-	}
-	actor.SendMessage(gen.PID{}, "message")
-	if original.messages != 1 {
-		t.Fatalf("expected forwarded message, got %d", original.messages)
-	}
-	actor.Behavior().(*routedActorBehavior).ProcessTerminate(gen.TerminateReasonNormal)
-	if !original.terminated {
-		t.Fatal("expected original terminate callback")
+func TestActorRouterTypedBehavior(t *testing.T) {
+	for _, kind := range []string{"actor", "supervisor", "pool"} {
+		t.Run(kind, func(t *testing.T) {
+			r := routeRouter(t, routeStore(t), ActorRouterOptions{})
+			var original gen.ProcessBehavior
+			switch kind {
+			case "actor":
+				original = &routerTestActor{}
+			case "supervisor":
+				original = &routerTestSupervisor{}
+			case "pool":
+				original = &routerTestPool{}
+			}
+			wrapped := r.routeFactory("key", func() gen.ProcessBehavior { return original })()
+			a, e := unit.Spawn(t, func() gen.ProcessBehavior { return wrapped })
+			if e != nil {
+				t.Fatal(e)
+			}
+			defer wrapped.ProcessTerminate(gen.TerminateReasonNormal)
+			switch b := original.(type) {
+			case *routerTestActor:
+				if !b.initialized || !b.behaviorOK {
+					t.Fatal("actor behavior hidden")
+				}
+				a.SendMessage(gen.PID{}, "hello")
+				if b.messages != 1 {
+					t.Fatal(b.messages)
+				}
+			case *routerTestSupervisor:
+				if !b.initialized || !b.behaviorOK {
+					t.Fatal("supervisor behavior hidden")
+				}
+			case *routerTestPool:
+				if !b.initialized || !b.behaviorOK {
+					t.Fatal("pool behavior hidden")
+				}
+			}
+			pid, found, e := r.lookup(nil, "key")
+			if e != nil || !found || pid != a.PID() {
+				t.Fatal(pid, found, e)
+			}
+		})
 	}
 }
-
-func TestActorRouterTypedRoutesPreserveSupervisorAndPoolBehavior(t *testing.T) {
-	spawn := func(t *testing.T, factory gen.ProcessFactory) {
-		t.Helper()
-		if _, err := unit.Spawn(t, factory); err != nil {
-			t.Fatalf("spawn routed behavior: %v", err)
-		}
-	}
-
-	t.Run("supervisor", func(t *testing.T) {
-		router, err := NewActorRouter(newMemoryActorRoutePersistence(), ActorRouterOptions{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		supervisor := &routerTestSupervisor{}
-		spawn(t, func() gen.ProcessBehavior { return router.WithSupervisorRoute("supervisor", supervisor) })
-		if !supervisor.initialized || !supervisor.behaviorOK {
-			t.Fatalf("supervisor behavior was hidden: initialized=%v behavior=%v", supervisor.initialized, supervisor.behaviorOK)
-		}
-	})
-
-	t.Run("pool", func(t *testing.T) {
-		router, err := NewActorRouter(newMemoryActorRoutePersistence(), ActorRouterOptions{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		pool := &routerTestPool{}
-		spawn(t, func() gen.ProcessBehavior { return router.WithPoolRoute("pool", pool) })
-		if !pool.initialized || !pool.behaviorOK {
-			t.Fatalf("pool behavior was hidden: initialized=%v behavior=%v", pool.initialized, pool.behaviorOK)
-		}
-	})
-}
-
-func TestActorRouterTypedRoutesRejectInvalidBehavior(t *testing.T) {
-	store := newMemoryActorRoutePersistence()
-	router, err := NewActorRouter(store, ActorRouterOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := unit.Spawn(t, func() gen.ProcessBehavior { return router.WithActorRoute("", &routerTestActor{}) }); err == nil || !strings.Contains(err.Error(), ErrActorRouteKeyEmpty.Error()) {
-		t.Fatalf("expected empty key error, got %v", err)
-	}
-	if _, err := unit.Spawn(t, func() gen.ProcessBehavior { return router.WithActorRoute("key", nil) }); err == nil || !strings.Contains(err.Error(), ErrActorRouteBehaviorNil.Error()) {
-		t.Fatalf("expected nil behavior error, got %v", err)
-	}
+func TestActorRouterInvalidBehavior(t *testing.T) {
+	r := routeRouter(t, routeStore(t), ActorRouterOptions{})
 	var typedNil *routerTestActor
-	if _, err := unit.Spawn(t, func() gen.ProcessBehavior { return router.WithActorRoute("key", typedNil) }); err == nil || !strings.Contains(err.Error(), ErrActorRouteBehaviorNil.Error()) {
-		t.Fatalf("expected typed nil behavior error, got %v", err)
-	}
-	if _, err := unit.Spawn(t, router.routeFactory("key", func() gen.ProcessBehavior { return routeErrorBehavior{err: errors.New("custom")} })); err == nil || !strings.Contains(err.Error(), ErrActorRouteBehaviorMismatch.Error()) {
-		t.Fatalf("expected unsupported behavior error, got %v", err)
+	for _, test := range []struct {
+		b    gen.ProcessBehavior
+		want error
+	}{{r.WithActorRoute("", &routerTestActor{}), ErrActorRouteKeyEmpty}, {r.WithActorRoute("key", nil), ErrActorRouteBehaviorNil}, {r.WithActorRoute("key", typedNil), ErrActorRouteBehaviorNil}, {r.routeFactory("key", nil)(), ErrActorRouteFactoryNil}, {r.routeFactory("key", func() gen.ProcessBehavior { return routeErrorBehavior{} })(), ErrActorRouteBehaviorMismatch}, {(*ActorRouter)(nil).WithActorRoute("key", &routerTestActor{}), ErrActorRoutePersistenceNil}} {
+		_, e := unit.Spawn(t, func() gen.ProcessBehavior { return test.b })
+		if e == nil || !strings.Contains(e.Error(), test.want.Error()) {
+			t.Fatal(e, test.want)
+		}
+		test.b.ProcessTerminate(e)
 	}
 }
-
-func TestActorRouteInitializationFailures(t *testing.T) {
-	t.Run("behavior init", func(t *testing.T) {
-		router, err := NewActorRouter(newMemoryActorRoutePersistence(), ActorRouterOptions{})
-		if err != nil {
-			t.Fatal(err)
+func TestRenewalJitterBounded(t *testing.T) {
+	var a, b uint64
+	for range 100 {
+		d := renewalDelay("session", gen.PID{ID: 1}, time.Second, &a)
+		if d < 900*time.Millisecond || d > 1100*time.Millisecond {
+			t.Fatal(d)
 		}
-		want := errors.New("init failed")
-		if _, err := unit.Spawn(t, func() gen.ProcessBehavior {
-			return router.WithActorRoute("key", &initErrorActor{err: want})
-		}); err == nil || !strings.Contains(err.Error(), want.Error()) {
-			t.Fatalf("expected behavior init failure, got %v", err)
-		}
-	})
-
-	t.Run("persistence error", func(t *testing.T) {
-		store := newMemoryActorRoutePersistence()
-		store.acquireErr = errors.New("storage unavailable")
-		router, err := NewActorRouter(store, ActorRouterOptions{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := unit.Spawn(t, func() gen.ProcessBehavior {
-			return router.WithActorRoute("key", &routerTestActor{})
-		}); err == nil || !strings.Contains(err.Error(), store.acquireErr.Error()) {
-			t.Fatalf("expected persistence failure, got %v", err)
-		}
-	})
-
-	t.Run("route taken", func(t *testing.T) {
-		store := newMemoryActorRoutePersistence()
-		store.routes["key"] = memoryActorRoute{
-			pid:       gen.PID{Node: "other@localhost", ID: 1, Creation: 1},
-			expiresAt: time.Now().Add(time.Minute),
-		}
-		router, err := NewActorRouter(store, ActorRouterOptions{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		base, err := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} })
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := router.Bind(base.Node()); err != nil {
-			t.Fatal(err)
-		}
-		registrar, _ := base.Node().Network().Registrar()
-		registrar.(*unit.TestRegistrar).AddNode("other@localhost", nil)
-		defer router.Close()
-		if _, err := unit.Spawn(t, func() gen.ProcessBehavior {
-			return router.WithActorRoute("key", &routerTestActor{})
-		}); err == nil || !strings.Contains(err.Error(), ErrActorRouteTaken.Error()) {
-			t.Fatalf("expected route conflict, got %v", err)
-		}
-	})
-
-	t.Run("router shutdown rolls back acquisition", func(t *testing.T) {
-		store := newMemoryActorRoutePersistence()
-		router, err := NewActorRouter(store, ActorRouterOptions{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		store.onAcquire = router.Close
-		if _, err := unit.Spawn(t, func() gen.ProcessBehavior {
-			return router.WithActorRoute("key", &routerTestActor{})
-		}); err == nil || !strings.Contains(err.Error(), ErrActorRouterClosed.Error()) {
-			t.Fatalf("expected closed router failure, got %v", err)
-		}
-		if _, found, err := store.Lookup(context.Background(), "key"); err != nil || found {
-			t.Fatalf("failed initialization leaked a route: found=%v err=%v", found, err)
-		}
-	})
-
-	t.Run("nil router", func(t *testing.T) {
-		behavior := &routerTestActor{}
-		routed := &routedActorBehavior{
-			IActor: behavior,
-			route:  newRouteLifecycle(nil, "key", behavior),
-		}
-		if _, err := unit.Spawn(t, func() gen.ProcessBehavior { return routed }); err == nil || !strings.Contains(err.Error(), ErrActorRoutePersistenceNil.Error()) {
-			t.Fatalf("expected nil router failure, got %v", err)
-		}
-	})
-}
-
-func TestRouteManagerAcquireRenewRelease(t *testing.T) {
-	store := newMemoryActorRoutePersistence()
-	router, err := NewActorRouter(store, ActorRouterOptions{
-		LeaseTTL:         time.Second,
-		RenewInterval:    20 * time.Millisecond,
-		OperationTimeout: time.Second,
-		RenewWorkers:     1,
-		RenewQueueSize:   8,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(router.Close)
-	actor, err := unit.Spawn(t, func() gen.ProcessBehavior {
-		return router.WithActorRoute("key", &routerTestActor{})
-	})
-	if err != nil {
-		t.Fatalf("spawn routed actor: %v", err)
-	}
-	if pid, found, err := store.Lookup(context.Background(), "key"); err != nil || !found || pid != actor.PID() {
-		t.Fatalf("route was not acquired: pid=%s found=%v err=%v", pid, found, err)
-	}
-	deadline := time.Now().Add(time.Second)
-	renewed := false
-	for time.Now().Before(deadline) {
-		store.mu.Lock()
-		renews := store.renews
-		store.mu.Unlock()
-		if renews > 0 {
-			renewed = true
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-	if !renewed {
-		t.Fatal("route was not renewed")
-	}
-	actor.Behavior().(*routedActorBehavior).ProcessTerminate(gen.TerminateReasonNormal)
-	for time.Now().Before(deadline.Add(time.Second)) {
-		_, found, err := store.Lookup(context.Background(), "key")
-		if err == nil && !found {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatal("route was not released")
-}
-
-func TestRouteManagerDoesNotOverwriteOrDeleteNewOwner(t *testing.T) {
-	store := newMemoryActorRoutePersistence()
-	router, err := NewActorRouter(store, ActorRouterOptions{
-		LeaseTTL:         time.Minute,
-		RenewInterval:    time.Second,
-		OperationTimeout: time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(router.Close)
-	actor, err := unit.Spawn(t, func() gen.ProcessBehavior {
-		return router.WithActorRoute("key", &routerTestActor{})
-	})
-	if err != nil {
-		t.Fatalf("spawn old owner: %v", err)
-	}
-	oldPID := actor.PID()
-	newPID := gen.PID{Node: "node@localhost", ID: 2, Creation: 1}
-	store.mu.Lock()
-	store.routes["key"] = memoryActorRoute{pid: newPID, expiresAt: time.Now().Add(time.Minute)}
-	store.mu.Unlock()
-	router.manager.renew(routeLeaseJob{kind: routeLeaseRenew, key: "key", pid: oldPID})
-	actor.Behavior().(*routedActorBehavior).ProcessTerminate(gen.TerminateReasonNormal)
-	if pid, found, err := store.Lookup(context.Background(), "key"); err != nil || !found || pid != newPID {
-		t.Fatalf("new owner was modified: pid=%s found=%v err=%v", pid, found, err)
-	}
-}
-
-func TestRouteManagerRetriesPersistenceErrorAndLimitsLogs(t *testing.T) {
-	store := newMemoryActorRoutePersistence()
-	store.renewErr = errors.New("renew unavailable")
-	router, err := NewActorRouter(store, ActorRouterOptions{
-		LeaseTTL:         time.Minute,
-		RenewInterval:    time.Second,
-		OperationTimeout: time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(router.Close)
-	actor, err := unit.Spawn(t, func() gen.ProcessBehavior {
-		return router.WithActorRoute("key", &routerTestActor{})
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	router.manager.renew(routeLeaseJob{kind: routeLeaseRenew, key: "key", pid: actor.PID()})
-	shard := router.manager.shard("key")
-	shard.mu.Lock()
-	lease, found := shard.entries["key"]
-	pending := found && lease.pending
-	shard.mu.Unlock()
-	if !found || pending {
-		t.Fatalf("renew error removed or wedged lease: found=%v pending=%v", found, pending)
-	}
-	router.lastRenewLog.Store(0)
-	now := time.Now()
-	if !router.shouldLogRenewFailure(now) {
-		t.Fatal("expected the first failure to be logged")
-	}
-	if router.shouldLogRenewFailure(now.Add(time.Second)) {
-		t.Fatal("expected a nearby failure to be rate limited")
-	}
-	if !router.shouldLogRenewFailure(now.Add(routeLogInterval + time.Second)) {
-		t.Fatal("expected logging after the rate limit window")
-	}
-}
-
-func TestRenewalDelayIsBoundedAndVariesByOwner(t *testing.T) {
-	interval := 10 * time.Second
-	seen := make(map[time.Duration]struct{})
-	for i := range 256 {
-		state := uint64(0)
-		delay := renewalDelay("worker", gen.PID{Node: "node-a", ID: uint64(i + 1), Creation: 1}, interval, &state)
-		if delay < 9*time.Second || delay > 11*time.Second {
-			t.Fatalf("delay outside jitter bounds: %s", delay)
-		}
-		seen[delay] = struct{}{}
-	}
-	if len(seen) < 200 {
-		t.Fatalf("renewals are insufficiently distributed: %d unique delays", len(seen))
-	}
-	state := uint64(0)
-	if got := renewalDelay("worker", gen.PID{}, 5*time.Nanosecond, &state); got != 5*time.Nanosecond {
-		t.Fatalf("unexpected sub-jitter delay: %s", got)
-	}
-	if seed := routeJitterSeed("", gen.PID{}); seed == 0 {
-		t.Fatal("jitter seed must never be zero")
-	}
-}
-
-func TestActorRouterLocateSelfAndOfflineNode(t *testing.T) {
-	store := newMemoryActorRoutePersistence()
-	router, err := NewActorRouter(store, ActorRouterOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	actor, err := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} })
-	if err != nil {
-		t.Fatal(err)
-	}
-	book := NewAddressBook()
-	if err := book.SetAvailableNodes(NewNodeList(actor.Node().Name())); err != nil {
-		t.Fatal(err)
-	}
-	if err := router.Bind(actor.Node()); err != nil {
-		t.Fatal(err)
-	}
-	if err := book.BindLocator(actor.Node().Name(), router.lookup); err != nil {
-		t.Fatal(err)
-	}
-	if err := router.Bind(actor.Node()); err != nil {
-		t.Fatalf("same-node bind must be idempotent: %v", err)
-	}
-	self := actor.PID()
-	if acquired, err := store.Acquire(context.Background(), "self", self, time.Minute); err != nil || !acquired {
-		t.Fatal("failed to acquire self route")
-	}
-	if pid, found, err := book.Locate(context.Background(), "self"); err != nil || !found || pid != self {
-		t.Fatalf("locate self: pid=%s found=%v err=%v", pid, found, err)
-	}
-	offline := gen.PID{Node: "offline@localhost", ID: 99, Creation: 1}
-	if acquired, err := store.Acquire(context.Background(), "offline", offline, time.Minute); err != nil || !acquired {
-		t.Fatal("failed to acquire offline route")
-	}
-	if _, found, err := book.Locate(context.Background(), "offline"); err != nil || found {
-		t.Fatalf("offline route must be filtered: found=%v err=%v", found, err)
-	}
-	if _, found, err := store.Lookup(context.Background(), "offline"); err != nil || !found {
-		t.Fatal("offline lookup must not delete persistence record")
-	}
-}
-
-func TestActorRouterRenewalScheduleFitsLease(t *testing.T) {
-	for _, interval := range []time.Duration{29 * time.Second, 27 * time.Second} {
-		if _, err := normalizeActorRouterOptions(ActorRouterOptions{LeaseTTL: 30 * time.Second, RenewInterval: interval}); err == nil {
-			t.Fatalf("accepted renewal schedule that can outlive lease: %s", interval)
+		if d != renewalDelay("session", gen.PID{ID: 1}, time.Second, &b) {
+			t.Fatal("jitter not reproducible")
 		}
 	}
-	if _, err := normalizeActorRouterOptions(ActorRouterOptions{LeaseTTL: 30 * time.Second, RenewInterval: 26 * time.Second}); err != nil {
-		t.Fatal(err)
+	if renewalDelay("", gen.PID{}, 1, &a) != 1 {
+		t.Fatal("small interval changed")
 	}
-}
-
-func (p *memoryActorRoutePersistence) Replace(ctx context.Context, key gen.Atom, old, pid gen.PID, ttl time.Duration) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	current, found := p.routes[key]
-	if !found || current.pid != old {
-		return false, nil
-	}
-	p.routes[key] = memoryActorRoute{pid: pid, expiresAt: time.Now().Add(ttl)}
-	return true, nil
 }

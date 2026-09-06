@@ -92,12 +92,14 @@ func StartSimpleNode(opts SimpleNodeOptions) (Node, error) {
 
 func (n *nodeImpl) Stop() {
 	n.signalStop()
+	n.router.Drain()
 	n.Node.Stop()
 	n.router.Close()
 }
 
 func (n *nodeImpl) StopForce() {
 	n.signalStop()
+	n.router.Drain()
 	n.Node.StopForce()
 	n.router.Close()
 }

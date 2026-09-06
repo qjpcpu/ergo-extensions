@@ -2,420 +2,277 @@ package system
 
 import (
 	"context"
+	"errors"
+	"runtime"
 	"sync"
 	"time"
 
 	"ergo.services/ergo/gen"
 )
 
-const (
-	routeLeaseShardCount = 64
-	routeLeaseWheelSlots = 256
-)
-
-type routeLease struct {
-	key     gen.Atom
-	pid     gen.PID
-	next    int64
-	jitter  uint64
-	slot    uint16
-	pending bool
-}
-
-type routeLeaseShard struct {
-	mu      sync.Mutex
-	entries map[gen.Atom]*routeLease
-	wheel   [routeLeaseWheelSlots]map[*routeLease]struct{}
-}
-
-type routeLeaseJobKind uint8
-
-const (
-	routeLeaseRenew routeLeaseJobKind = iota + 1
-	routeLeaseRelease
-)
-
-type routeLeaseJob struct {
-	lease *routeLease
-	kind  routeLeaseJobKind
-	key   gen.Atom
-	pid   gen.PID
-}
-
 type routeLeaseManager struct {
-	router      *ActorRouter
-	shards      []routeLeaseShard
-	renewJobs   chan routeLeaseJob
-	releaseJobs chan routeLeaseJob
-	resolution  time.Duration
-	started     time.Time
-	cursor      int64
-	stop        chan struct{}
-	ctx         context.Context
-	cancel      context.CancelFunc
-	once        sync.Once
-	wg          sync.WaitGroup
+	router          *ActorRouter
+	jobs            chan func()
+	stop            chan struct{}
+	renewStop       chan struct{}
+	once, renewOnce sync.Once
+	started         time.Time
+	resolution      time.Duration
+	cursor          int64
+	wheel           map[int64]map[*localRouteInstance]struct{}
 }
 
-func newRouteLeaseManager(router *ActorRouter) *routeLeaseManager {
-	manager := newRouteLeaseManagerState(router)
-	manager.wg.Add(1 + router.options.RenewWorkers)
-	go manager.schedule()
-	for range router.options.RenewWorkers {
-		go manager.work()
-	}
-	return manager
+func newRouteLeaseManager(r *ActorRouter) *routeLeaseManager {
+	return &routeLeaseManager{router: r, jobs: make(chan func(), r.options.RouteChangeQueueSize), stop: make(chan struct{}), renewStop: make(chan struct{}), started: time.Now(), resolution: max(time.Nanosecond, min(100*time.Millisecond, r.options.SessionRenewInterval/10)), wheel: make(map[int64]map[*localRouteInstance]struct{})}
 }
-
-func newRouteLeaseManagerState(router *ActorRouter) *routeLeaseManager {
-	resolution := routeSchedulerResolution(router.options.RenewInterval)
-	started := time.Now()
-	ctx, cancel := context.WithCancel(context.Background())
-	manager := &routeLeaseManager{
-		router:      router,
-		shards:      make([]routeLeaseShard, routeLeaseShardCount),
-		renewJobs:   make(chan routeLeaseJob, router.options.RenewQueueSize),
-		releaseJobs: make(chan routeLeaseJob, router.options.ReleaseQueueSize),
-		resolution:  resolution,
-		started:     started,
-		cursor:      routeLeaseTick(started, started, resolution),
-		stop:        make(chan struct{}),
-		ctx:         ctx, cancel: cancel,
+func (m *routeLeaseManager) start() {
+	for range m.router.options.RouteChangeWorkers {
+		go m.worker()
 	}
-	for index := range manager.shards {
-		manager.shards[index].entries = make(map[gen.Atom]*routeLease)
-	}
-	return manager
+	go m.heartbeat()
+	go m.watchdog()
 }
-
-func (m *routeLeaseManager) track(key gen.Atom, pid gen.PID) {
-	lease := &routeLease{key: key, pid: pid}
-	delay := renewalDelay(key, pid, m.router.options.RenewInterval, &lease.jitter)
-	lease.next = time.Now().Add(delay).Sub(m.started).Nanoseconds()
-	shard := m.shard(key)
-	shard.mu.Lock()
-	if previous, found := shard.entries[key]; found {
-		m.removeFromWheelLocked(shard, previous)
+func (m *routeLeaseManager) close()     { m.once.Do(func() { m.stopRenew(); close(m.stop) }) }
+func (m *routeLeaseManager) stopRenew() { m.renewOnce.Do(func() { close(m.renewStop) }) }
+func routeWork[T any](r *ActorRouter, ctx context.Context, fn func() (T, error)) (value T, err error) {
+	r.mu.Lock()
+	m := r.manager
+	closed := r.state == routerLost || r.state == routerClosed
+	r.mu.Unlock()
+	if closed {
+		return value, ErrActorRouterClosed
 	}
-	shard.entries[key] = lease
-	m.addToWheelLocked(shard, lease)
-	shard.mu.Unlock()
-}
-
-func (m *routeLeaseManager) untrack(key gen.Atom, pid gen.PID) {
-	shard := m.shard(key)
-	shard.mu.Lock()
-	lease, found := shard.entries[key]
-	if found && lease.pid == pid {
-		m.removeFromWheelLocked(shard, lease)
-		delete(shard.entries, key)
+	if m == nil {
+		return value, ErrActorRouterUnbound
 	}
-	shard.mu.Unlock()
-	if !found || lease.pid != pid {
-		return
+	if err := ctx.Err(); err != nil {
+		return value, notApplied(err)
+	}
+	type result struct {
+		value T
+		err   error
+	}
+	done := make(chan result, 1)
+	job := func() { v, e := safeRouteCall(fn); done <- result{v, e} }
+	select {
+	case m.jobs <- job:
+	case <-ctx.Done():
+		return value, notApplied(ctx.Err())
+	default:
+		return value, ErrActorRouterBusy
 	}
 	select {
-	case m.releaseJobs <- routeLeaseJob{kind: routeLeaseRelease, key: key, pid: pid}:
-	default:
-		m.router.releaseDropped.Add(1)
-		if m.router.shouldLogRenewFailure(time.Now()) {
-			m.router.boundLogWarning("actor route release queue is full; the lease will expire: key=%s pid=%s", key, pid)
-		}
+	case got := <-done:
+		return got.value, got.err
+	case <-ctx.Done():
+		return value, ctx.Err()
+	case <-m.stop:
+		return value, ErrActorRouterClosed
 	}
 }
-
-func (m *routeLeaseManager) close() {
-	m.once.Do(func() {
-		close(m.stop)
-		m.cancel()
-		m.wg.Wait()
-		// Renewal has stopped; spend one operation budget draining queued releases.
-		ctx, cancel := m.router.operationContext(context.Background())
-		defer cancel()
-		var drain sync.WaitGroup
-		for i := 0; i < m.router.options.RenewWorkers; i++ {
-			drain.Add(1)
-			go func() {
-				defer drain.Done()
-				for ctx.Err() == nil {
-					select {
-					case job := <-m.releaseJobs:
-						m.release(ctx, job)
-					default:
-						return
-					}
-				}
-			}()
-		}
-		drain.Wait()
-		m.router.releaseDropped.Add(uint64(len(m.releaseJobs)))
-	})
-}
-
-func (m *routeLeaseManager) schedule() {
-	defer m.wg.Done()
-	ticker := time.NewTicker(m.resolution)
-	defer ticker.Stop()
-	for {
-		select {
-		case now := <-ticker.C:
-			m.enqueueDue(now)
-		case <-m.stop:
-			return
-		}
-	}
-}
-
-func (m *routeLeaseManager) enqueueDue(now time.Time) {
-	nowTick := routeLeaseTick(now, m.started, m.resolution)
-	if nowTick <= m.cursor {
-		return
-	}
-	first := m.cursor + 1
-	if nowTick-first+1 > routeLeaseWheelSlots {
-		first = nowTick - routeLeaseWheelSlots + 1
-	}
-	for tick := first; tick <= nowTick; tick++ {
-		m.enqueueWheelSlot(int(uint64(tick)%routeLeaseWheelSlots), now)
-	}
-	m.cursor = nowTick
-}
-
-func (m *routeLeaseManager) enqueueWheelSlot(slot int, now time.Time) {
-	nowNanos := now.Sub(m.started).Nanoseconds()
-	for index := range m.shards {
-		shard := &m.shards[index]
-		shard.mu.Lock()
-		bucket := shard.wheel[slot]
-		for lease := range bucket {
-			current, found := shard.entries[lease.key]
-			if !found || current != lease || int(lease.slot) != slot {
-				delete(bucket, lease)
-				continue
-			}
-			if lease.pending || lease.next > nowNanos {
-				continue
-			}
-			delete(bucket, lease)
-			select {
-			case m.renewJobs <- routeLeaseJob{kind: routeLeaseRenew, key: lease.key, pid: lease.pid, lease: lease}:
-				lease.pending = true
-			default:
-				lease.next = now.Add(m.resolution).Sub(m.started).Nanoseconds()
-				m.addToWheelLocked(shard, lease)
-			}
-		}
-		shard.mu.Unlock()
-	}
-}
-
-func (m *routeLeaseManager) work() {
-	defer m.wg.Done()
+func (m *routeLeaseManager) worker() {
+	tick := time.NewTicker(m.resolution)
+	defer tick.Stop()
 	for {
 		select {
 		case <-m.stop:
 			return
 		default:
 		}
-
-		// Give releases priority in bounded bursts, allowing renewals to progress.
-		for i := 0; i < 8; i++ {
+		// Give cleanup bounded priority without starving route admission.
+		released := false
+		for range 8 {
+			if !m.releaseOne() {
+				break
+			}
+			released = true
+		}
+		if released {
 			select {
 			case <-m.stop:
 				return
+			case job := <-m.jobs:
+				job()
 			default:
 			}
-			select {
-			case job := <-m.releaseJobs:
-				m.executeSafely(job)
-			default:
-				i = 8
+			continue
+		}
+		select {
+		case <-m.stop:
+			return
+		case job := <-m.jobs:
+			job()
+		case <-tick.C:
+		}
+	}
+}
+func (m *routeLeaseManager) releaseOne() bool {
+	r := m.router
+	r.mu.Lock()
+	e := r.pending.Front()
+	if e == nil {
+		r.mu.Unlock()
+		return false
+	}
+	i := e.Value.(*localRouteInstance)
+	if time.Now().Before(i.retryAt) {
+		r.pending.MoveToBack(e)
+		r.mu.Unlock()
+		return false
+	}
+	r.pending.Remove(e)
+	i.release = nil
+	i.releasing = true
+	id := r.session
+	lost := r.state == routerLost || r.state == routerClosed
+	r.mu.Unlock()
+	var err error
+	if !lost {
+		ctx, cancel := r.operationContext(context.Background())
+		err = safeRouteError(func() error { return r.persistence.ReleaseRoute(ctx, id, i.key, i.pid) })
+		cancel()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	i.releasing = false
+	if err != nil && r.state != routerLost && r.state != routerClosed {
+		r.releaseFailures++
+		i.retryAt = time.Now().Add(100 * time.Millisecond)
+		i.release = r.pending.PushBack(i)
+	} else {
+		r.releaseCount--
+		delete(r.instances, i.pid)
+	}
+	return true
+}
+func (m *routeLeaseManager) heartbeat() {
+	r := m.router
+	var jitter uint64
+	for {
+		timer := time.NewTimer(renewalDelay(gen.Atom(r.session), gen.PID{}, r.options.SessionRenewInterval, &jitter))
+		select {
+		case <-m.renewStop:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		r.mu.Lock()
+		active := (r.state == routerActive || r.state == routerDraining) && time.Now().Before(r.deadline)
+		id := r.session
+		r.mu.Unlock()
+		if !active {
+			r.lose()
+			return
+		}
+		start := time.Now()
+		ctx, cancel := r.operationContext(context.Background())
+		lease, err := safeRouteCall(func() (SessionLease, error) { return r.persistence.RenewSession(ctx, id, r.options.SessionTTL) })
+		cancel()
+		now := time.Now()
+		r.mu.Lock()
+		expired := !now.Before(r.deadline)
+		if err != nil {
+			r.renewFailures++
+		}
+		active = r.state == routerActive || r.state == routerDraining
+		if active && !expired && err == nil {
+			deadline := start.Add(lease.ValidFor - r.options.LeaseSafetyMargin)
+			if now.Before(deadline) {
+				r.deadline = deadline
+			} else {
+				expired = true
 			}
 		}
-
-		select {
-		case job := <-m.releaseJobs:
-			m.executeSafely(job)
-		case job := <-m.renewJobs:
-			m.executeSafely(job)
-		case <-m.stop:
+		r.mu.Unlock()
+		if expired || errors.Is(err, ErrSessionLost) {
+			r.lose()
+			return
+		}
+		if !active {
 			return
 		}
 	}
 }
-
-func (m *routeLeaseManager) executeSafely(job routeLeaseJob) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			if job.kind == routeLeaseRenew {
-				m.rescheduleRenew(job, time.Now())
+func (m *routeLeaseManager) scheduleLocked(i *localRouteInstance) {
+	m.removeLocked(i)
+	slot := int64((i.deadline.Sub(m.started) + m.resolution - 1) / m.resolution)
+	if slot <= m.cursor {
+		slot = m.cursor + 1
+	}
+	i.slot = slot
+	if m.wheel[slot] == nil {
+		m.wheel[slot] = make(map[*localRouteInstance]struct{})
+	}
+	m.wheel[slot][i] = struct{}{}
+}
+func (m *routeLeaseManager) removeLocked(i *localRouteInstance) {
+	if bucket := m.wheel[i.slot]; bucket != nil {
+		delete(bucket, i)
+		if len(bucket) == 0 {
+			delete(m.wheel, i.slot)
+		}
+	}
+	i.slot = 0
+}
+func (m *routeLeaseManager) expire(now time.Time) []gen.PID {
+	r := m.router
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	pids := make([]gen.PID, 0, 128)
+	target := int64(now.Sub(m.started) / m.resolution)
+	for steps := 0; m.cursor < target && steps < 256; steps++ {
+		slot := m.cursor + 1
+		bucket := m.wheel[slot]
+		for i := range bucket {
+			delete(bucket, i)
+			i.slot = 0
+			if !i.stopped {
+				i.stopped = true
+				pids = append(pids, i.pid)
 			}
-			if m.router.shouldLogRenewFailure(time.Now()) {
-				m.router.boundLogWarning("actor route persistence panic recovered; worker remains available: %v", recovered)
+			if len(pids) == cap(pids) {
+				return pids
 			}
 		}
-	}()
-	m.execute(job)
+		delete(m.wheel, slot)
+		m.cursor = slot
+	}
+	return pids
 }
-
-func (m *routeLeaseManager) execute(job routeLeaseJob) {
-	switch job.kind {
-	case routeLeaseRenew:
-		m.renew(job)
-	case routeLeaseRelease:
-		ctx, cancel := m.router.operationContext(context.Background())
-		defer cancel()
-		m.release(ctx, job)
-	}
-}
-
-func (m *routeLeaseManager) renew(job routeLeaseJob) {
-	shard := m.shard(job.key)
-	shard.mu.Lock()
-	original, found := shard.entries[job.key]
-	if !found || original.pid != job.pid || (job.lease != nil && original != job.lease) {
-		shard.mu.Unlock()
-		return
-	}
-	delay := time.Since(m.started).Nanoseconds() - original.next
-	shard.mu.Unlock()
-	for old := m.router.maxRenewDelay.Load(); delay > old; old = m.router.maxRenewDelay.Load() {
-		if m.router.maxRenewDelay.CompareAndSwap(old, delay) {
-			break
-		}
-	}
-	ctx, cancel := m.router.operationContext(m.ctx)
-	owned, err := m.router.persistence.Renew(ctx, job.key, job.pid, m.router.options.LeaseTTL)
-	cancel()
-	now := time.Now()
-
-	shard.mu.Lock()
-	lease, found := shard.entries[job.key]
-	if !found || lease != original {
-		shard.mu.Unlock()
-		return
-	}
-	lease.pending = false
-	if err == nil && !owned {
-		m.router.leaseLosses.Add(1)
-		delete(shard.entries, job.key)
-		shard.mu.Unlock()
-		if node, err := m.router.boundNode(); err == nil {
-			_ = node.Kill(job.pid)
-		}
-		if m.router.shouldLogRenewFailure(now) {
-			m.router.boundLogWarning("actor route lease was lost; other losses are rate limited: key=%s pid=%s", job.key, job.pid)
-		}
-		return
-	}
-	m.scheduleNextLocked(shard, job.key, lease, now)
-	shard.mu.Unlock()
-	if err != nil {
-		m.router.renewFailures.Add(1)
-	}
-	if err != nil && m.router.shouldLogRenewFailure(now) {
-		m.router.boundLogWarning("actor route renewal failed; other failures are rate limited: %v", err)
-	}
-}
-
-func (m *routeLeaseManager) rescheduleRenew(job routeLeaseJob, now time.Time) {
-	shard := m.shard(job.key)
-	shard.mu.Lock()
-	lease, found := shard.entries[job.key]
-	if found && lease.pid == job.pid && (job.lease == nil || job.lease == lease) {
-		lease.pending = false
-		m.scheduleNextLocked(shard, job.key, lease, now)
-	}
-	shard.mu.Unlock()
-}
-
-func (m *routeLeaseManager) scheduleNextLocked(shard *routeLeaseShard, key gen.Atom, lease *routeLease, now time.Time) {
-	delay := renewalDelay(key, lease.pid, m.router.options.RenewInterval, &lease.jitter)
-	lease.next = now.Add(delay).Sub(m.started).Nanoseconds()
-	m.addToWheelLocked(shard, lease)
-}
-
-func (m *routeLeaseManager) addToWheelLocked(shard *routeLeaseShard, lease *routeLease) {
-	slot := routeLeaseSlot(lease.next, m.resolution)
-	lease.slot = uint16(slot)
-	if shard.wheel[slot] == nil {
-		shard.wheel[slot] = make(map[*routeLease]struct{})
-	}
-	shard.wheel[slot][lease] = struct{}{}
-}
-
-func (m *routeLeaseManager) removeFromWheelLocked(shard *routeLeaseShard, lease *routeLease) {
-	if lease.pending {
-		return
-	}
-	delete(shard.wheel[lease.slot], lease)
-}
-
-func (m *routeLeaseManager) isTracked(key gen.Atom, pid gen.PID) bool {
-	shard := m.shard(key)
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-	lease, found := shard.entries[key]
-	return found && lease.pid == pid
-}
-
-func (m *routeLeaseManager) trackedCount() int {
-	total := 0
-	for index := range m.shards {
-		shard := &m.shards[index]
-		shard.mu.Lock()
-		total += len(shard.entries)
-		shard.mu.Unlock()
-	}
-	return total
-}
-
-func (m *routeLeaseManager) shard(key gen.Atom) *routeLeaseShard {
-	index := routeJitterSeed(key, gen.PID{}) % uint64(len(m.shards))
-	return &m.shards[index]
-}
-
-func routeLeaseTick(at time.Time, started time.Time, resolution time.Duration) int64 {
-	return at.Sub(started).Nanoseconds() / int64(resolution)
-}
-
-func routeLeaseSlot(nanos int64, resolution time.Duration) int {
-	unit := int64(resolution)
-	tick := nanos / unit
-	if nanos%unit != 0 {
-		tick++
-	}
-	return int(uint64(tick) % routeLeaseWheelSlots)
-}
-
-func routeSchedulerResolution(interval time.Duration) time.Duration {
-	resolution := interval / 20
-	if resolution > time.Second {
-		resolution = time.Second
-	}
-	if resolution < time.Millisecond {
-		resolution = time.Millisecond
-	}
-	if resolution >= interval {
-		resolution = interval / 2
-		if resolution <= 0 {
-			resolution = time.Nanosecond
-		}
-	}
-	return resolution
-}
-
-func (m *routeLeaseManager) release(ctx context.Context, job routeLeaseJob) {
-	defer func() {
-		if v := recover(); v != nil {
-			m.router.releaseFailures.Add(1)
-			m.router.boundLogWarning("actor route release panic: %v", v)
-		}
-	}()
-	if err := m.router.persistence.Release(ctx, job.key, job.pid); err != nil {
-		m.router.releaseFailures.Add(1)
-		if m.router.shouldLogRenewFailure(time.Now()) {
-			m.router.boundLogWarning("actor route release failed: %v", err)
+func (m *routeLeaseManager) watchdog() {
+	tick := time.NewTicker(m.resolution)
+	defer tick.Stop()
+	r := m.router
+	for {
+		select {
+		case <-m.stop:
+			return
+		case now := <-tick.C:
+			r.mu.Lock()
+			expired := !now.Before(r.deadline)
+			active := r.state == routerActive || r.state == routerDraining
+			node := r.node
+			r.mu.Unlock()
+			if active && expired {
+				r.lose()
+			}
+			for {
+				for _, pid := range m.expire(now) {
+					_ = node.Kill(pid)
+				}
+				r.mu.Lock()
+				caughtUp := m.cursor >= int64(now.Sub(m.started)/m.resolution)
+				r.mu.Unlock()
+				if caughtUp {
+					break
+				}
+				select {
+				case <-m.stop:
+					return
+				default:
+				}
+				runtime.Gosched()
+			}
 		}
 	}
 }

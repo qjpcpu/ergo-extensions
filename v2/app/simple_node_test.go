@@ -15,7 +15,7 @@ import (
 
 func TestSimpleNode_Integration(t *testing.T) {
 	cluster := mem.NewCluster()
-	routes := newTestRoutePersistence()
+	routes := newTestRoutePersistence(t)
 	node1, err := StartSimpleNode(SimpleNodeOptions{
 		ActorRoutePersistence: routes,
 		NodeName:              "node1@localhost",
@@ -117,7 +117,7 @@ func TestSimpleNodeRequiresActorRoutePersistence(t *testing.T) {
 func TestSimpleNodeStopForce(t *testing.T) {
 	var configuredRoutes ActorRoutes
 	node, err := StartSimpleNode(SimpleNodeOptions{
-		ActorRoutePersistence: newTestRoutePersistence(),
+		ActorRoutePersistence: newTestRoutePersistence(t),
 		NodeName:              "node-stop-force@localhost",
 		Registrar:             mem.Create(),
 		Port:                  11009,
@@ -141,13 +141,13 @@ func TestSimpleNodeStopForce(t *testing.T) {
 
 func TestSimpleNodeValidatesActorRouterOptions(t *testing.T) {
 	_, err := StartSimpleNode(SimpleNodeOptions{
-		ActorRoutePersistence: newTestRoutePersistence(),
+		ActorRoutePersistence: newTestRoutePersistence(t),
 		ActorRouterOptions: system.ActorRouterOptions{
-			LeaseTTL:      time.Second,
-			RenewInterval: time.Second,
+			SessionTTL:           time.Second,
+			SessionRenewInterval: time.Second,
 		},
 	})
-	if err == nil || !strings.Contains(err.Error(), "renew interval must be shorter") {
+	if err == nil || !strings.Contains(err.Error(), "TTL must cover") {
 		t.Fatalf("expected invalid actor router options error, got %v", err)
 	}
 }
@@ -194,7 +194,7 @@ func TestStrReturnsFirstNonEmptyOrEmpty(t *testing.T) {
 func TestForwardCallUnknownProcessDoesNotFallbackLocal(t *testing.T) {
 	cluster := mem.NewCluster()
 	node, err := StartSimpleNode(SimpleNodeOptions{
-		ActorRoutePersistence: newTestRoutePersistence(),
+		ActorRoutePersistence: newTestRoutePersistence(t),
 		NodeName:              "node-forward@localhost",
 		Port:                  11003,
 		Cookie:                "test-cookie",
@@ -215,7 +215,7 @@ func TestForwardCallUnknownProcessDoesNotFallbackLocal(t *testing.T) {
 func TestForwardSendUnknownProcessDoesNotFallbackLocal(t *testing.T) {
 	cluster := mem.NewCluster()
 	node, err := StartSimpleNode(SimpleNodeOptions{
-		ActorRoutePersistence: newTestRoutePersistence(),
+		ActorRoutePersistence: newTestRoutePersistence(t),
 		NodeName:              "node-forward-send@localhost",
 		Port:                  11004,
 		Cookie:                "test-cookie",
@@ -236,7 +236,7 @@ func TestForwardSendUnknownProcessDoesNotFallbackLocal(t *testing.T) {
 func TestWaitPIDUsesRouteActor(t *testing.T) {
 	cluster := mem.NewCluster()
 	node, err := StartSimpleNode(SimpleNodeOptions{
-		ActorRoutePersistence: newTestRoutePersistence(),
+		ActorRoutePersistence: newTestRoutePersistence(t),
 		NodeName:              "node-waitpid@localhost",
 		Port:                  11005,
 		Cookie:                "test-cookie",
@@ -271,7 +271,7 @@ func TestWaitPIDUsesRouteActor(t *testing.T) {
 func TestForwardSpawnReturnsPIDAndCanWaitWithRouteActor(t *testing.T) {
 	cluster := mem.NewCluster()
 	node, err := StartSimpleNode(SimpleNodeOptions{
-		ActorRoutePersistence: newTestRoutePersistence(),
+		ActorRoutePersistence: newTestRoutePersistence(t),
 		NodeName:              "node-spawnwait@localhost",
 		Port:                  11006,
 		Cookie:                "test-cookie",
@@ -315,7 +315,7 @@ func TestForwardSpawnReturnsPIDAndCanWaitWithRouteActor(t *testing.T) {
 func TestForwardPIDUsesRouteActor(t *testing.T) {
 	cluster := mem.NewCluster()
 	node, err := StartSimpleNode(SimpleNodeOptions{
-		ActorRoutePersistence: newTestRoutePersistence(),
+		ActorRoutePersistence: newTestRoutePersistence(t),
 		NodeName:              "node-forwardpid@localhost",
 		Port:                  11008,
 		Cookie:                "test-cookie",
@@ -357,7 +357,7 @@ func TestForwardPIDUsesRouteActor(t *testing.T) {
 func TestForwardSpawnUsesRouteActor(t *testing.T) {
 	cluster := mem.NewCluster()
 	node, err := StartSimpleNode(SimpleNodeOptions{
-		ActorRoutePersistence: newTestRoutePersistence(),
+		ActorRoutePersistence: newTestRoutePersistence(t),
 		NodeName:              "node-spawn@localhost",
 		Port:                  11007,
 		Cookie:                "test-cookie",

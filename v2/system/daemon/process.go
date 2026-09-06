@@ -148,7 +148,6 @@ type daemon struct {
 	act.Actor
 	book             core.IAddressBook
 	decorate         RouteDecorator
-	restore          RouteRestorer
 	release          func(context.Context, gen.Atom, gen.PID) error
 	ioPool           gen.PID
 	pendingReplies   int
@@ -172,24 +171,16 @@ type daemon struct {
 // RouteDecorator adds route lifecycle management to a daemon factory.
 type RouteDecorator func(key gen.Atom, factory gen.ProcessFactory) gen.ProcessFactory
 
-// RouteRestorer restores the route of an existing local routed process.
-type RouteRestorer func(context.Context, gen.Atom, gen.PID) (bool, error)
-
 func Factory(book core.IAddressBook, decorate RouteDecorator) gen.ProcessFactory {
 	return FactoryWithOptions(book, decorate, Options{})
 }
 
-func FactoryWithOptions(book core.IAddressBook, decorate RouteDecorator, opts Options, restorers ...RouteRestorer) gen.ProcessFactory {
-	var restore RouteRestorer
-	if len(restorers) > 0 {
-		restore = restorers[0]
-	}
+func FactoryWithOptions(book core.IAddressBook, decorate RouteDecorator, opts Options) gen.ProcessFactory {
 	opts = normalizeOptions(opts)
 	return func() gen.ProcessBehavior {
 		return &daemon{
 			book:          book,
 			decorate:      decorate,
-			restore:       restore,
 			recovered:     make(map[gen.Atom]struct{}),
 			launching:     make(map[gen.Atom]daemonLaunchState),
 			nextEpoch:     time.Now().UnixNano(),
@@ -201,8 +192,8 @@ func FactoryWithOptions(book core.IAddressBook, decorate RouteDecorator, opts Op
 }
 
 // FactoryWithRouteCleanup also allows recovery to release an exact exited PID.
-func FactoryWithRouteCleanup(book core.IAddressBook, decorate RouteDecorator, opts Options, restore RouteRestorer, release func(context.Context, gen.Atom, gen.PID) error) gen.ProcessFactory {
-	factory := FactoryWithOptions(book, decorate, opts, restore)
+func FactoryWithRouteCleanup(book core.IAddressBook, decorate RouteDecorator, opts Options, release func(context.Context, gen.Atom, gen.PID) error) gen.ProcessFactory {
+	factory := FactoryWithOptions(book, decorate, opts)
 	return func() gen.ProcessBehavior { w := factory().(*daemon); w.release = release; return w }
 }
 
@@ -535,7 +526,7 @@ func (w *daemon) dispatchLaunch(msg messageLaunch) error {
 	}
 	if w.launchPool == (gen.PID{}) {
 		pid, err := w.Spawn(func() gen.ProcessBehavior {
-			return &daemonLaunchPool{decorate: w.decorate, restore: w.restore}
+			return &daemonLaunchPool{decorate: w.decorate}
 		}, gen.ProcessOptions{LinkParent: true})
 		if err != nil {
 			return err
@@ -709,7 +700,6 @@ type messageLaunch struct {
 type daemonLaunchPool struct {
 	act.Pool
 	decorate RouteDecorator
-	restore  RouteRestorer
 	stopped  chan struct{}
 }
 
@@ -718,7 +708,7 @@ func (p *daemonLaunchPool) Init(...any) (act.PoolOptions, error) {
 	return act.PoolOptions{
 		PoolSize: daemonLaunchWorkers,
 		WorkerFactory: func() gen.ProcessBehavior {
-			return &daemonLaunchWorker{decorate: p.decorate, restore: p.restore, stopped: p.stopped}
+			return &daemonLaunchWorker{decorate: p.decorate, stopped: p.stopped}
 		},
 	}, nil
 }
@@ -733,7 +723,6 @@ type daemonLaunchWorker struct {
 	act.Actor
 	stopped  <-chan struct{}
 	decorate RouteDecorator
-	restore  RouteRestorer
 }
 
 func (w *daemonLaunchWorker) Init(...any) error {
@@ -779,17 +768,6 @@ func (w *daemonLaunchWorker) HandleMessage(from gen.PID, message any) error {
 
 func (w *daemonLaunchWorker) launch(msg messageLaunch) error {
 	name := msg.request.Process.ProcessName
-	if w.restore != nil {
-		if pid, err := w.Node().ProcessPID(name); err == nil {
-			restored, err := w.restore(context.Background(), name, pid)
-			if err != nil {
-				return err
-			}
-			if restored {
-				return nil
-			}
-		}
-	}
 	factory := msg.launcher.Factory
 	if w.decorate != nil {
 		factory = w.decorate(name, factory)

@@ -82,7 +82,7 @@ func (sup *systemSup) Init(args ...any) (act.SupervisorSpec, error) {
 		},
 		{
 			Name:    DaemonMonitorProcess,
-			Factory: daemon.FactoryWithRouteCleanup(book, sup.router.routeFactory, sup.daemonOptions, sup.router.restoreRoute, sup.router.releaseExitedRoute),
+			Factory: daemon.FactoryWithRouteCleanup(book, sup.router.routeFactory, sup.daemonOptions, sup.router.releaseExitedRoute),
 		},
 		{
 			Name:    CronJobProcess,
