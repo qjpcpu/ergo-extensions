@@ -84,7 +84,7 @@ func TestActorRouteUncertainAcquireClosesSession(t *testing.T) {
 			r := routeRouter(t, s, shortRouteOptions())
 			b := &routerTestActor{}
 			wrapped := r.WithActorRoute("key", b)
-			_, e := unit.Spawn(t, func() gen.ProcessBehavior { return wrapped })
+			_, e := unit.Spawn(t, func() gen.ProcessBehavior { return wrapped }, gen.ProcessOptions{})
 			if e == nil || b.initialized {
 				t.Fatal("uncertain acquisition ran Init", e)
 			}
@@ -151,7 +151,7 @@ func TestReleaseQueueRetainsFailuresAndAppliesBackpressure(t *testing.T) {
 	o.ReleaseQueueSize = 1
 	r := routeRouter(t, s, o)
 	b := r.WithActorRoute("key", &routerTestActor{})
-	_, e := unit.Spawn(t, func() gen.ProcessBehavior { return b })
+	_, e := unit.Spawn(t, func() gen.ProcessBehavior { return b }, gen.ProcessOptions{})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -172,12 +172,25 @@ func TestActorRouteDeadlineStopsBusinessDispatch(t *testing.T) {
 	r := routeRouter(t, routeStore(t), o)
 	b := &routerTestActor{}
 	wrapped := r.WithActorRoute("key", b)
-	a, e := unit.Spawn(t, func() gen.ProcessBehavior { return wrapped })
+	node := unit.StartNode(t, "deadline@localhost", gen.NodeOptions{})
+	killed := make(chan gen.PID, 1)
+	node.OnKill(func(pid gen.PID) error {
+		killed <- pid
+		return nil
+	})
+	a, e := node.Spawn(func() gen.ProcessBehavior { return wrapped }, gen.ProcessOptions{})
 	if e != nil {
 		t.Fatal(e)
 	}
 	defer wrapped.ProcessTerminate(gen.TerminateReasonNormal)
-	time.Sleep(120 * time.Millisecond)
+	select {
+	case pid := <-killed:
+		if pid != a.PID() {
+			t.Fatalf("killed %v, want %v", pid, a.PID())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expired route was not stopped")
+	}
 	a.SendMessage(gen.PID{}, "late")
 	if b.messages != 0 {
 		t.Fatal("expired route handled business")
@@ -225,14 +238,14 @@ func (a *lateInitActor) Terminate(error)   { a.terminated = true }
 func TestActorRouteLostDuringInitClosesBeforeCleanup(t *testing.T) {
 	s := routeStore(t)
 	r := routeRouter(t, s, shortRouteOptions())
-	base, e := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} })
+	base, e := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} }, gen.ProcessOptions{})
 	if e != nil {
 		t.Fatal(e)
 	}
 	b := &lateInitActor{entered: make(chan struct{}), finish: make(chan struct{})}
 	wrapped := r.WithActorRoute("key", b)
 	done := make(chan error, 1)
-	go func() { done <- wrapped.ProcessInit(base.Process()) }()
+	go func() { done <- wrapped.ProcessInit(base.Behavior().(gen.Process)) }()
 	<-b.entered
 	r.lose()
 	routeEventually(t, func() bool {
@@ -254,7 +267,7 @@ func TestActorRouteLostDuringInitClosesBeforeCleanup(t *testing.T) {
 func TestActorRouteFailedBusinessInitReleasesAfterCleanup(t *testing.T) {
 	s := routeStore(t)
 	r := routeRouter(t, s, ActorRouterOptions{})
-	base, e := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} })
+	base, e := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} }, gen.ProcessOptions{})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -263,7 +276,7 @@ func TestActorRouteFailedBusinessInitReleasesAfterCleanup(t *testing.T) {
 	want := errors.New("business init failed")
 	b := &lateInitActor{entered: make(chan struct{}), finish: finish, initError: want}
 	wrapped := r.WithActorRoute("key", b)
-	if e := wrapped.ProcessInit(base.Process()); !errors.Is(e, want) {
+	if e := wrapped.ProcessInit(base.Behavior().(gen.Process)); !errors.Is(e, want) {
 		t.Fatal(e)
 	}
 	if _, found, _ := s.ReadRoute(context.Background(), "key"); !found {
@@ -277,11 +290,11 @@ func TestActorRouteFailedBusinessInitReleasesAfterCleanup(t *testing.T) {
 }
 func TestActorRouteQueuedCancellationKeepsSession(t *testing.T) {
 	r := routeRouter(t, routeStore(t), shortRouteOptions())
-	base, e := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} })
+	base, e := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} }, gen.ProcessOptions{})
 	if e != nil {
 		t.Fatal(e)
 	}
-	r.Bind(base.Node())
+	r.Bind(base.Behavior().(gen.Process).Node())
 	entered := make(chan struct{}, 2)
 	finish := make(chan struct{})
 	for range 2 {
@@ -290,7 +303,7 @@ func TestActorRouteQueuedCancellationKeepsSession(t *testing.T) {
 	<-entered
 	<-entered
 	wrapped := r.WithActorRoute("canceled", &routerTestActor{})
-	e = wrapped.ProcessInit(base.Process())
+	e = wrapped.ProcessInit(base.Behavior().(gen.Process))
 	wrapped.ProcessTerminate(e)
 	if !errors.Is(e, context.DeadlineExceeded) {
 		close(finish)
@@ -317,13 +330,13 @@ func TestActorRouteAdmissionBackpressure(t *testing.T) {
 	o.ReleaseQueueSize = 1
 	r := routeRouter(t, s, o)
 	first := r.WithActorRoute("first", &routerTestActor{})
-	a, e := unit.Spawn(t, func() gen.ProcessBehavior { return first })
+	a, e := unit.Spawn(t, func() gen.ProcessBehavior { return first }, gen.ProcessOptions{})
 	if e != nil {
 		t.Fatal(e)
 	}
 	first.ProcessTerminate(gen.TerminateReasonNormal)
 	next := r.WithActorRoute("next", &routerTestActor{})
-	e = next.ProcessInit(a.Process())
+	e = next.ProcessInit(a.Behavior().(gen.Process))
 	next.ProcessTerminate(e)
 	if !errors.Is(e, ErrActorRouterBusy) {
 		t.Fatal(e)
@@ -411,7 +424,7 @@ func TestActorRouteCloseInvalidatesSession(t *testing.T) {
 	}
 	r := routeRouter(t, s, ActorRouterOptions{})
 	wrapped := r.WithActorRoute("key", &routerTestActor{})
-	if _, err := unit.Spawn(t, func() gen.ProcessBehavior { return wrapped }); err != nil {
+	if _, err := unit.Spawn(t, func() gen.ProcessBehavior { return wrapped }, gen.ProcessOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	defer wrapped.ProcessTerminate(gen.TerminateReasonNormal)
@@ -450,16 +463,16 @@ func TestActorRouteLookupFailureDoesNotWrite(t *testing.T) {
 	want := errors.New("read unavailable")
 	s.read = func(context.Context, gen.Atom) (RouteSnapshot, bool, error) { return RouteSnapshot{}, false, want }
 	r := routeRouter(t, s, shortRouteOptions())
-	base, e := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} })
+	base, e := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} }, gen.ProcessOptions{})
 	if e != nil {
 		t.Fatal(e)
 	}
-	r.Bind(base.Node())
+	r.Bind(base.Behavior().(gen.Process).Node())
 	if _, _, e := r.lookup(nil, "key"); !errors.Is(e, want) {
 		t.Fatal(e)
 	}
 	wrapped := r.WithActorRoute("key", &routerTestActor{})
-	e = wrapped.ProcessInit(base.Process())
+	e = wrapped.ProcessInit(base.Behavior().(gen.Process))
 	wrapped.ProcessTerminate(e)
 	if !errors.Is(e, want) || r.Stats().LeaseLosses != 0 {
 		t.Fatal(e, r.Stats())
@@ -498,7 +511,7 @@ func TestActorRouteUnknownInFlightWriteClosesBeforeLateResult(t *testing.T) {
 	r := routeRouter(t, s, shortRouteOptions())
 	b := &routerTestActor{}
 	wrapped := r.WithActorRoute("key", b)
-	_, e := unit.Spawn(t, func() gen.ProcessBehavior { return wrapped })
+	_, e := unit.Spawn(t, func() gen.ProcessBehavior { return wrapped }, gen.ProcessOptions{})
 	wrapped.ProcessTerminate(e)
 	if !errors.Is(e, context.DeadlineExceeded) && (e == nil || !strings.Contains(e.Error(), context.DeadlineExceeded.Error())) {
 		close(finish)
@@ -521,11 +534,11 @@ func TestActorRouteQueueSaturationIsBounded(t *testing.T) {
 	o.RouteChangeQueueSize = 1
 	s := routeStore(t)
 	r := routeRouter(t, s, o)
-	base, e := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} })
+	base, e := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} }, gen.ProcessOptions{})
 	if e != nil {
 		t.Fatal(e)
 	}
-	r.Bind(base.Node())
+	r.Bind(base.Behavior().(gen.Process).Node())
 	routeSeed(t, s, "available", base.PID())
 	entered := make(chan struct{}, 2)
 	finish := make(chan struct{})
@@ -539,7 +552,7 @@ func TestActorRouteQueueSaturationIsBounded(t *testing.T) {
 		t.Fatal("lookup failed while route workers were occupied", pid, found, err)
 	}
 	wrapped := r.WithActorRoute("busy", &routerTestActor{})
-	e = wrapped.ProcessInit(base.Process())
+	e = wrapped.ProcessInit(base.Behavior().(gen.Process))
 	wrapped.ProcessTerminate(e)
 	if !errors.Is(e, ErrActorRouterBusy) {
 		t.Fatal(e)
@@ -554,14 +567,14 @@ func TestActorRouteExpirationDuringInitKeepsSessionUsable(t *testing.T) {
 	o := shortRouteOptions()
 	o.RouteTTL = 60 * time.Millisecond
 	r := routeRouter(t, s, o)
-	base, e := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} })
+	base, e := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} }, gen.ProcessOptions{})
 	if e != nil {
 		t.Fatal(e)
 	}
 	b := &lateInitActor{entered: make(chan struct{}), finish: make(chan struct{})}
 	wrapped := r.WithActorRoute("key", b)
 	done := make(chan error, 1)
-	go func() { done <- wrapped.ProcessInit(base.Process()) }()
+	go func() { done <- wrapped.ProcessInit(base.Behavior().(gen.Process)) }()
 	<-b.entered
 	time.Sleep(80 * time.Millisecond)
 	close(b.finish)
@@ -588,14 +601,14 @@ func TestActorRouteDrainingDuringAcquireReleasesKnownWrite(t *testing.T) {
 		return v, e
 	}
 	r := routeRouter(t, s, ActorRouterOptions{})
-	base, e := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} })
+	base, e := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} }, gen.ProcessOptions{})
 	if e != nil {
 		t.Fatal(e)
 	}
 	b := &routerTestActor{}
 	wrapped := r.WithActorRoute("key", b)
 	done := make(chan error, 1)
-	go func() { done <- wrapped.ProcessInit(base.Process()) }()
+	go func() { done <- wrapped.ProcessInit(base.Behavior().(gen.Process)) }()
 	<-entered
 	r.Drain()
 	close(finish)

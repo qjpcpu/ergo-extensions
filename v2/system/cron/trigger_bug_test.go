@@ -6,19 +6,19 @@ import (
 
 	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
+	"ergo.services/ergo/testing/check"
 	"ergo.services/ergo/testing/unit"
 )
 
 type triggerTestProc struct{ act.Actor }
 
-func spawnTriggerTestProcess(t *testing.T) *unit.TestActor {
+func spawnTriggerTestProcess(t *testing.T) *unit.Subject {
 	t.Helper()
-	actor, err := unit.Spawn(t, func() gen.ProcessBehavior { return &triggerTestProc{} })
+	actor, err := unit.Spawn(t, func() gen.ProcessBehavior { return &triggerTestProc{} }, gen.ProcessOptions{})
 	if err != nil {
 		t.Fatalf("spawn trigger test process: %v", err)
 	}
-	actor.ClearEvents()
-	actor.Process().SetMethodFailurePattern("Send", "fail", gen.ErrProcessUnknown)
+	actor.OnSend(gen.Atom("fail")).Fail(gen.ErrProcessUnknown)
 	return actor
 }
 
@@ -31,7 +31,7 @@ func TestTriggerBatchBug(t *testing.T) {
 		{JobID: "2", TriggerProcess: "success", ScheduledAt: time.Now()},
 	}
 
-	failed, err := trigger.Fire(actor.Process(), jobs)
+	failed, err := trigger.Fire(actor.Behavior().(gen.Process), jobs)
 	if err == nil {
 		t.Fatalf("expected batch failure")
 	}
@@ -41,7 +41,8 @@ func TestTriggerBatchBug(t *testing.T) {
 
 	actor.ShouldSend().
 		To(gen.Atom("success")).
-		MessageMatching(func(message any) bool {
+		Where(func(record check.Send) bool {
+			message := record.Message
 			msg, ok := message.(MessageTrigger)
 			return ok && msg.JobID == "2"
 		}).
@@ -58,7 +59,7 @@ func TestTriggerNoBatchBug(t *testing.T) {
 		{JobID: "2", TriggerProcess: "success", ScheduledAt: time.Now()},
 	}
 
-	failed, err := trigger.Fire(actor.Process(), jobs)
+	failed, err := trigger.Fire(actor.Behavior().(gen.Process), jobs)
 	if err == nil {
 		t.Fatalf("expected non-batch failure")
 	}
@@ -68,7 +69,8 @@ func TestTriggerNoBatchBug(t *testing.T) {
 
 	actor.ShouldSend().
 		To(gen.Atom("success")).
-		MessageMatching(func(message any) bool {
+		Where(func(record check.Send) bool {
+			message := record.Message
 			msg, ok := message.(MessageTrigger)
 			return ok && msg.JobID == "2"
 		}).

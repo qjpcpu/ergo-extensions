@@ -3,7 +3,6 @@ package system
 import (
 	"context"
 	"ergo.services/ergo/gen"
-	"ergo.services/ergo/testing/unit"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -27,7 +26,7 @@ func TestActorRouteLookupAndTakeoverShareValidity(t *testing.T) {
 			id := routeSeed(t, s, "key", old)
 			reg, _ := n.Network().Registrar()
 			if mode != "offline" {
-				reg.(*unit.TestRegistrar).AddNode(old.Node, nil)
+				reg.(*routeFailRegistrar).nodes = []gen.Atom{old.Node}
 			}
 			if mode == "session closed" {
 				s.CloseSession(context.Background(), id)
@@ -67,12 +66,12 @@ func TestActorRouteRegistrarChangesAreReadDirectly(t *testing.T) {
 	pid := gen.PID{Node: "remote@localhost", ID: 1}
 	routeSeed(t, s, "key", pid)
 	reg, _ := n.Network().Registrar()
-	registrar := reg.(*unit.TestRegistrar)
-	registrar.AddNode(pid.Node, nil)
+	registrar := reg.(*routeFailRegistrar)
+	registrar.nodes = []gen.Atom{pid.Node}
 	if _, found, e := r.lookup(nil, "key"); e != nil || !found {
 		t.Fatal(found, e)
 	}
-	registrar.RemoveNode(pid.Node)
+	registrar.nodes = nil
 	if _, found, e := r.lookup(nil, "key"); e != nil || found {
 		t.Fatal(found, e)
 	}
@@ -95,10 +94,11 @@ func (n routeFailNetwork) Registrar() (gen.Registrar, error) { return n.registra
 
 type routeFailRegistrar struct {
 	gen.Registrar
-	err error
+	nodes []gen.Atom
+	err   error
 }
 
-func (r routeFailRegistrar) Nodes() ([]gen.Atom, error) { return nil, r.err }
+func (r routeFailRegistrar) Nodes() ([]gen.Atom, error) { return r.nodes, r.err }
 func TestActorRouteRegistrarFailuresPreventTakeover(t *testing.T) {
 	want := errors.New("registrar unavailable")
 	for _, network := range []gen.Network{nil, routeFailNetwork{err: want}, routeFailNetwork{registrar: routeFailRegistrar{err: want}}} {

@@ -17,7 +17,7 @@ func NewQueue[T any]() Queue[T] {
 }
 
 func NewLimitQueue[T any](size int64) Queue[T] {
-	return &simpleQueue[T]{impl: lib.NewQueueLimitMPSC(size, false)}
+	return &simpleQueue[T]{impl: lib.NewQueueLimitMPSC(size)}
 }
 
 type simpleQueue[T any] struct {

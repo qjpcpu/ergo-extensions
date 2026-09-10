@@ -40,7 +40,7 @@ func TestFacadeConstructorsAndLauncherHelpers(t *testing.T) {
 		t.Fatalf("get launcher failed: %+v ok=%v", launcher, ok)
 	}
 
-	parent, err := unit.Spawn(t, func() gen.ProcessBehavior { return &facadeParentProc{} })
+	parent, err := unit.Spawn(t, func() gen.ProcessBehavior { return &facadeParentProc{} }, gen.ProcessOptions{})
 	if err != nil {
 		t.Fatalf("spawn parent: %v", err)
 	}
@@ -50,13 +50,13 @@ func TestFacadeConstructorsAndLauncherHelpers(t *testing.T) {
 	}
 	t.Cleanup(router.Close)
 	book := NewAddressBook()
-	if err := router.Bind(parent.Node()); err != nil {
+	if err := router.Bind(parent.Behavior().(gen.Process).Node()); err != nil {
 		t.Fatal(err)
 	}
 	if err := book.BindLocator(parent.Node().Name(), router.lookup); err != nil {
 		t.Fatal(err)
 	}
-	spawner := NewSpawner(parent.Process(), router, launcherName)
+	spawner := NewSpawner(parent.Behavior().(gen.Process), router, launcherName)
 	if _, err := spawner.SpawnRegister(gen.Atom("facade-proc")); err != nil {
 		t.Fatalf("spawn through facade spawner: %v", err)
 	}

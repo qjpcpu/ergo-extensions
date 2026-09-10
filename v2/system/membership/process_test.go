@@ -11,18 +11,13 @@ import (
 	"github.com/qjpcpu/registrar/events"
 )
 
-func spawnMembership(t *testing.T, book *core.AddressBook, options Options) *unit.TestActor {
+func spawnMembership(t *testing.T, book *core.AddressBook, options Options) *unit.Subject {
 	t.Helper()
-	actor, err := unit.Spawn(t, Factory(book, options), unit.WithNodeName("node-a@localhost"))
+	actor, err := unit.StartNode(t, "node-a@localhost", gen.NodeOptions{}).Spawn(Factory(book, options), gen.ProcessOptions{})
 	if err != nil {
 		t.Fatalf("spawn membership: %v", err)
 	}
-	registrar, err := actor.Node().Network().Registrar()
-	if err != nil {
-		t.Fatalf("get test registrar: %v", err)
-	}
-	actor.Behavior().(*membership).registrar = registrar
-	actor.ClearEvents()
+	actor.Behavior().(*membership).registrar = &failingRegistrar{}
 	return actor
 }
 
@@ -57,14 +52,9 @@ func TestMembershipInitialAndPeriodicRefresh(t *testing.T) {
 	if behavior.lastUpdate.IsZero() || behavior.refreshID == 0 {
 		t.Fatalf("refresh state was not updated: %+v", behavior)
 	}
-	actor.ShouldSend().Message(messageRefresh{ID: behavior.refreshID}).Once().Assert()
+	actor.ShouldSendAfter().Message(messageRefresh{ID: behavior.refreshID}).Once().Assert()
 
-	registrar, err := actor.Node().Network().Registrar()
-	if err != nil {
-		t.Fatal(err)
-	}
-	registrar.(*unit.TestRegistrar).AddNode("node-b@localhost", []gen.Route{{Host: "127.0.0.1", Port: 1234}})
-	actor.ClearEvents()
+	behavior.registrar.(*failingRegistrar).nodes = []gen.Atom{"node-b@localhost"}
 	actor.SendMessage(gen.PID{}, messageRefresh{ID: behavior.refreshID})
 	if !book.GetAvailableNodes().Exist("node-b@localhost") {
 		t.Fatalf("remote node was not refreshed: %v", book.GetAvailableNodes().GetAll())
@@ -88,9 +78,9 @@ func TestMembershipDebouncesTopologyEventsAndIgnoresStaleMessages(t *testing.T) 
 	if behavior.topologyID != first+1 {
 		t.Fatalf("expected topology generation increment, got %d", behavior.topologyID)
 	}
-	actor.ClearEvents()
+	mark := actor.Mark()
 	actor.SendMessage(gen.PID{}, messageTopologyChanged{ID: first})
-	actor.ShouldNotSend().Assert()
+	actor.ShouldSendAfter().Since(mark).None().Assert()
 }
 
 func TestMembershipRefreshFailureKeepsLastSnapshot(t *testing.T) {
@@ -101,6 +91,7 @@ func TestMembershipRefreshFailureKeepsLastSnapshot(t *testing.T) {
 	actor := spawnMembership(t, book, Options{RetryMin: time.Millisecond, RetryMax: time.Second})
 	behavior := actor.Behavior().(*membership)
 	behavior.registrar = &failingRegistrar{err: errors.New("nodes unavailable")}
+	mark := actor.Mark()
 	behavior.refreshAndSchedule()
 	if !book.GetAvailableNodes().Exist("existing@localhost") {
 		t.Fatal("failed refresh cleared the last snapshot")
@@ -108,7 +99,7 @@ func TestMembershipRefreshFailureKeepsLastSnapshot(t *testing.T) {
 	if behavior.lastError == nil || behavior.retry != 1 {
 		t.Fatalf("failure state not recorded: retry=%d err=%v", behavior.retry, behavior.lastError)
 	}
-	actor.ShouldSend().Once().Assert()
+	actor.ShouldSendAfter().Since(mark).Once().Assert()
 }
 
 func TestMembershipInspectRetryBoundsAndTerminate(t *testing.T) {
@@ -159,17 +150,19 @@ func TestMembershipIgnoresUnrelatedAndStaleMessages(t *testing.T) {
 	behavior := actor.Behavior().(*membership)
 	behavior.refreshID = 10
 	behavior.topologyID = 20
+	mark := actor.Mark()
 	actor.SendMessage(gen.PID{}, messageRefresh{ID: 9})
 	actor.SendMessage(gen.PID{}, messageTopologyChanged{ID: 19})
 	actor.SendMessage(gen.PID{}, "unrelated")
 	if err := behavior.HandleEvent(gen.MessageEvent{Message: "unrelated"}); err != nil {
 		t.Fatal(err)
 	}
-	actor.ShouldNotSend().Assert()
+	actor.ShouldSendAfter().Since(mark).None().Assert()
 }
 
 type failingRegistrar struct {
-	err error
+	nodes []gen.Atom
+	err   error
 }
 
 func (f *failingRegistrar) Register(gen.NodeRegistrar, gen.RegisterRoutes) (gen.StaticRoutes, error) {
@@ -184,7 +177,7 @@ func (f *failingRegistrar) RegisterApplicationRoute(gen.ApplicationRoute) error 
 	return gen.ErrUnsupported
 }
 func (f *failingRegistrar) UnregisterApplicationRoute(gen.Atom) error { return gen.ErrUnsupported }
-func (f *failingRegistrar) Nodes() ([]gen.Atom, error)                { return nil, f.err }
+func (f *failingRegistrar) Nodes() ([]gen.Atom, error)                { return f.nodes, f.err }
 func (f *failingRegistrar) Config(...string) (map[string]any, error)  { return nil, gen.ErrUnsupported }
 func (f *failingRegistrar) ConfigItem(string) (any, error)            { return nil, gen.ErrUnsupported }
 func (f *failingRegistrar) Event() (gen.Event, error)                 { return gen.Event{}, f.err }

@@ -1,11 +1,13 @@
 package app
 
 import (
+	ergoapp "ergo.services/ergo/app"
 	"ergo.services/ergo/gen"
 	"github.com/qjpcpu/ergo-extensions/v2/system"
 )
 
 type simpleApp struct {
+	ergoapp.Application
 	book   *system.AddressBook
 	router *system.ActorRouter
 	routes ActorRoutes
@@ -21,7 +23,7 @@ func newApp(book *system.AddressBook, router *system.ActorRouter, routes ActorRo
 	}
 }
 
-func (app *simpleApp) Load(node gen.Node, args ...any) (gen.ApplicationSpec, error) {
+func (app *simpleApp) Load(args ...any) (gen.ApplicationSpec, error) {
 	var members []gen.ApplicationMemberSpec
 	opts := system.ApplicationMemberSpecOptions{
 		CronSource:           app.opts.CronSource,
@@ -43,9 +45,6 @@ func (app *simpleApp) Load(node gen.Node, args ...any) (gen.ApplicationSpec, err
 		Depends:     gen.ApplicationDepends{Network: true},
 	}, nil
 }
-
-func (app *simpleApp) Start(mode gen.ApplicationMode) {}
-func (app *simpleApp) Terminate(reason error)         {}
 
 func (app *simpleApp) routeMemberSpec() gen.ApplicationMemberSpec {
 	return gen.ApplicationMemberSpec{

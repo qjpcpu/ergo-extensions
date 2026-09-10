@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"ergo.services/ergo/gen"
+	"ergo.services/ergo/testing/check"
 	"ergo.services/ergo/testing/unit"
 )
 
@@ -135,14 +136,13 @@ func TestCallerCallLocalRemoteAndUnknown(t *testing.T) {
 func TestRouteActorSendToNodeLocalAndRemote(t *testing.T) {
 	self := gen.Atom("node-a@localhost")
 	remote := gen.Atom("node-b@localhost")
-	actor, err := unit.Spawn(t, func() gen.ProcessBehavior {
+	actor, err := unit.StartNode(t, self, gen.NodeOptions{}).Spawn(func() gen.ProcessBehavior {
 		return newRouteActor(nil)
-	}, unit.WithNodeName(self))
+	}, gen.ProcessOptions{})
 	if err != nil {
 		t.Fatalf("spawn route actor: %v", err)
 	}
 	route := actor.Behavior().(*routeActor)
-	actor.ClearEvents()
 
 	if err := route.sendToNode("worker", self, "local", false); err != nil {
 		t.Fatalf("local send failed: %v", err)
@@ -153,34 +153,31 @@ func TestRouteActorSendToNodeLocalAndRemote(t *testing.T) {
 		Once().
 		Assert()
 
-	actor.ClearEvents()
 	if err := route.sendToNode("worker", remote, "remote", false); err != nil {
 		t.Fatalf("remote send failed: %v", err)
 	}
 	if !hasRouteSend(actor, gen.ProcessID{Node: remote, Name: "worker"}, "remote", false) {
-		t.Fatalf("expected regular remote send, events=%#v", actor.Events())
+		t.Fatalf("expected regular remote send, events=%#v", actor.Records())
 	}
 
-	actor.ClearEvents()
 	if err := route.sendToNode("worker", remote, "important", true); err != nil {
 		t.Fatalf("important remote send failed: %v", err)
 	}
 	if !hasRouteSend(actor, gen.ProcessID{Node: remote, Name: "worker"}, "important", true) {
-		t.Fatalf("expected important remote send, events=%#v", actor.Events())
+		t.Fatalf("expected important remote send, events=%#v", actor.Records())
 	}
 }
 
 func TestRouteActorSendToPIDLocalAndRemote(t *testing.T) {
 	self := gen.Atom("node-a@localhost")
 	remote := gen.Atom("node-b@localhost")
-	actor, err := unit.Spawn(t, func() gen.ProcessBehavior {
+	actor, err := unit.StartNode(t, self, gen.NodeOptions{}).Spawn(func() gen.ProcessBehavior {
 		return newRouteActor(nil)
-	}, unit.WithNodeName(self))
+	}, gen.ProcessOptions{})
 	if err != nil {
 		t.Fatalf("spawn route actor: %v", err)
 	}
 	route := actor.Behavior().(*routeActor)
-	actor.ClearEvents()
 
 	localPID := gen.PID{Node: self, ID: 1, Creation: 1}
 	if err := route.sendToPID(localPID, "local", false); err != nil {
@@ -192,21 +189,19 @@ func TestRouteActorSendToPIDLocalAndRemote(t *testing.T) {
 		Once().
 		Assert()
 
-	actor.ClearEvents()
 	remotePID := gen.PID{Node: remote, ID: 2, Creation: 1}
 	if err := route.sendToPID(remotePID, "remote", false); err != nil {
 		t.Fatalf("remote PID send failed: %v", err)
 	}
 	if !hasRouteSend(actor, remotePID, "remote", false) {
-		t.Fatalf("expected regular remote PID send, events=%#v", actor.Events())
+		t.Fatalf("expected regular remote PID send, events=%#v", actor.Records())
 	}
 
-	actor.ClearEvents()
 	if err := route.sendToPID(remotePID, "important", true); err != nil {
 		t.Fatalf("important remote PID send failed: %v", err)
 	}
 	if !hasRouteSend(actor, remotePID, "important", true) {
-		t.Fatalf("expected important remote PID send, events=%#v", actor.Events())
+		t.Fatalf("expected important remote PID send, events=%#v", actor.Records())
 	}
 }
 
@@ -215,9 +210,9 @@ func TestRouteActorForwardSendUsesLocator(t *testing.T) {
 	remote := gen.Atom("node-b@localhost")
 	remotePID := gen.PID{Node: remote, ID: 2, Creation: 1}
 	locator := actorLocatorStub{routes: map[gen.Atom]gen.PID{"worker": remotePID}}
-	actor, err := unit.Spawn(t, func() gen.ProcessBehavior {
+	actor, err := unit.StartNode(t, self, gen.NodeOptions{}).Spawn(func() gen.ProcessBehavior {
 		return newRouteActor(locator)
-	}, unit.WithNodeName(self))
+	}, gen.ProcessOptions{})
 	if err != nil {
 		t.Fatalf("spawn route actor: %v", err)
 	}
@@ -227,15 +222,14 @@ func TestRouteActorForwardSendUsesLocator(t *testing.T) {
 		t.Fatalf("forward send failed: %v", err)
 	}
 	if !hasRouteSend(actor, remotePID, "first", false) {
-		t.Fatalf("expected remote forward send, events=%#v", actor.Events())
+		t.Fatalf("expected remote forward send, events=%#v", actor.Records())
 	}
 
-	actor.ClearEvents()
 	if err := route.forwardSend("worker", "", "important", true); err != nil {
 		t.Fatalf("important forward send failed: %v", err)
 	}
 	if !hasRouteSend(actor, remotePID, "important", true) {
-		t.Fatalf("expected important send to use located PID, events=%#v", actor.Events())
+		t.Fatalf("expected important send to use located PID, events=%#v", actor.Records())
 	}
 
 	if err := route.forwardSend("missing", "", "nope", false); !errors.Is(err, gen.ErrProcessUnknown) {
@@ -244,31 +238,32 @@ func TestRouteActorForwardSendUsesLocator(t *testing.T) {
 }
 
 func TestRouteActorImportantCallPreservesTimeout(t *testing.T) {
-	actor, err := unit.Spawn(t, func() gen.ProcessBehavior {
+	actor, err := unit.StartNode(t, "node-a@localhost", gen.NodeOptions{}).Spawn(func() gen.ProcessBehavior {
 		return newRouteActor(nil)
-	}, unit.WithNodeName("node-a@localhost"))
+	}, gen.ProcessOptions{})
 	if err != nil {
 		t.Fatalf("spawn route actor: %v", err)
 	}
 	route := actor.Behavior().(*routeActor)
-	actor.ClearEvents()
 
 	to := gen.ProcessID{Node: "node-b@localhost", Name: "worker"}
+	process := &timeoutProcess{Process: route.Process}
+	route.Process = process
 	if _, err := route.callImportantWithTimeout(to, "ping", 7); err != nil {
 		t.Fatalf("important call failed: %v", err)
 	}
 	if route.ImportantDelivery() {
 		t.Fatal("important delivery flag was not restored")
 	}
-	if !hasRouteCallWithTimeout(actor, to, "ping", 7) {
-		t.Fatalf("expected call with timeout, events=%#v", actor.Events())
+	if process.target != to || process.request != "ping" || process.timeout != 7 || !process.important {
+		t.Fatalf("call parameters: %+v", process)
 	}
 }
 
-func hasRouteSend(actor *unit.TestActor, to any, message any, important bool) bool {
-	for _, event := range actor.Events() {
-		send, ok := event.(unit.SendEvent)
-		if !ok || send.Important != important || send.To != to {
+func hasRouteSend(actor *unit.Subject, to any, message any, important bool) bool {
+	for _, event := range actor.Records() {
+		send, ok := event.(check.Send)
+		if !ok || send.Options.ImportantDelivery != important || send.To != to {
 			continue
 		}
 		if send.Message == message {
@@ -278,17 +273,17 @@ func hasRouteSend(actor *unit.TestActor, to any, message any, important bool) bo
 	return false
 }
 
-func hasRouteCallWithTimeout(actor *unit.TestActor, to any, request any, timeout int) bool {
-	for _, event := range actor.Events() {
-		call, ok := event.(unit.CallEvent)
-		if !ok || call.To != to {
-			continue
-		}
-		if call.Request == request && call.Timeout == timeout {
-			return true
-		}
-	}
-	return false
+type timeoutProcess struct {
+	gen.Process
+	target, request any
+	timeout         int
+	important       bool
+}
+
+func (p *timeoutProcess) CallWithTimeout(to, request any, timeout int) (any, error) {
+	p.target, p.request, p.timeout = to, request, timeout
+	p.important = p.ImportantDelivery()
+	return "ok", nil
 }
 
 type callerProcessStub struct {

@@ -781,6 +781,7 @@ type routeErrorBehavior struct {
 func (r routeErrorBehavior) ProcessInit(gen.Process, ...any) error { return r.err }
 func (r routeErrorBehavior) ProcessRun() error                     { return r.err }
 func (routeErrorBehavior) ProcessTerminate(error)                  {}
+func (routeErrorBehavior) ProcessKind() gen.ProcessKind            { return gen.ProcessKindCustom }
 
 func renewalDelay(key gen.Atom, owner gen.PID, interval time.Duration, state *uint64) time.Duration {
 	jitter := interval / 10

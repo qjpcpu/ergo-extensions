@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"ergo.services/ergo/gen"
+	"ergo.services/ergo/testing/check"
 	"ergo.services/ergo/testing/unit"
 )
 
@@ -37,16 +38,16 @@ func TestWatchActorDrainsBatchesAndTerminatesOnClosedChannel(t *testing.T) {
 		watch: func(context.Context, WatchRequest) (<-chan JobDeltaBatch, error) {
 			return ch, nil
 		},
-	}, 3, 9, WatchRequest{Shards: []uint32{3}, Since: "cursor"}))
+	}, 3, 9, WatchRequest{Shards: []uint32{3}, Since: "cursor"}), gen.ProcessOptions{})
 	if err != nil {
 		t.Fatalf("spawn watch actor: %v", err)
 	}
-	actor.ClearEvents()
 
 	actor.SendMessage(gen.PID{}, messageWatchPoll{})
 	actor.ShouldSend().
 		To(parent).
-		MessageMatching(func(message any) bool {
+		Where(func(record check.Send) bool {
+			message := record.Message
 			msg, ok := message.(messageWatchBatch)
 			return ok &&
 				msg.shard == 3 &&

@@ -58,17 +58,16 @@ func TestSpawner(t *testing.T) {
 	RegisterLauncher(launcherName, Launcher{Factory: factory})
 	defer UnregisterLauncher(launcherName)
 
-	parent, err := unit.Spawn(t, func() gen.ProcessBehavior { return &spawnerParentProc{} })
+	parent, err := unit.Spawn(t, func() gen.ProcessBehavior { return &spawnerParentProc{} }, gen.ProcessOptions{})
 	if err != nil {
 		t.Fatalf("spawn parent actor: %v", err)
 	}
-	parent.ClearEvents()
 	var routeKey gen.Atom
 	decorate := func(key gen.Atom, factory gen.ProcessFactory) gen.ProcessFactory {
 		routeKey = key
 		return factory
 	}
-	spawner := NewSpawner(parent.Process(), decorate, launcherName)
+	spawner := NewSpawner(parent.Behavior().(gen.Process), decorate, launcherName)
 
 	procName := gen.Atom("my_proc")
 	pid, err := spawner.SpawnRegister(procName)
@@ -84,13 +83,13 @@ func TestSpawner(t *testing.T) {
 	}
 
 	// Test non-existent launcher
-	spawnerInvalid := NewSpawner(parent.Process(), decorate, "non_existent")
+	spawnerInvalid := NewSpawner(parent.Behavior().(gen.Process), decorate, "non_existent")
 	_, err = spawnerInvalid.SpawnRegister("any")
 	if err == nil {
 		t.Errorf("expected error for non-existent launcher")
 	}
 
-	spawnerWithoutRouter := NewSpawner(parent.Process(), nil, launcherName)
+	spawnerWithoutRouter := NewSpawner(parent.Behavior().(gen.Process), nil, launcherName)
 	if _, err := spawnerWithoutRouter.SpawnRegister("any"); err == nil {
 		t.Error("expected error for missing actor router")
 	}

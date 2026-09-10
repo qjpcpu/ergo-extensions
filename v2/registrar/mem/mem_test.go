@@ -2,6 +2,7 @@ package mem
 
 import (
 	"testing"
+	"time"
 
 	"ergo.services/ergo/gen"
 	"github.com/qjpcpu/registrar/constants"
@@ -231,6 +232,8 @@ func (n *registrarNodeStub) Name() gen.Atom { return n.name }
 
 func (n *registrarNodeStub) Creation() int64 { return 0 }
 
+func (n *registrarNodeStub) Peers() []gen.Atom { return nil }
+
 func (n *registrarNodeStub) SetEnv(name gen.Env, value any) {}
 
 func (n *registrarNodeStub) RegisterEvent(name gen.Atom, options gen.EventOptions) (gen.Ref, error) {
@@ -252,5 +255,7 @@ func (n *registrarNodeStub) SendEvent(name gen.Atom, token gen.Ref, options gen.
 func (n *registrarNodeStub) Log() gen.Log { return nil }
 
 func (n *registrarNodeStub) Stop() {}
+
+func (n *registrarNodeStub) StopWithTimeout(time.Duration) {}
 
 func (n *registrarNodeStub) StopForce() {}

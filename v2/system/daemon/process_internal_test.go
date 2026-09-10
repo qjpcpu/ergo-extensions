@@ -11,6 +11,7 @@ import (
 
 	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
+	"ergo.services/ergo/testing/check"
 	"ergo.services/ergo/testing/unit"
 	core "github.com/qjpcpu/ergo-extensions/v2/system/internal/core"
 	"github.com/qjpcpu/registrar/events"
@@ -48,6 +49,19 @@ func setDaemonRoute(book *core.AddressBook, key gen.Atom, pid gen.PID) {
 
 type daemonTestProc struct{ act.Actor }
 
+type scanResultNode struct {
+	gen.Node
+	pages chan messageScanPage
+}
+
+func (n *scanResultNode) Send(to any, message any) error {
+	if page, ok := message.(messageScanPage); ok {
+		n.pages <- page
+		return nil
+	}
+	return n.Node.Send(to, message)
+}
+
 type daemonTestRegistrar struct{}
 
 func (r *daemonTestRegistrar) Register(gen.NodeRegistrar, gen.RegisterRoutes) (gen.StaticRoutes, error) {
@@ -72,14 +86,14 @@ func (r *daemonTestRegistrar) Info() gen.RegistrarInfo   { return gen.RegistrarI
 func (r *daemonTestRegistrar) Terminate()                {}
 func (r *daemonTestRegistrar) Version() gen.Version      { return gen.Version{} }
 
-func spawnDaemonUnit(t *testing.T, book core.IAddressBook, self gen.Atom) *unit.TestActor {
+func spawnDaemonUnit(t *testing.T, book core.IAddressBook, self gen.Atom) *unit.Subject {
 	t.Helper()
 	if concrete, ok := book.(*core.AddressBook); ok {
 		if err := concrete.BindLocator(self, daemonRouteStoreFor(concrete).Locate); err != nil {
 			t.Fatalf("bind test locator: %v", err)
 		}
 	}
-	actor, err := unit.Spawn(t, FactoryWithOptions(book, daemonTestDecorator, Options{
+	actor, err := unit.StartNode(t, self, gen.NodeOptions{}).Spawn(FactoryWithOptions(book, daemonTestDecorator, Options{
 		InitialRecoveryDelay:  time.Millisecond,
 		LeaderRecoveryDelay:   time.Millisecond,
 		NodeLeftRecoveryDelay: time.Millisecond,
@@ -90,11 +104,13 @@ func spawnDaemonUnit(t *testing.T, book core.IAddressBook, self gen.Atom) *unit.
 		RetryMaxDelay:         time.Millisecond,
 		RecoveryJitterMax:     -1,
 		RetryJitterMax:        -1,
-	}), unit.WithNodeName(self))
+	}), gen.ProcessOptions{})
 	if err != nil {
 		t.Fatalf("spawn daemon actor: %v", err)
 	}
-	actor.ClearEvents()
+	actor.Node().OnInfo(func() (gen.NodeInfo, error) { return gen.NodeInfo{}, nil })
+	node := &scanResultNode{Node: actor.Behavior().(gen.Process).Node(), pages: make(chan messageScanPage, 1)}
+	actor.OnNode(func() gen.Node { return node })
 	return actor
 }
 
@@ -115,10 +131,10 @@ func findDaemonNameWithPrefix(t *testing.T, book *core.AddressBook, owner gen.At
 	return ""
 }
 
-func hasDaemonSend(actor *unit.TestActor, to gen.ProcessID, match func(any) bool) bool {
-	for _, event := range actor.Events() {
-		send, ok := event.(unit.SendEvent)
-		if !ok || send.Important || send.To != to {
+func hasDaemonSend(actor *unit.Subject, to gen.ProcessID, match func(any) bool) bool {
+	for _, event := range actor.Records() {
+		send, ok := event.(check.Send)
+		if !ok || send.Options.ImportantDelivery || send.To != to {
 			continue
 		}
 		if match == nil || match(send.Message) {
@@ -131,32 +147,30 @@ func hasDaemonSend(actor *unit.TestActor, to gen.ProcessID, match func(any) bool
 func TestDaemonInitAndLaunchAllAfterScheduleMessages(t *testing.T) {
 	book := core.NewAddressBook()
 	self := gen.Atom("node-a@127.0.0.1")
-	actor, err := unit.Spawn(t, FactoryWithOptions(book, daemonTestDecorator, Options{
+	actor, err := unit.StartNode(t, self, gen.NodeOptions{}).Spawn(FactoryWithOptions(book, daemonTestDecorator, Options{
 		RecoveryJitterMax: -1,
 		RetryJitterMax:    -1,
-	}), unit.WithNodeName(self))
+	}), gen.ProcessOptions{})
 	if err != nil {
 		t.Fatalf("spawn daemon actor: %v", err)
 	}
-	actor.ShouldSend().
-		To(actor.Process().PID()).
+	actor.ShouldSendAfter().
+		To(actor.PID()).
 		Message(messageInit{}).
 		Once().
 		Assert()
 
-	actor.ClearEvents()
 	w := actor.Behavior().(*daemon)
 	w.launchAllAfter(0)
 	actor.ShouldSend().
-		To(actor.Process().PID()).
+		To(actor.PID()).
 		Message(core.MessageLaunchAllDaemon{}).
 		Once().
 		Assert()
 
-	actor.ClearEvents()
 	w.launchAllAfter(time.Second)
-	actor.ShouldSend().
-		To(actor.Process().PID()).
+	actor.ShouldSendAfter().
+		To(actor.PID()).
 		Message(core.MessageLaunchAllDaemon{}).
 		Once().
 		Assert()
@@ -192,20 +206,20 @@ func TestDaemonHandleEventsUpdateLeadershipAndScheduleRecovery(t *testing.T) {
 	if !w.isLeader {
 		t.Fatal("expected daemon to become leader")
 	}
-	actor.ShouldSend().
-		To(actor.Process().PID()).
+	actor.ShouldSendAfter().
+		To(actor.PID()).
 		Message(core.MessageLaunchAllDaemon{}).
 		Once().
 		Assert()
 
-	actor.ClearEvents()
+	mark := actor.Mark()
 	if err := w.HandleMessage(actor.PID(), core.MessageTopologyUpdated{}); err != nil {
 		t.Fatalf("node left event: %v", err)
 	}
-	actor.ShouldSend().
-		To(actor.Process().PID()).
+	actor.ShouldSendAfter().
+		To(actor.PID()).
 		Message(core.MessageLaunchAllDaemon{}).
-		Once().
+		Since(mark).Once().
 		Assert()
 
 	if err := w.HandleEvent(gen.MessageEvent{Message: events.EventNodeSwitchedToFollower{Name: self}}); err != nil {
@@ -224,7 +238,7 @@ func TestDaemonHandleEnsureDaemonForwardsAndStartsLaunch(t *testing.T) {
 	w := actor.Behavior().(*daemon)
 	key := findDaemonName(t, book, remote, "")
 	w.handleEnsureDaemon(core.MessageEnsureDaemon{Launcher: "launcher", Process: core.DaemonProcess{ProcessName: key}})
-	runDaemonIO(t, actor, w)
+	runDaemonIO(t, actor, w, 0)
 	if !hasDaemonSend(actor, gen.ProcessID{Name: ProcessName, Node: remote}, func(v any) bool {
 		m, ok := v.(core.MessageLaunchOneDaemon)
 		return ok && m.Owner == self && m.Process.ProcessName == key
@@ -264,7 +278,7 @@ func TestDaemonLaunchOneDaemonMissingLauncherSendsFailure(t *testing.T) {
 		Owner:    gen.Atom("remote@localhost"),
 		Epoch:    7,
 	})
-	runDaemonIO(t, actor, actor.Behavior().(*daemon))
+	runDaemonIO(t, actor, actor.Behavior().(*daemon), 0)
 	if !hasDaemonSend(actor, gen.ProcessID{Name: ProcessName, Node: "remote@localhost"}, func(message any) bool {
 		msg, ok := message.(core.MessageDaemonLaunchResult)
 		return ok && msg.Name == daemonName && msg.State == daemonLaunchFailed && strings.Contains(msg.Err, "missing-launcher")
@@ -427,18 +441,18 @@ func TestDaemonHandleMessageInitRetryAndLaunchAll(t *testing.T) {
 	w.registrar = &daemonTestRegistrar{}
 
 	actor.SendMessage(gen.PID{}, messageInit{})
-	actor.ShouldSend().
-		To(actor.Process().PID()).
+	actor.ShouldSendAfter().
+		To(actor.PID()).
 		Message(core.MessageLaunchAllDaemon{}).
 		Once().
 		Assert()
 
-	actor.ClearEvents()
+	mark := actor.Mark()
 	actor.SendMessage(gen.PID{}, core.MessageLaunchAllDaemon{})
-	actor.ShouldSend().
-		To(actor.Process().PID()).
+	actor.ShouldSendAfter().
+		To(actor.PID()).
 		Message(core.MessageLaunchAllDaemon{}).
-		Once().
+		Since(mark).Once().
 		Assert()
 }
 
@@ -458,11 +472,10 @@ func TestDaemonLaunchWorkerSpawnsRoutedProcessAndReportsResult(t *testing.T) {
 			Epoch:    42,
 		},
 	}
-	actor, err := unit.Spawn(t, func() gen.ProcessBehavior { return &daemonLaunchWorker{} }, unit.WithNodeName(owner))
+	actor, err := unit.StartNode(t, owner, gen.NodeOptions{}).Spawn(func() gen.ProcessBehavior { return &daemonLaunchWorker{} }, gen.ProcessOptions{})
 	if err != nil {
 		t.Fatalf("spawn launch worker: %v", err)
 	}
-	actor.ClearEvents()
 
 	actor.SendMessage(gen.PID{}, request)
 	actor.ShouldSpawn().Once().Assert()
@@ -499,12 +512,12 @@ func TestDaemonLaunchWorkerReportsTakenAndFailedSpawn(t *testing.T) {
 					Epoch:   43,
 				},
 			}
-			actor, err := unit.Spawn(t, func() gen.ProcessBehavior { return &daemonLaunchWorker{} }, unit.WithNodeName(owner))
+			actor, err := unit.StartNode(t, owner, gen.NodeOptions{}).Spawn(func() gen.ProcessBehavior { return &daemonLaunchWorker{} }, gen.ProcessOptions{})
 			if err != nil {
 				t.Fatalf("spawn launch worker: %v", err)
 			}
-			actor.ClearEvents()
-			actor.Process().SetMethodFailure("Spawn", tt.err)
+			worker := actor.Behavior().(*daemonLaunchWorker)
+			worker.Process = failedSpawnProcess{Process: worker.Process, err: tt.err}
 
 			actor.SendMessage(gen.PID{}, request)
 			if !hasLaunchCompletion(actor, func(message any) bool {
@@ -520,18 +533,18 @@ func TestDaemonLaunchWorkerReportsTakenAndFailedSpawn(t *testing.T) {
 func TestDaemonFactoryHandleCallAndSendLaunchResultEdges(t *testing.T) {
 	book := core.NewAddressBook()
 	self := gen.Atom("node-a@127.0.0.1")
-	actor, err := unit.Spawn(t, Factory(book, daemonTestDecorator), unit.WithNodeName(self))
+	actor, err := unit.StartNode(t, self, gen.NodeOptions{}).Spawn(Factory(book, daemonTestDecorator), gen.ProcessOptions{})
 	if err != nil {
 		t.Fatalf("spawn daemon with default factory: %v", err)
 	}
-	result := actor.Call(gen.PID{}, "anything")
-	if result.Error != nil || result.Response != nil {
-		t.Fatalf("daemon call should return nil nil, got response=%v err=%v", result.Response, result.Error)
+	result, callErr := actor.Call(gen.PID{}, "anything")
+	if callErr != nil || result != nil {
+		t.Fatalf("daemon call should return nil nil, got response=%v err=%v", result, callErr)
 	}
 
 	w := actor.Behavior().(*daemon)
 	w.sendLaunchResult("", core.MessageDaemonLaunchResult{Name: gen.Atom("ignored")})
-	actor.Process().SetMethodFailurePattern("Send", string(self), errors.New("send failed"))
+	actor.OnSend(gen.ProcessID{Name: ProcessName, Node: self}).Fail(errors.New("send failed"))
 	w.sendLaunchResult(self, core.MessageDaemonLaunchResult{Name: gen.Atom("failed-send")})
 }
 
@@ -573,6 +586,15 @@ func TestDaemonLaunchResultAndTimeoutIgnoreStaleOrRemoteOwner(t *testing.T) {
 
 type disconnectedDaemonProcess struct{ gen.Process }
 
+type failedSpawnProcess struct {
+	gen.Process
+	err error
+}
+
+func (p failedSpawnProcess) SpawnRegister(gen.Atom, gen.ProcessFactory, gen.ProcessOptions, ...any) (gen.PID, error) {
+	return gen.PID{}, p.err
+}
+
 func (p disconnectedDaemonProcess) Send(to any, message any) error {
 	if _, ok := to.(gen.ProcessID); ok {
 		return gen.ErrNoConnection
@@ -591,38 +613,50 @@ func TestDaemonRetriesForwardConnectionFailure(t *testing.T) {
 	if len(w.retries) != 0 {
 		t.Fatal("local I/O dispatch failed before the remote send")
 	}
-	runDaemonIO(t, actor, w)
+	runDaemonIO(t, actor, w, 0)
 	if len(w.retries) != 1 || len(w.launching) != 1 {
 		t.Fatal("connection failure not retained for retry")
 	}
 
 }
 
-func driveRecoveryScan(t *testing.T, actor *unit.TestActor, w *daemon) {
+func driveRecoveryScan(t *testing.T, actor *unit.Subject, w *daemon) {
 	t.Helper()
+	pages := w.Node().(*scanResultNode).pages
 	cursor := 0
 	deadline := time.Now().Add(time.Second)
 	for w.scan != nil && time.Now().Before(deadline) {
-		events := actor.Events()
+		events := actor.Records()
 		for cursor < len(events) {
 			event := events[cursor]
 			cursor++
-			if send, ok := event.(unit.SendEvent); ok {
-				switch send.Message.(type) {
+			var message any
+			switch send := event.(type) {
+			case check.Send:
+				message = send.Message
+			case check.SendAfter:
+				message = send.Message
+			}
+			if message != nil {
+				switch message.(type) {
 				case messageScanStep, messageScanPage:
-					w.HandleMessage(actor.PID(), send.Message)
+					w.HandleMessage(actor.PID(), message)
 				}
 			}
 		}
-		time.Sleep(time.Millisecond)
+		select {
+		case page := <-pages:
+			w.HandleMessage(actor.PID(), page)
+		case <-time.After(time.Millisecond):
+		}
 	}
 	if w.scan != nil {
 		t.Fatal("scan did not finish")
 	}
 }
-func hasLaunchCompletion(actor *unit.TestActor, match func(any) bool) bool {
-	for _, event := range actor.Events() {
-		if send, ok := event.(unit.SendEvent); ok {
+func hasLaunchCompletion(actor *unit.Subject, match func(any) bool) bool {
+	for _, event := range actor.Records() {
+		if send, ok := event.(check.Send); ok {
 			if finished, ok := send.Message.(messageLaunchFinished); ok && match(finished.result) {
 				return true
 			}
@@ -640,7 +674,7 @@ func TestExitedDaemonRetriesUntilRemoteReleaseCompletes(t *testing.T) {
 	old := gen.PID{Node: self, ID: 100, Creation: 1}
 	w.release = func(context.Context, gen.Atom, gen.PID) error { return errors.New("store unavailable") }
 	w.handleDaemonExit(core.MessageDaemonExited{Ensure: core.MessageEnsureDaemon{Launcher: "l", Process: core.DaemonProcess{ProcessName: "key"}}, PID: old})
-	runDaemonIO(t, actor, w)
+	runDaemonIO(t, actor, w, 0)
 	if len(w.retries) != 1 || w.launching["key"].Exited != old {
 		t.Fatal("cleanup retry lost exited PID")
 	}
@@ -668,19 +702,19 @@ func TestDaemonScanYieldsAtBatchAndCapacity(t *testing.T) {
 }
 
 // Drive the fixed I/O worker explicitly; unit actors do not run spawned pools.
-func runDaemonIO(t *testing.T, actor *unit.TestActor, w *daemon) {
+func runDaemonIO(t *testing.T, actor *unit.Subject, w *daemon, after int) {
 	t.Helper()
 	worker := &daemonIOWorker{book: w.book, release: w.release, parent: actor.PID()}
 	worker.Process = w.Process
-	for _, event := range actor.Events() {
-		if send, ok := event.(unit.SendEvent); ok {
+	for _, event := range actor.Records()[after:] {
+		if send, ok := event.(check.Send); ok {
 			if job, ok := send.Message.(messageIO); ok {
 				worker.HandleMessage(actor.PID(), job)
 			}
 		}
 	}
-	for _, event := range actor.Events() {
-		if send, ok := event.(unit.SendEvent); ok {
+	for _, event := range actor.Records()[after:] {
+		if send, ok := event.(check.Send); ok {
 			if result, ok := send.Message.(messageIOResult); ok {
 				w.handleIOResult(result)
 			}
@@ -704,7 +738,7 @@ func TestDaemonRetriesMissingLaunchResult(t *testing.T) {
 			if err := w.handleEnsureDaemon(core.MessageEnsureDaemon{Launcher: "launcher", Process: core.DaemonProcess{ProcessName: key}}); err != nil {
 				t.Fatal(err)
 			}
-			runDaemonIO(t, actor, w)
+			runDaemonIO(t, actor, w, 0)
 			state, ok := w.launching[key]
 			if !ok || state.Phase != daemonLaunchPhaseLaunching || state.Cancel == nil {
 				t.Fatal("sent request must wait for a launch result with a timeout")
@@ -716,9 +750,9 @@ func TestDaemonRetriesMissingLaunchResult(t *testing.T) {
 			if len(w.retries) != 1 {
 				t.Fatal("missing result did not schedule retry")
 			}
-			actor.ClearEvents()
+			mark := actor.Mark()
 			w.HandleMessage(actor.PID(), messageRetry{Name: key, Epoch: w.launching[key].Epoch})
-			runDaemonIO(t, actor, w)
+			runDaemonIO(t, actor, w, mark)
 			if started {
 				if len(w.launching) != 0 || len(w.retries) != 0 {
 					t.Fatal("existing route did not complete the task")

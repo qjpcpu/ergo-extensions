@@ -37,11 +37,11 @@ func routeEventually(t testing.TB, f func() bool) {
 	}
 }
 func routeNode(t *testing.T) gen.Node {
-	a, e := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} })
+	a, e := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} }, gen.ProcessOptions{})
 	if e != nil {
 		t.Fatal(e)
 	}
-	return a.Node()
+	return &routeNetworkNode{Node: a.Behavior().(gen.Process).Node(), network: routeFailNetwork{registrar: &routeFailRegistrar{}}}
 }
 func routeSeed(t testing.TB, s ActorRoutePersistence, key gen.Atom, pid gen.PID) SessionID {
 	t.Helper()
@@ -173,7 +173,7 @@ func TestActorRouterTypedBehavior(t *testing.T) {
 				original = &routerTestPool{}
 			}
 			wrapped := r.routeFactory("key", func() gen.ProcessBehavior { return original })()
-			a, e := unit.Spawn(t, func() gen.ProcessBehavior { return wrapped })
+			a, e := unit.Spawn(t, func() gen.ProcessBehavior { return wrapped }, gen.ProcessOptions{})
 			if e != nil {
 				t.Fatal(e)
 			}
@@ -210,7 +210,7 @@ func TestActorRouterInvalidBehavior(t *testing.T) {
 		b    gen.ProcessBehavior
 		want error
 	}{{r.WithActorRoute("", &routerTestActor{}), ErrActorRouteKeyEmpty}, {r.WithActorRoute("key", nil), ErrActorRouteBehaviorNil}, {r.WithActorRoute("key", typedNil), ErrActorRouteBehaviorNil}, {r.routeFactory("key", nil)(), ErrActorRouteFactoryNil}, {r.routeFactory("key", func() gen.ProcessBehavior { return routeErrorBehavior{} })(), ErrActorRouteBehaviorMismatch}, {(*ActorRouter)(nil).WithActorRoute("key", &routerTestActor{}), ErrActorRoutePersistenceNil}} {
-		_, e := unit.Spawn(t, func() gen.ProcessBehavior { return test.b })
+		_, e := unit.Spawn(t, func() gen.ProcessBehavior { return test.b }, gen.ProcessOptions{})
 		if e == nil || !strings.Contains(e.Error(), test.want.Error()) {
 			t.Fatal(e, test.want)
 		}

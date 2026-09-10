@@ -8,7 +8,7 @@ import (
 	"github.com/qjpcpu/ergo-extensions/v2/system"
 )
 
-func TestSimpleAppLoadAndLifecycle(t *testing.T) {
+func TestSimpleAppLoad(t *testing.T) {
 	book := system.NewAddressBook()
 	extra := gen.ApplicationMemberSpec{Name: gen.Atom("extra-member")}
 	router := newTestActorRouter(t)
@@ -42,6 +42,4 @@ func TestSimpleAppLoadAndLifecycle(t *testing.T) {
 	if spec.Group[2].Name != extra.Name {
 		t.Fatalf("expected extra member at index 2, got %s", spec.Group[2].Name)
 	}
-	app.Start(gen.ApplicationModePermanent)
-	app.Terminate(nil)
 }

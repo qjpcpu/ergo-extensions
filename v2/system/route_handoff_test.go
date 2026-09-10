@@ -22,7 +22,7 @@ func TestRouteHeldThroughBusinessTermination(t *testing.T) {
 	r := routeRouter(t, s, ActorRouterOptions{})
 	b := &handoffActor{entered: make(chan struct{}), finish: make(chan struct{})}
 	wrapped := r.WithActorRoute("key", b)
-	a, e := unit.Spawn(t, func() gen.ProcessBehavior { return wrapped })
+	a, e := unit.Spawn(t, func() gen.ProcessBehavior { return wrapped }, gen.ProcessOptions{})
 	if e != nil {
 		t.Fatal(e)
 	}

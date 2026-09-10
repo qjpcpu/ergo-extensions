@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"ergo.services/ergo/gen"
+	"ergo.services/ergo/testing/check"
 	"ergo.services/ergo/testing/unit"
 	"errors"
 	"fmt"
@@ -104,14 +105,14 @@ func TestSlowLookupLeavesDaemonResponsive(t *testing.T) {
 	w := actor.Behavior().(*daemon)
 	w.handleEnsureDaemon(core.MessageEnsureDaemon{Launcher: "l", Process: core.DaemonProcess{ProcessName: "key"}})
 	var job messageIO
-	for _, e := range actor.Events() {
-		if s, ok := e.(unit.SendEvent); ok {
+	for _, e := range actor.Records() {
+		if s, ok := e.(check.Send); ok {
 			if m, ok := s.Message.(messageIO); ok {
 				job = m
 			}
 		}
 	}
-	worker, err := unit.Spawn(t, func() gen.ProcessBehavior { return &daemonIOWorker{book: slow, parent: actor.PID()} })
+	worker, err := unit.Spawn(t, func() gen.ProcessBehavior { return &daemonIOWorker{book: slow, parent: actor.PID()} }, gen.ProcessOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,8 +219,8 @@ func TestScannerFailureAfterScanCoalescesRecovery(t *testing.T) {
 		w.handleIOResult(messageIOResult{key: key, epoch: state.Epoch, err: errors.New("lookup failed")})
 	}
 	timers := 0
-	for _, event := range actor.Events() {
-		if e, ok := event.(unit.SendEvent); ok {
+	for _, event := range actor.Records() {
+		if e, ok := event.(check.SendAfter); ok {
 			if _, ok := e.Message.(messageScanRetry); ok {
 				timers++
 			}

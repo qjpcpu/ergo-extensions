@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"ergo.services/ergo/gen"
+	"ergo.services/ergo/testing/check"
 	"ergo.services/ergo/testing/unit"
 	"github.com/qjpcpu/registrar/events"
 )
@@ -54,9 +55,9 @@ func (p watchableProvider) Watch(ctx context.Context, req WatchRequest) (<-chan 
 	return nil, nil
 }
 
-func spawnCronUnit(t *testing.T, source Source) *unit.TestActor {
+func spawnCronUnit(t *testing.T, source Source) *unit.Subject {
 	t.Helper()
-	actor, err := unit.Spawn(t, Factory(source, SchedulerOptions{
+	actor, err := unit.StartNode(t, gen.Atom("node-a@127.0.0.1"), gen.NodeOptions{}).Spawn(Factory(source, SchedulerOptions{
 		ShardCount:         8,
 		TickResolution:     time.Minute,
 		InitDelay:          time.Millisecond,
@@ -66,51 +67,48 @@ func spawnCronUnit(t *testing.T, source Source) *unit.TestActor {
 		ScanPageSize:       2,
 		OwnerRingSalt:      "test-cron",
 		MaxDispatchPerTick: 10,
-	}), unit.WithNodeName(gen.Atom("node-a@127.0.0.1")))
+	}), gen.ProcessOptions{})
 	if err != nil {
 		t.Fatalf("spawn cron actor: %v", err)
 	}
-	actor.ClearEvents()
 	return actor
 }
 
 func TestCronFactoryInitCallAndEventScheduling(t *testing.T) {
 	source := NewManagedSource(NewStaticSource(8), NewMemoryKVStore())
-	actor, err := unit.Spawn(t, Factory(source, SchedulerOptions{
+	actor, err := unit.StartNode(t, gen.Atom("node-a@127.0.0.1"), gen.NodeOptions{}).Spawn(Factory(source, SchedulerOptions{
 		InitDelay:      time.Millisecond,
 		RebalanceDelay: time.Millisecond,
-	}), unit.WithNodeName(gen.Atom("node-a@127.0.0.1")))
+	}), gen.ProcessOptions{})
 	if err != nil {
 		t.Fatalf("spawn cron actor: %v", err)
 	}
-	actor.ShouldSend().
-		To(actor.Process().PID()).
+	actor.ShouldSendAfter().
+		To(actor.PID()).
 		Message(messageInit{}).
 		Once().
 		Assert()
 
-	result := actor.Call(gen.PID{}, "inspect")
-	if result.Error != nil {
-		t.Fatalf("inspect call failed: %v", result.Error)
+	result, callErr := actor.Call(gen.PID{}, "inspect")
+	if callErr != nil {
+		t.Fatalf("inspect call failed: %v", callErr)
 	}
-	if _, ok := result.Response.(map[string]string); !ok {
-		t.Fatalf("expected inspect map response, got %#v", result.Response)
+	if _, ok := result.(map[string]string); !ok {
+		t.Fatalf("expected inspect map response, got %#v", result)
 	}
-	result = actor.Call(gen.PID{}, struct{}{})
-	if !errors.Is(result.Error, gen.ErrUnsupported) {
-		t.Fatalf("expected unsupported call, got %v", result.Error)
-	}
-
-	actor.ClearEvents()
 	process := actor.Behavior().(*Process)
 	if err := process.HandleEvent(gen.MessageEvent{Message: events.EventNodeJoined{}}); err != nil {
 		t.Fatalf("handle event: %v", err)
 	}
-	actor.ShouldSend().
-		To(actor.Process().PID()).
+	actor.ShouldSendAfter().
+		To(actor.PID()).
 		Message(messageRebalance{}).
 		Once().
 		Assert()
+	_, callErr = actor.Call(gen.PID{}, struct{}{})
+	if !errors.Is(callErr, gen.ErrUnsupported) {
+		t.Fatalf("expected unsupported call, got %v", callErr)
+	}
 }
 
 func TestCronHelperBranches(t *testing.T) {
@@ -219,16 +217,15 @@ func TestCronScheduleAndRingHelpers(t *testing.T) {
 	process := actor.Behavior().(*Process)
 
 	process.scheduleNextTick()
-	actor.ShouldSend().
-		To(actor.Process().PID()).
+	actor.ShouldSendAfter().
+		To(actor.PID()).
 		Message(messageTick{}).
 		Once().
 		Assert()
 
-	actor.ClearEvents()
 	process.scheduleRebalance()
-	actor.ShouldSend().
-		To(actor.Process().PID()).
+	actor.ShouldSendAfter().
+		To(actor.PID()).
 		Message(messageRebalance{}).
 		Once().
 		Assert()
@@ -299,7 +296,7 @@ func TestCronWatchDownStopsOrRestartsWatcher(t *testing.T) {
 	}, NewMemoryKVStore()))
 	process := actor.Behavior().(*Process)
 	runtime := newShardRuntime(2, 9)
-	runtime.watchPID = gen.PID{Node: actor.Process().Node().Name(), ID: 42}
+	runtime.watchPID = gen.PID{Node: actor.Behavior().(gen.Process).Node().Name(), ID: 42}
 	process.owned[2] = runtime
 
 	process.handleWatchDown(gen.MessageDownPID{PID: runtime.watchPID, Reason: gen.TerminateReasonNormal})
@@ -307,8 +304,7 @@ func TestCronWatchDownStopsOrRestartsWatcher(t *testing.T) {
 		t.Fatal("normal watcher down should clear watch pid")
 	}
 
-	runtime.watchPID = gen.PID{Node: actor.Process().Node().Name(), ID: 43}
-	actor.ClearEvents()
+	runtime.watchPID = gen.PID{Node: actor.Behavior().(gen.Process).Node().Name(), ID: 43}
 	process.handleWatchDown(gen.MessageDownPID{PID: runtime.watchPID, Reason: errors.New("crash")})
 	if runtime.watchPID == (gen.PID{}) {
 		t.Fatal("unexpected watcher crash should restart watcher")
@@ -321,7 +317,7 @@ func TestCronRefreshShardLeasesRenewsAndDropsLostLease(t *testing.T) {
 	source := NewManagedSource(NewStaticSource(8), store)
 	actor := spawnCronUnit(t, source)
 	process := actor.Behavior().(*Process)
-	self := actor.Process().Node().Name()
+	self := actor.Behavior().(gen.Process).Node().Name()
 	backend := newStateBackend(store)
 
 	runtime := newShardRuntime(1, 1)
@@ -349,7 +345,6 @@ func TestCronRefreshShardLeasesRenewsAndDropsLostLease(t *testing.T) {
 	lostRuntime.watchPID = gen.PID{Node: self, ID: 99}
 	lostRuntime.lease = ShardLease{Shard: 2, Owner: self, Epoch: 1, ExpiresAt: time.Now().UTC().Add(time.Millisecond), Acquired: true}
 	process.owned[2] = lostRuntime
-	actor.ClearEvents()
 	if err := process.refreshShardLeases(); err != nil {
 		t.Fatalf("refresh lost lease: %v", err)
 	}
@@ -368,22 +363,22 @@ func TestCronWatchActorDrainsBatchesAndTerminates(t *testing.T) {
 			return ch, nil
 		},
 	}
-	actor, err := unit.Spawn(t, newWatchFactory(parent, provider, 4, 12, WatchRequest{Shards: []uint32{4}}))
+	actor, err := unit.Spawn(t, newWatchFactory(parent, provider, 4, 12, WatchRequest{Shards: []uint32{4}}), gen.ProcessOptions{})
 	if err != nil {
 		t.Fatalf("spawn watch actor: %v", err)
 	}
-	actor.ClearEvents()
 
 	actor.SendMessage(gen.PID{}, messageWatchPoll{})
 	actor.ShouldSend().
 		To(parent).
-		MessageMatching(func(message any) bool {
+		Where(func(record check.Send) bool {
+			message := record.Message
 			msg, ok := message.(messageWatchBatch)
 			return ok && msg.shard == 4 && msg.generation == 12 && msg.batch.Cursor == "c1"
 		}).
 		Once().
 		Assert()
-	if !actor.IsTerminated() {
+	if !actor.Terminated() {
 		t.Fatal("closed watch channel should terminate actor")
 	}
 }
@@ -393,12 +388,12 @@ func TestCronWatchActorInitHandlesNilAndErrorWatch(t *testing.T) {
 		watch: func(context.Context, WatchRequest) (<-chan JobDeltaBatch, error) {
 			return nil, errors.New("watch failed")
 		},
-	}, 1, 1, WatchRequest{}))
+	}, 1, 1, WatchRequest{}), gen.ProcessOptions{})
 	if err == nil {
 		t.Fatal("expected watch init error")
 	}
 
-	_, err = unit.Spawn(t, newWatchFactory(gen.PID{}, watchableProvider{}, 1, 1, WatchRequest{}))
+	_, err = unit.Spawn(t, newWatchFactory(gen.PID{}, watchableProvider{}, 1, 1, WatchRequest{}), gen.ProcessOptions{})
 	if err == nil || !strings.Contains(err.Error(), gen.TerminateReasonNormal.Error()) {
 		t.Fatalf("expected normal termination from nil watch channel, got %v", err)
 	}
@@ -440,7 +435,7 @@ func TestCronRebalanceErrorsAndRemovesUnwantedShard(t *testing.T) {
 	process.options.ShardCount = 1
 	process.ring = &consistentState{prevMembers: make(map[gen.Atom]ringMember), ring: makeRing()}
 	runtime := newShardRuntime(0, 1)
-	runtime.watchPID = gen.PID{Node: actor.Process().Node().Name(), ID: 50}
+	runtime.watchPID = gen.PID{Node: actor.Behavior().(gen.Process).Node().Name(), ID: 50}
 	process.owned[0] = runtime
 	if err := process.rebalance(); err != nil {
 		t.Fatalf("rebalance after registrar recovery: %v", err)
@@ -452,7 +447,7 @@ func TestCronCollectShardSlotClaimAndReplay(t *testing.T) {
 	source := NewManagedSource(NewStaticSource(1), store)
 	actor := spawnCronUnit(t, source)
 	process := actor.Behavior().(*Process)
-	self := actor.Process().Node().Name()
+	self := actor.Behavior().(gen.Process).Node().Name()
 	backend := newStateBackend(store)
 	lease, err := backend.AcquireShardLease(context.Background(), 0, self, time.Minute)
 	if err != nil {
@@ -492,7 +487,7 @@ func TestCronHandleTickCollectsDueJobs(t *testing.T) {
 	source := NewManagedSource(NewStaticSource(1), store)
 	actor := spawnCronUnit(t, source)
 	process := actor.Behavior().(*Process)
-	self := actor.Process().Node().Name()
+	self := actor.Behavior().(gen.Process).Node().Name()
 	backend := newStateBackend(store)
 	lease, err := backend.AcquireShardLease(context.Background(), 0, self, time.Minute)
 	if err != nil {
@@ -529,23 +524,22 @@ func TestCronHandleMessageBranchesThroughMailbox(t *testing.T) {
 	process.registrar = &cronTestRegistrar{}
 
 	actor.SendMessage(gen.PID{}, messageInit{})
-	actor.ShouldSend().
-		To(actor.Process().PID()).
+	actor.ShouldSendAfter().
+		To(actor.PID()).
 		Message(messageTick{}).
 		Once().
 		Assert()
 
-	actor.ClearEvents()
+	mark := actor.Mark()
 	actor.SendMessage(gen.PID{}, messageTick{})
-	actor.ShouldSend().
-		To(actor.Process().PID()).
+	actor.ShouldSendAfter().
+		To(actor.PID()).
 		Message(messageTick{}).
-		Once().
+		Since(mark).Once().
 		Assert()
 
-	actor.ClearEvents()
 	actor.SendMessage(gen.PID{}, messageRebalance{})
-	actor.ShouldNotTerminate().Assert()
+	actor.ShouldTerminate().None().Assert()
 
 	runtime := newShardRuntime(2, 3)
 	runtime.Activate()
@@ -562,7 +556,7 @@ func TestCronHandleMessageBranchesThroughMailbox(t *testing.T) {
 		t.Fatal("expected watch batch to upsert job through mailbox")
 	}
 
-	runtime.watchPID = gen.PID{Node: actor.Process().Node().Name(), ID: 77}
+	runtime.watchPID = gen.PID{Node: actor.Behavior().(gen.Process).Node().Name(), ID: 77}
 	actor.SendMessage(gen.PID{}, gen.MessageDownPID{PID: runtime.watchPID, Reason: gen.TerminateReasonNormal})
 	if runtime.watchPID != (gen.PID{}) {
 		t.Fatal("expected down pid message to clear watcher")
