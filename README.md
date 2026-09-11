@@ -76,9 +76,9 @@ Each node instance opens a fresh `SessionID`. A route stores its key and `RouteO
 - `ValidFor` describes remaining validity when the operation executes. Local deadlines use the request start time plus `ValidFor`, less a safety margin.
 - An acquisition error has an uncertain outcome unless it wraps `ErrRouteNotApplied`, which certifies that the operation did not write. Backends must preserve that distinction and avoid implicitly replaying uncertain acquisitions. Successful operations must remain durable within the backend's documented failure model.
 
-Lookup and takeover use the same validity rule: an unexpired route, a live session, and an online owner node. Remote owners are checked through a direct `registrar.Nodes()` call on every check. The local node is checked through `node.IsAlive()` because registrars can omit self. Registrar errors propagate to callers. A router uses the result returned by the registrar, including any caching internal to that registrar.
+Lookup and takeover use the same persisted validity rule: an unexpired route and a live owner session. The current owner retains the route while registrar discovery converges; discovery supplies addressing for network delivery.
 
-An invalid route can be replaced by comparing its exact observed owner. This replacement affects that route; the owner closes its own session. A registrar that returns names cannot distinguish two incarnations with the same node name, so a prior incarnation's session must expire or be closed before that case becomes reclaimable.
+An invalid route can be replaced by comparing its exact observed owner. This replacement affects that route; the owner closes its own session. Graceful exit releases its route, while an abnormally terminated owner's session expires before takeover. The session identity distinguishes node incarnations, including restarts with the same node name.
 
 The new contract replaces the previous per-actor lease interface. Custom persistence implementations must implement all six operations. `system.NewMemoryActorRoutePersistence()` supplies an in-process backend for examples and tests; call its `Close` when finished.
 

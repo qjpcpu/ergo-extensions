@@ -22,15 +22,14 @@ Normal shutdown enters Draining, stops the node, then closes the router. Router 
 
 ## Lookup and takeover
 
-A valid route requires all three conditions:
+A valid route requires both conditions:
 
 1. Its independent route TTL remains live.
 2. The referenced session remains live in the consistent storage snapshot.
-3. Its owner is online: direct `registrar.Nodes()` membership for remote nodes, or `node.IsAlive()` for self.
 
-Lookup reads storage synchronously in the caller with an operation timeout, then checks validity. Acquisition and release use the route worker pool. Lookup and acquisition use this same predicate. Invalid routes can be replaced with an exact-owner comparison. Only a session's owning router closes it. Each check consumes the registrar's own current result; implementations may maintain their own internal cache. Name-only membership cannot identify a same-name restart until the old session is closed or expires.
+Lookup reads storage synchronously in the caller with an operation timeout, then checks validity. Acquisition and release use the route worker pool. Lookup and acquisition use this same predicate. Invalid routes can be replaced with an exact-owner comparison. Only a session's owning router closes it. A live route/session retains its owner while registrar discovery catches up; registrar data supplies network addressing. Graceful shutdown releases routes, and abnormal node termination leaves its existing session to expire before takeover.
 
-A registrar-based takeover may overlap a still-running old owner until its local deadline, potentially for the route TTL (24 hours by default). Route/session checks govern routing and future dispatch; they cannot reverse or serialize external business side effects.
+Route/session checks govern routing and future dispatch. Expiration can stop an actor while its current callback is still returning; these checks cannot reverse external business side effects.
 
 ## Membership
 

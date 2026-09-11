@@ -288,34 +288,7 @@ func (r *ActorRouter) lose() {
 	}
 }
 func (r *ActorRouter) valid(snapshot RouteSnapshot) (bool, error) {
-	if snapshot.ValidFor <= 0 || !snapshot.SessionValid {
-		return false, nil
-	}
-	node, err := r.boundNode()
-	if err != nil {
-		return false, err
-	}
-	if snapshot.Owner.PID.Node == node.Name() {
-		return node.IsAlive(), nil
-	}
-	network := node.Network()
-	if network == nil {
-		return false, gen.ErrNoRoute
-	}
-	registrar, err := network.Registrar()
-	if err != nil {
-		return false, err
-	}
-	nodes, err := registrar.Nodes()
-	if err != nil {
-		return false, err
-	}
-	for _, name := range nodes {
-		if name == snapshot.Owner.PID.Node {
-			return true, nil
-		}
-	}
-	return false, nil
+	return snapshot.ValidFor > 0 && snapshot.SessionValid, nil
 }
 func (r *ActorRouter) lookup(ctx context.Context, key gen.Atom) (gen.PID, bool, error) {
 	if key == "" {
