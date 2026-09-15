@@ -54,7 +54,8 @@ func (book *AddressBook) BindLocator(self gen.Atom, locator func(context.Context
 	return nil
 }
 
-// Locate resolves a route key and rejects PIDs hosted by offline nodes.
+// Locate delegates to the router, which checks route/session validity and node
+// membership for both lookup and takeover.
 func (book *AddressBook) Locate(ctx context.Context, key gen.Atom) (gen.PID, bool, error) {
 	book.locatorMu.RLock()
 	locator := book.locator

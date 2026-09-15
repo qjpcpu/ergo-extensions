@@ -66,7 +66,7 @@ type CronSchedulerOptions = cronpkg.SchedulerOptions
 type SimpleNodeOptions struct {
 	NodeName              string                       // Node name.
 	ActorRoutePersistence system.ActorRoutePersistence // Required durable actor route storage.
-	ActorRouterOptions    system.ActorRouterOptions    // Actor route lease timing and worker limits.
+	ActorRouterOptions    system.ActorRouterOptions    // RouteTTL (default 2h), RouteRenewInterval (default 100min ±10%), session timing and worker limits.
 	Registrar             gen.Registrar                // Required registrar supplied by the caller.
 	// Optional
 	Port                 uint16                                        // Listen port, default to 11144

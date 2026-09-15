@@ -195,7 +195,11 @@ func (m *routeLeaseManager) heartbeat() {
 }
 func (m *routeLeaseManager) scheduleLocked(i *localRouteInstance) {
 	m.removeLocked(i)
-	slot := int64((i.deadline.Sub(m.started) + m.resolution - 1) / m.resolution)
+	at := i.deadline
+	if !i.renewing && !i.renewAt.IsZero() && i.renewAt.Before(at) {
+		at = i.renewAt
+	}
+	slot := int64((at.Sub(m.started) + m.resolution - 1) / m.resolution)
 	if slot <= m.cursor {
 		slot = m.cursor + 1
 	}
@@ -219,6 +223,7 @@ func (m *routeLeaseManager) expire(now time.Time) []gen.PID {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	pids := make([]gen.PID, 0, 128)
+	processed := 0
 	target := int64(now.Sub(m.started) / m.resolution)
 	for steps := 0; m.cursor < target && steps < 256; steps++ {
 		slot := m.cursor + 1
@@ -226,11 +231,24 @@ func (m *routeLeaseManager) expire(now time.Time) []gen.PID {
 		for i := range bucket {
 			delete(bucket, i)
 			i.slot = 0
-			if !i.stopped {
+			if !i.stopped && !now.Before(i.deadline) {
 				i.stopped = true
 				pids = append(pids, i.pid)
+			} else if !i.stopped && !i.cleanup {
+				// Use the existing bounded I/O workers. A queued or blocked renewal
+				// keeps its deadline scheduled, so it cannot keep an expired actor alive.
+				if !i.renewing && !now.Before(i.renewAt) {
+					select {
+					case m.jobs <- func() { m.renewRoute(i) }:
+						i.renewing = true
+					default:
+						i.retryRenewal(now, r.options.RouteRenewInterval)
+					}
+				}
+				m.scheduleLocked(i)
 			}
-			if len(pids) == cap(pids) {
+			processed++
+			if processed == cap(pids) {
 				return pids
 			}
 		}
@@ -239,6 +257,79 @@ func (m *routeLeaseManager) expire(now time.Time) []gen.PID {
 	}
 	return pids
 }
+
+func (m *routeLeaseManager) renewRoute(i *localRouteInstance) {
+	r := m.router
+	r.mu.Lock()
+	active := r.state == routerActive || r.state == routerDraining
+	if !active || i.stopped || i.cleanup || !time.Now().Before(i.deadline) {
+		i.renewing = false
+		r.finishLocked(i)
+		r.mu.Unlock()
+		return
+	}
+	owner := RouteOwner{SessionID: r.session, PID: i.pid}
+	r.mu.Unlock()
+	start := time.Now()
+	ctx, cancel := r.operationContext(context.Background())
+	// Compare our exact owner, rather than re-reading and acquiring somebody
+	// else's route. A displaced actor must stop, even if discovery omits the new
+	// owner; renewal must not turn tolerated overlap into repeated takeovers.
+	result, err := safeRouteCall(func() (AcquireRouteResult, error) {
+		return r.persistence.AcquireRoute(ctx, owner.SessionID, i.key, i.pid, &owner, r.options.RouteTTL)
+	})
+	cancel()
+	now := time.Now()
+	r.mu.Lock()
+	i.renewing = false
+	active = r.state == routerActive || r.state == routerDraining
+	kill := false
+	if active && !i.stopped && !i.cleanup {
+		deadline := start.Add(result.ValidFor - r.options.LeaseSafetyMargin)
+		switch {
+		case !now.Before(i.deadline), err == nil && (result.Status != RouteAcquired || !now.Before(deadline)):
+			i.stopped = true
+			m.removeLocked(i)
+			kill = true
+		case err == nil:
+			i.deadline = deadline
+			i.scheduleRenewal(start, r.options.RouteRenewInterval)
+			m.scheduleLocked(i)
+		default:
+			// Keep the last confirmed deadline on errors, including uncertain
+			// writes. Retrying our exact owner cannot reclaim a replacement route.
+			i.retryRenewal(now, r.options.RouteRenewInterval)
+			m.scheduleLocked(i)
+		}
+	}
+	r.finishLocked(i)
+	node := r.node
+	r.mu.Unlock()
+	if errors.Is(err, ErrSessionLost) {
+		r.lose()
+	}
+	if kill {
+		_ = node.Kill(i.pid)
+	}
+}
+
+func (i *localRouteInstance) scheduleRenewal(start time.Time, interval time.Duration) {
+	i.renewRetryDelay = 0
+	i.renewAt = start.Add(renewalDelay(i.key, i.pid, interval, &i.renewJitter))
+}
+
+func (i *localRouteInstance) retryRenewal(now time.Time, interval time.Duration) {
+	// Back off both storage failures and a full worker queue. Per-actor jitter
+	// spreads retries after a shared outage; the deadline stays scheduled too.
+	limit := min(time.Minute, interval)
+	if i.renewRetryDelay == 0 {
+		i.renewRetryDelay = min(time.Second, limit)
+	} else {
+		i.renewRetryDelay = min(2*i.renewRetryDelay, limit)
+	}
+	i.renewAt = now.Add(renewalDelay(i.key, i.pid, i.renewRetryDelay, &i.renewJitter))
+}
+
 func (m *routeLeaseManager) watchdog() {
 	tick := time.NewTicker(m.resolution)
 	defer tick.Stop()

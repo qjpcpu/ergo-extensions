@@ -26,6 +26,7 @@ type messageInit struct{}
 type messageDaemonLaunchTimeout struct {
 	Name  gen.Atom
 	Epoch int64
+	Phase daemonLaunchPhase
 }
 
 const (
@@ -35,9 +36,7 @@ const (
 )
 
 type Options struct {
-	ScanBatchSize int
-	// ScanBatchInterval spaces recovery batches to bound persistence load.
-	ScanBatchInterval     time.Duration
+	ScanBatchSize         int
 	MaxInFlight           int
 	InitialRecoveryDelay  time.Duration
 	LeaderRecoveryDelay   time.Duration
@@ -55,7 +54,6 @@ type Options struct {
 func DefaultOptions() Options {
 	return Options{
 		ScanBatchSize:         32,
-		ScanBatchInterval:     50 * time.Millisecond,
 		MaxInFlight:           64,
 		InitialRecoveryDelay:  500 * time.Millisecond,
 		LeaderRecoveryDelay:   500 * time.Millisecond,
@@ -74,9 +72,6 @@ func normalizeOptions(opts Options) Options {
 	defaults := DefaultOptions()
 	if opts.ScanBatchSize <= 0 {
 		opts.ScanBatchSize = defaults.ScanBatchSize
-	}
-	if opts.ScanBatchInterval <= 0 {
-		opts.ScanBatchInterval = defaults.ScanBatchInterval
 	}
 	if opts.MaxInFlight <= 0 {
 		opts.MaxInFlight = defaults.MaxInFlight
@@ -130,6 +125,10 @@ type daemonLaunchPhase uint8
 const (
 	daemonLaunchPhaseLaunching daemonLaunchPhase = iota + 1
 	daemonLaunchPhaseChecking
+	daemonLaunchPhaseMonitoring
+	daemonLaunchPhaseOffering
+	daemonLaunchPhaseWaiting
+	daemonLaunchPhaseRetrying
 )
 
 type daemonLaunchState struct {
@@ -153,7 +152,6 @@ type daemon struct {
 	pendingReplies   int
 	lastScanDuration time.Duration
 	wantRecovery     bool
-	launchPool       gen.PID
 	registrar        gen.Registrar
 	isLeader         bool
 	cancelLaunchAll  gen.CancelFunc
@@ -164,7 +162,14 @@ type daemon struct {
 	options          Options
 	scan             *recoveryScan
 	fetching         bool
-	pendingLaunch    map[gen.Atom]struct{}
+	scanFetch        *scanPageRequest
+	pendingLaunch    map[gen.Atom]*launchEntry
+	launchReplies    map[core.MessageDaemonLaunchOffer]*launchReply
+	launchQueue      []*launchEntry
+	launchWorkers    map[gen.PID]*launchWorkerSlot
+	idleWorkers      []gen.PID
+	peers            map[gen.Atom]bool
+	peerWatches      map[gen.Atom]*peerWatch
 	retries          map[gen.Atom]gen.CancelFunc
 }
 
@@ -185,7 +190,11 @@ func FactoryWithOptions(book core.IAddressBook, decorate RouteDecorator, opts Op
 			launching:     make(map[gen.Atom]daemonLaunchState),
 			nextEpoch:     time.Now().UnixNano(),
 			options:       opts,
-			pendingLaunch: make(map[gen.Atom]struct{}),
+			pendingLaunch: make(map[gen.Atom]*launchEntry),
+			launchWorkers: make(map[gen.PID]*launchWorkerSlot),
+			launchReplies: make(map[core.MessageDaemonLaunchOffer]*launchReply),
+			peers:         make(map[gen.Atom]bool),
+			peerWatches:   make(map[gen.Atom]*peerWatch),
 			retries:       make(map[gen.Atom]gen.CancelFunc),
 		}
 	}
@@ -198,6 +207,7 @@ func FactoryWithRouteCleanup(book core.IAddressBook, decorate RouteDecorator, op
 }
 
 func (w *daemon) Init(args ...any) error {
+	w.SetTrapExit(true)
 	w.SendAfter(w.PID(), messageInit{}, time.Second*1)
 	return nil
 }
@@ -217,6 +227,8 @@ func (w *daemon) HandleMessage(from gen.PID, message any) error {
 			w.launchAllAfter(w.options.FullRecoveryInterval)
 		}
 	case core.MessageTopologyUpdated:
+		w.retargetTasks()
+		w.scheduleScan()
 		if w.isLeader {
 			w.recovered = make(map[gen.Atom]struct{})
 			w.requestRecovery()
@@ -225,28 +237,27 @@ func (w *daemon) HandleMessage(from gen.PID, message any) error {
 		e.scan.scheduled = false
 		w.scanStep(e.scan)
 	case messageScanPage:
-		w.fetching = false
-		if w.scan == e.scan {
-			if e.err != nil {
-				w.Log().Warning("daemon scanner failed: %v", e.err)
-				e.scan.failed = true
-				e.scan.launchers = e.scan.launchers[1:]
-				e.scan.iterator = nil
-				if len(e.scan.launchers) > 0 {
-					e.scan.iterator = e.scan.iterators[e.scan.launchers[0].Name]
-				}
-				e.scan.loaded = false
-			} else {
-				e.scan.iterator, e.scan.page = e.iterator, e.page
-				e.scan.more, e.scan.loaded = e.more, true
-			}
-		}
-		if w.scan != nil {
-			w.scheduleScan(0)
-		}
+		w.handleScanPage(e)
 	case messageLaunchFinished:
-		delete(w.pendingLaunch, e.result.Name)
-		w.sendLaunchResult(e.owner, e.result)
+		w.finishLaunch(from, e)
+	case messagePeerMonitor:
+		w.handlePeerMonitor(e)
+	case messagePeerDown:
+		if w.peerWatches[e.watch.node] == e.watch {
+			w.peerDown(e.watch.node)
+		}
+	case messageDeliveryFinished:
+		w.handleDeliveryFinished(e)
+	case core.MessageDaemonLaunchOffer:
+		w.handleLaunchOffer(e)
+	case core.MessageDaemonLaunchPull:
+		w.handleLaunchPull(e)
+	case core.MessageDaemonLaunchWithdraw:
+		w.withdrawLaunch(e)
+	case messageLaunchResultTimeout:
+		w.retryLaunchResult(e)
+	case messageLaunchReservationTimeout:
+		w.reservationTimeout(e)
 	case messageIOResult:
 		w.handleIOResult(e)
 	case messageReplyFinished:
@@ -278,20 +289,32 @@ func (w *daemon) HandleMessage(from gen.PID, message any) error {
 		return w.handleDaemonLaunchResult(e)
 	case messageDaemonLaunchTimeout:
 		return w.handleDaemonLaunchTimeout(e)
+	case gen.MessageExitPID:
+		if e.PID == w.Parent() {
+			return e.Reason
+		}
 	case gen.MessageDownPID:
 		if e.PID == w.ioPool {
 			w.ioPool = gen.PID{}
 			w.pendingReplies = 0
+			for node := range w.peerWatches {
+				w.peerDown(node)
+			}
+			if request := w.scanFetch; request != nil {
+				w.handleScanPage(messageScanPage{scan: request.scan, request: request, err: e.Reason})
+			}
 			for name, state := range w.launching {
 				if state.Phase == daemonLaunchPhaseChecking {
 					w.retryTask(name)
 				}
 			}
 		}
-		if e.PID == w.launchPool {
-			w.launchPool = gen.PID{}
-			w.pendingLaunch = make(map[gen.Atom]struct{})
+		for node, watch := range w.peerWatches {
+			if watch.worker == e.PID {
+				w.peerDown(node)
+			}
 		}
+		w.launchWorkerDown(e.PID, e.Reason)
 	}
 	return nil
 }
@@ -378,7 +401,7 @@ func (w *daemon) leaderShouldRecoverDaemon() error {
 		return true
 	})
 	w.scan = &recoveryScan{launchers: launchers, iterators: make(map[gen.Atom]core.DaemonIterator), started: time.Now()}
-	w.scheduleScan(0)
+	w.scheduleScan()
 	return nil
 }
 
@@ -400,7 +423,7 @@ func (w *daemon) admit(msg core.MessageEnsureDaemon, exited gen.PID) error {
 		}
 		return nil
 	}
-	if len(w.launching)+w.pendingReplies >= w.options.MaxInFlight {
+	if len(w.launching) >= w.options.MaxInFlight {
 		return errLaunchBusy
 	}
 	if w.book.PickNode(key) == "" {
@@ -413,6 +436,11 @@ func (w *daemon) admit(msg core.MessageEnsureDaemon, exited gen.PID) error {
 
 func (w *daemon) startCheck(key gen.Atom) {
 	state := w.launching[key]
+	w.cancelOffer(key, state)
+	if state.Cancel != nil {
+		state.Cancel()
+	}
+	state.Cancel = nil
 	state.Epoch = w.nextLaunchEpoch()
 	state.TargetNode = w.book.PickNode(key)
 	state.Phase = daemonLaunchPhaseChecking
@@ -429,7 +457,7 @@ func (w *daemon) startCheck(key gen.Atom) {
 
 func (w *daemon) handleIOResult(msg messageIOResult) {
 	state, ok := w.launching[msg.key]
-	if !ok || state.Epoch != msg.epoch {
+	if !ok || state.Epoch != msg.epoch || state.Phase != daemonLaunchPhaseChecking {
 		return
 	}
 	if msg.err != nil {
@@ -446,9 +474,7 @@ func (w *daemon) handleIOResult(msg messageIOResult) {
 		w.completeTask(msg.key)
 		return
 	}
-	state.Phase = daemonLaunchPhaseLaunching
-	state.Cancel, _ = w.SendAfter(w.PID(), messageDaemonLaunchTimeout{Name: msg.key, Epoch: state.Epoch}, w.options.LaunchTimeout)
-	w.launching[msg.key] = state
+	w.offerTask(msg.key)
 }
 
 func (w *daemon) retryTask(key gen.Atom) {
@@ -470,6 +496,8 @@ func (w *daemon) retryTask(key gen.Atom) {
 	if state.Cancel != nil {
 		state.Cancel()
 	}
+	w.cancelOffer(key, state)
+	state.Phase = daemonLaunchPhaseRetrying
 	state.Attempt++
 	state.Epoch = w.nextLaunchEpoch()
 	state.Cancel, _ = w.SendAfter(w.PID(), messageRetry{Name: key, Epoch: state.Epoch}, w.retryDelay(state.Attempt))
@@ -478,75 +506,24 @@ func (w *daemon) retryTask(key gen.Atom) {
 }
 
 func (w *daemon) completeTask(key gen.Atom) {
-	if state, ok := w.launching[key]; ok && state.Cancel != nil {
-		state.Cancel()
+	if state, ok := w.launching[key]; ok {
+		w.cancelOffer(key, state)
+		if state.Cancel != nil {
+			state.Cancel()
+		}
 	}
 	delete(w.launching, key)
 	delete(w.retries, key)
 	w.requestPendingRecovery()
 	if w.scan != nil {
-		w.scheduleScan(0)
+		w.scheduleScan()
 	}
-}
-
-func (w *daemon) handleLaunchOneDaemon(msg core.MessageLaunchOneDaemon) error {
-	launcher, ok := core.GetLauncher(msg.Launcher)
-	if !ok {
-		if msg.Owner != "" {
-			w.sendLaunchResult(msg.Owner, core.MessageDaemonLaunchResult{
-				Name:  msg.Process.ProcessName,
-				Node:  w.Node().Name(),
-				Epoch: msg.Epoch,
-				State: daemonLaunchFailed,
-				Err:   fmt.Sprintf("can't find launcher by %s", msg.Launcher),
-			})
-		}
-		return nil
-	}
-
-	err := w.dispatchLaunch(messageLaunch{launcher: launcher, request: msg})
-	if err != nil {
-		w.sendLaunchResult(msg.Owner, core.MessageDaemonLaunchResult{
-			Name:  msg.Process.ProcessName,
-			Node:  w.Node().Name(),
-			Epoch: msg.Epoch,
-			State: daemonLaunchFailed,
-			Err:   err.Error(),
-		})
-	}
-	return nil
-}
-
-func (w *daemon) dispatchLaunch(msg messageLaunch) error {
-	if _, ok := w.pendingLaunch[msg.request.Process.ProcessName]; ok {
-		return nil
-	}
-	if len(w.pendingLaunch) >= daemonLaunchWorkers {
-		return errLaunchBusy
-	}
-	if w.launchPool == (gen.PID{}) {
-		pid, err := w.Spawn(func() gen.ProcessBehavior {
-			return &daemonLaunchPool{decorate: w.decorate}
-		}, gen.ProcessOptions{LinkParent: true})
-		if err != nil {
-			return err
-		}
-		if err := w.MonitorPID(pid); err != nil {
-			w.Node().Kill(pid)
-			return err
-		}
-		w.launchPool = pid
-	}
-	if err := w.Send(w.launchPool, msg); err != nil {
-		return err
-	}
-	w.pendingLaunch[msg.request.Process.ProcessName] = struct{}{}
-	return nil
 }
 
 func (w *daemon) handleDaemonLaunchResult(msg core.MessageDaemonLaunchResult) error {
 	state, ok := w.launching[msg.Name]
 	if !ok || state.Epoch != msg.Epoch || state.TargetNode != msg.Node {
+		w.acknowledgeLaunchResult(msg)
 		return nil
 	}
 	if state.Exited != (gen.PID{}) {
@@ -554,22 +531,31 @@ func (w *daemon) handleDaemonLaunchResult(msg core.MessageDaemonLaunchResult) er
 		return nil
 	}
 	switch msg.State {
+	case daemonLaunchQueued:
+		if state.Phase == daemonLaunchPhaseOffering {
+			if state.Cancel != nil {
+				state.Cancel()
+			}
+			state.Cancel = nil
+			state.Phase = daemonLaunchPhaseWaiting
+			w.launching[msg.Name] = state
+		}
 	case daemonLaunchStarted, daemonLaunchTaken, daemonLaunchNotNeeded:
 		w.completeTask(msg.Name)
 	default:
-		// Older targets report a normal Init refusal as a failed launch.
-		if msg.Err == gen.TerminateReasonNormal.Error() {
-			w.completeTask(msg.Name)
-			return nil
-		}
 		w.retryTask(msg.Name)
 	}
 	return nil
 }
 
 func (w *daemon) handleDaemonLaunchTimeout(msg messageDaemonLaunchTimeout) error {
-	if state, ok := w.launching[msg.Name]; ok && state.Epoch == msg.Epoch {
-		w.retryTask(msg.Name)
+	if state, ok := w.launching[msg.Name]; ok && state.Epoch == msg.Epoch && state.Phase == msg.Phase {
+		switch state.Phase {
+		case daemonLaunchPhaseOffering:
+			w.offerTask(msg.Name)
+		case daemonLaunchPhaseLaunching:
+			w.retryTask(msg.Name)
+		}
 	}
 	return nil
 }
@@ -611,7 +597,7 @@ func (w *daemon) requestPendingRecovery() {
 		w.launchAllAfter(w.options.NodeLeftRecoveryDelay)
 		return
 	}
-	if len(w.launching)+w.pendingReplies >= w.options.MaxInFlight || w.registrar == nil {
+	if len(w.launching) >= w.options.MaxInFlight || w.registrar == nil {
 		return
 	}
 	leader, err := w.registrar.ConfigItem(constants.LeaderNodeConfigItem)
@@ -632,17 +618,14 @@ func (w *daemon) sendLaunchResult(owner gen.Atom, result core.MessageDaemonLaunc
 	if owner == "" {
 		return
 	}
-	if owner == w.Node().Name() {
-		w.handleDaemonLaunchResult(result)
-		return
+	if result.State != daemonLaunchQueued && (owner == w.Node().Name() || w.peers[owner]) {
+		offer := core.MessageDaemonLaunchOffer{Name: result.Name, Owner: owner, Epoch: result.Epoch}
+		w.clearLaunchReply(offer)
+		reply := &launchReply{result: result}
+		w.launchReplies[offer] = reply
+		reply.cancel, _ = w.SendAfter(w.PID(), messageLaunchResultTimeout{offer: offer, reply: reply}, w.options.LaunchTimeout)
 	}
-	// If reply capacity is exhausted the sender's existing launch timeout retries.
-	if len(w.launching)+w.pendingReplies >= w.options.MaxInFlight {
-		return
-	}
-	if err := w.dispatchIO(messageIO{owner: owner, reply: &result}); err == nil {
-		w.pendingReplies++
-	}
+	w.sendProtocol(owner, result)
 }
 
 func (w *daemon) HandleCall(from gen.PID, ref gen.Ref, request any) (any, error) {
@@ -695,28 +678,6 @@ const daemonLaunchWorkers = 8
 type messageLaunch struct {
 	launcher core.Launcher
 	request  core.MessageLaunchOneDaemon
-}
-
-type daemonLaunchPool struct {
-	act.Pool
-	decorate RouteDecorator
-	stopped  chan struct{}
-}
-
-func (p *daemonLaunchPool) Init(...any) (act.PoolOptions, error) {
-	p.stopped = make(chan struct{})
-	return act.PoolOptions{
-		PoolSize: daemonLaunchWorkers,
-		WorkerFactory: func() gen.ProcessBehavior {
-			return &daemonLaunchWorker{decorate: p.decorate, stopped: p.stopped}
-		},
-	}, nil
-}
-
-func (p *daemonLaunchPool) Terminate(error) {
-	if p.stopped != nil {
-		close(p.stopped)
-	}
 }
 
 type daemonLaunchWorker struct {
@@ -783,7 +744,7 @@ func (w *daemonLaunchWorker) launch(msg messageLaunch) error {
 		return init
 	}, msg.launcher.Option, msg.request.Process.Args...)
 	// Spawn timeout does not stop Ergo's Init goroutine. Keep this worker
-	// occupied until the callback returns, or the launch pool stops.
+	// occupied until the callback returns, or its worker stops.
 	if err == gen.ErrTimeout && !init.state.CompareAndSwap(0, 2) {
 		select {
 		case <-init.done:
@@ -829,12 +790,12 @@ type recoveryScan struct {
 	iterators                   map[gen.Atom]core.DaemonIterator
 	started                     time.Time
 	scheduled                   bool
-	nextBatchAt                 time.Time
 }
 type messageScanRetry struct{}
 
 type messageScanStep struct{ scan *recoveryScan }
 type messageScanPage struct {
+	request  *scanPageRequest
 	scan     *recoveryScan
 	iterator core.DaemonIterator
 	page     []core.DaemonProcess
@@ -842,18 +803,38 @@ type messageScanPage struct {
 	err      error
 }
 
-func (w *daemon) scheduleScan(delay time.Duration) {
+func (w *daemon) handleScanPage(e messageScanPage) {
+	if e.request != w.scanFetch {
+		return
+	}
+	w.scanFetch = nil
+	w.fetching = false
+	if w.scan == e.scan {
+		if e.err != nil {
+			w.Log().Warning("daemon scanner failed: %v", e.err)
+			e.scan.failed = true
+			e.scan.launchers = e.scan.launchers[1:]
+			e.scan.iterator = nil
+			if len(e.scan.launchers) > 0 {
+				e.scan.iterator = e.scan.iterators[e.scan.launchers[0].Name]
+			}
+			e.scan.loaded = false
+		} else {
+			e.scan.iterator, e.scan.page = e.iterator, e.page
+			e.scan.more, e.scan.loaded = e.more, true
+		}
+	}
+	if w.scan != nil {
+		w.scheduleScan()
+	}
+}
+
+func (w *daemon) scheduleScan() {
 	if w.scan == nil || w.scan.scheduled {
 		return
 	}
 	w.scan.scheduled = true
-	var err error
-	if delay == 0 {
-		err = w.Send(w.PID(), messageScanStep{w.scan})
-	} else {
-		_, err = w.SendAfter(w.PID(), messageScanStep{w.scan}, delay)
-	}
-	if err != nil {
+	if err := w.Send(w.PID(), messageScanStep{w.scan}); err != nil {
 		w.scan.scheduled = false
 	}
 }
@@ -866,34 +847,18 @@ func (w *daemon) scanStep(scan *recoveryScan) {
 		w.finishScan(scan.failed)
 		return
 	}
-	if delay := time.Until(scan.nextBatchAt); delay > 0 {
-		w.scheduleScan(delay)
-		return
-	}
 	if !scan.loaded {
 		w.fetching = true
-		node, pid := w.Node(), w.PID()
-		iterator, factory := scan.iterator, scan.launchers[0].RecoveryScanner
-		go func() {
-			result := messageScanPage{scan: scan, iterator: iterator}
-			defer func() {
-				if v := recover(); v != nil {
-					result.err = fmt.Errorf("scanner panic: %v", v)
-				}
-				_ = node.Send(pid, result)
-			}()
-			if result.iterator == nil {
-				result.iterator = factory()
-			}
-			result.page, result.more, result.err = result.iterator()
-		}()
+		request := &scanPageRequest{scan: scan, iterator: scan.iterator, factory: scan.launchers[0].RecoveryScanner}
+		w.scanFetch = request
+		if err := w.dispatchIO(messageIO{scanPage: request}); err != nil {
+			w.handleScanPage(messageScanPage{scan: scan, request: request, err: err})
+		}
 		return
 	}
-	scan.nextBatchAt = time.Now().Add(w.options.ScanBatchInterval)
 	processed := 0
 	for len(scan.page) > 0 && processed < w.options.ScanBatchSize {
-		if len(w.launching)+w.pendingReplies >= w.options.MaxInFlight {
-			w.scheduleScan(50 * time.Millisecond)
+		if len(w.launching) >= w.options.MaxInFlight {
 			return
 		}
 		proc := scan.page[0]
@@ -904,7 +869,6 @@ func (w *daemon) scanStep(scan *recoveryScan) {
 		}
 		if err := w.ensureDaemon(scan.launchers[0].Name, proc, 0); err != nil {
 			scan.page = append([]core.DaemonProcess{proc}, scan.page...)
-			w.scheduleScan(50 * time.Millisecond)
 			return
 		} else {
 			w.recovered[proc.ProcessName] = struct{}{}
@@ -928,7 +892,7 @@ func (w *daemon) scanStep(scan *recoveryScan) {
 			scan.iterator = scan.iterators[scan.launchers[0].Name]
 		}
 	}
-	w.scheduleScan(0)
+	w.scheduleScan()
 }
 func (w *daemon) finishScan(failed bool) {
 	again := w.scan != nil && w.scan.again
@@ -947,6 +911,18 @@ func (w *daemon) handleDaemonExit(msg core.MessageDaemonExited) error {
 	return w.admit(msg.Ensure, msg.PID)
 }
 func (w *daemon) Terminate(error) {
+	for offer := range w.launchReplies {
+		w.clearLaunchReply(offer)
+	}
+	for pid, slot := range w.launchWorkers {
+		close(slot.stopped)
+		w.Node().Kill(pid)
+	}
+	for _, entry := range w.pendingLaunch {
+		if entry.cancel != nil {
+			entry.cancel()
+		}
+	}
 	if w.cancelScanRetry != nil {
 		w.cancelScanRetry()
 	}

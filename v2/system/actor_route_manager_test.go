@@ -16,7 +16,7 @@ import (
 )
 
 func shortRouteOptions() ActorRouterOptions {
-	return ActorRouterOptions{SessionTTL: 300 * time.Millisecond, SessionRenewInterval: 40 * time.Millisecond, OperationTimeout: 30 * time.Millisecond, LeaseSafetyMargin: 20 * time.Millisecond, RouteTTL: time.Hour, RouteChangeWorkers: 2, RouteChangeQueueSize: 8}
+	return ActorRouterOptions{SessionTTL: 300 * time.Millisecond, SessionRenewInterval: 40 * time.Millisecond, OperationTimeout: 30 * time.Millisecond, LeaseSafetyMargin: 20 * time.Millisecond, RouteTTL: time.Hour, RouteRenewInterval: 50 * time.Minute, RouteChangeWorkers: 2, RouteChangeQueueSize: 8}
 }
 
 type faultRouteStore struct {
@@ -169,7 +169,9 @@ func TestReleaseQueueRetainsFailuresAndAppliesBackpressure(t *testing.T) {
 func TestActorRouteDeadlineStopsBusinessDispatch(t *testing.T) {
 	o := shortRouteOptions()
 	o.RouteTTL = 100 * time.Millisecond
-	r := routeRouter(t, routeStore(t), o)
+	o.RouteRenewInterval = 20 * time.Millisecond
+	s := failingRouteRenewals(t)
+	r := routeRouter(t, s, o)
 	b := &routerTestActor{}
 	wrapped := r.WithActorRoute("key", b)
 	node := unit.StartNode(t, "deadline@localhost", gen.NodeOptions{})
@@ -563,9 +565,10 @@ func TestActorRouteQueueSaturationIsBounded(t *testing.T) {
 }
 
 func TestActorRouteExpirationDuringInitKeepsSessionUsable(t *testing.T) {
-	s := routeStore(t)
+	s := failingRouteRenewals(t)
 	o := shortRouteOptions()
-	o.RouteTTL = 60 * time.Millisecond
+	o.RouteTTL = 100 * time.Millisecond
+	o.RouteRenewInterval = 20 * time.Millisecond
 	r := routeRouter(t, s, o)
 	base, e := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} }, gen.ProcessOptions{})
 	if e != nil {
@@ -576,7 +579,7 @@ func TestActorRouteExpirationDuringInitKeepsSessionUsable(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- wrapped.ProcessInit(base.Behavior().(gen.Process)) }()
 	<-b.entered
-	time.Sleep(80 * time.Millisecond)
+	time.Sleep(120 * time.Millisecond)
 	close(b.finish)
 	e = <-done
 	if !errors.Is(e, ErrRouteExpired) {

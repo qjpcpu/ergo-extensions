@@ -9,7 +9,7 @@ import (
 	core "github.com/qjpcpu/ergo-extensions/v2/system/internal/core"
 )
 
-const daemonIOWorkers = 8
+const daemonIOWorkers = 16
 
 type messageRetry struct {
 	Name  gen.Atom
@@ -19,9 +19,17 @@ type messageIO struct {
 	key        gen.Atom
 	state      daemonLaunchState
 	owner      gen.Atom
-	reply      *core.MessageDaemonLaunchResult
+	message    any
 	recoverAll bool
+	scanPage   *scanPageRequest
+	watch      *peerWatch
 }
+type scanPageRequest struct {
+	scan     *recoveryScan
+	iterator core.DaemonIterator
+	factory  core.DaemonIteratorFactory
+}
+
 type messageIOResult struct {
 	key     gen.Atom
 	epoch   int64
@@ -62,6 +70,7 @@ func (p *daemonIOPool) Init(...any) (act.PoolOptions, error) {
 
 type daemonIOWorker struct {
 	act.Actor
+	watches map[gen.ProcessID]*peerWatch
 	book    core.IAddressBook
 	release func(context.Context, gen.Atom, gen.PID) error
 	parent  gen.PID
@@ -69,8 +78,19 @@ type daemonIOWorker struct {
 
 func (w *daemonIOWorker) Init(...any) error { return nil }
 func (w *daemonIOWorker) HandleMessage(_ gen.PID, message any) error {
+	if down, ok := message.(gen.MessageDownProcessID); ok {
+		if watch := w.watches[down.ProcessID]; watch != nil {
+			delete(w.watches, down.ProcessID)
+			w.Send(w.parent, messagePeerDown{watch: watch})
+		}
+		return nil
+	}
 	job, ok := message.(messageIO)
 	if !ok {
+		return nil
+	}
+	if job.scanPage != nil {
+		w.fetchScanPage(job.scanPage)
 		return nil
 	}
 	result := messageIOResult{key: job.key, epoch: job.state.Epoch, exited: job.state.Exited}
@@ -78,20 +98,38 @@ func (w *daemonIOWorker) HandleMessage(_ gen.PID, message any) error {
 		if v := recover(); v != nil {
 			result.err = fmt.Errorf("daemon I/O panic: %v", v)
 		}
-		if job.reply != nil || job.recoverAll {
+		if job.watch != nil {
+			w.Send(w.parent, messagePeerMonitor{watch: job.watch, worker: w.PID(), ready: true, err: result.err})
+			return
+		}
+		if job.message != nil {
+			w.Send(w.parent, messageDeliveryFinished{node: job.owner, message: job.message, err: result.err})
+			return
+		}
+		if job.recoverAll {
 			w.Send(w.parent, messageReplyFinished{})
 			return
 		}
 		w.Send(w.parent, result)
 	}()
+	if job.watch != nil {
+		w.Send(w.parent, messagePeerMonitor{watch: job.watch, worker: w.PID()})
+		target := gen.ProcessID{Name: ProcessName, Node: job.watch.node}
+		result.err = w.MonitorProcessID(target)
+		if result.err == nil {
+			if w.watches == nil {
+				w.watches = make(map[gen.ProcessID]*peerWatch)
+			}
+			w.watches[target] = job.watch
+		}
+		return nil
+	}
 	if job.recoverAll {
 		w.Send(gen.ProcessID{Name: ProcessName, Node: job.owner}, core.MessageLaunchAllDaemon{})
 		return nil
 	}
-	if job.reply != nil {
-		if err := w.Send(gen.ProcessID{Name: ProcessName, Node: job.owner}, *job.reply); err != nil {
-			w.Log().Warning("daemon launch result delivery failed: %v", err)
-		}
+	if job.message != nil {
+		result.err = w.Send(gen.ProcessID{Name: ProcessName, Node: job.owner}, job.message)
 		return nil
 	}
 	if job.state.Exited != (gen.PID{}) && w.release != nil {
@@ -117,8 +155,19 @@ func (w *daemonIOWorker) HandleMessage(_ gen.PID, message any) error {
 		result.running = true
 		return nil
 	}
-	result.err = w.Send(gen.ProcessID{Name: ProcessName, Node: job.state.TargetNode}, core.MessageLaunchOneDaemon{
-		Launcher: job.state.Launcher, Process: job.state.Process, Owner: w.Node().Name(), Epoch: job.state.Epoch,
-	})
 	return nil
+}
+
+func (w *daemonIOWorker) fetchScanPage(request *scanPageRequest) {
+	result := messageScanPage{scan: request.scan, request: request, iterator: request.iterator}
+	defer func() {
+		if v := recover(); v != nil {
+			result.err = fmt.Errorf("scanner panic: %v", v)
+		}
+		w.Send(w.parent, result)
+	}()
+	if result.iterator == nil {
+		result.iterator = request.factory()
+	}
+	result.page, result.more, result.err = result.iterator()
 }

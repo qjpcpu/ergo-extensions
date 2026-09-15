@@ -49,19 +49,6 @@ func setDaemonRoute(book *core.AddressBook, key gen.Atom, pid gen.PID) {
 
 type daemonTestProc struct{ act.Actor }
 
-type scanResultNode struct {
-	gen.Node
-	pages chan messageScanPage
-}
-
-func (n *scanResultNode) Send(to any, message any) error {
-	if page, ok := message.(messageScanPage); ok {
-		n.pages <- page
-		return nil
-	}
-	return n.Node.Send(to, message)
-}
-
 type daemonTestRegistrar struct{}
 
 func (r *daemonTestRegistrar) Register(gen.NodeRegistrar, gen.RegisterRoutes) (gen.StaticRoutes, error) {
@@ -109,8 +96,6 @@ func spawnDaemonUnit(t *testing.T, book core.IAddressBook, self gen.Atom) *unit.
 		t.Fatalf("spawn daemon actor: %v", err)
 	}
 	actor.Node().OnInfo(func() (gen.NodeInfo, error) { return gen.NodeInfo{}, nil })
-	node := &scanResultNode{Node: actor.Behavior().(gen.Process).Node(), pages: make(chan messageScanPage, 1)}
-	actor.OnNode(func() gen.Node { return node })
 	return actor
 }
 
@@ -240,10 +225,10 @@ func TestDaemonHandleEnsureDaemonForwardsAndStartsLaunch(t *testing.T) {
 	w.handleEnsureDaemon(core.MessageEnsureDaemon{Launcher: "launcher", Process: core.DaemonProcess{ProcessName: key}})
 	runDaemonIO(t, actor, w, 0)
 	if !hasDaemonSend(actor, gen.ProcessID{Name: ProcessName, Node: remote}, func(v any) bool {
-		m, ok := v.(core.MessageLaunchOneDaemon)
-		return ok && m.Owner == self && m.Process.ProcessName == key
+		m, ok := v.(core.MessageDaemonLaunchOffer)
+		return ok && m.Owner == self && m.Name == key
 	}) {
-		t.Fatal("launch was not sent directly to target")
+		t.Fatal("task notice was not sent to target")
 	}
 	if len(w.launching) != 1 {
 		t.Fatal("remote work not counted")
@@ -272,13 +257,16 @@ func TestDaemonLaunchOneDaemonMissingLauncherSendsFailure(t *testing.T) {
 	actor := spawnDaemonUnit(t, book, self)
 
 	daemonName := gen.Atom("missing-launcher-daemon")
+	actor.SendMessage(gen.PID{}, core.MessageDaemonLaunchOffer{Name: daemonName, Owner: "remote@localhost", Epoch: 7})
+	runDaemonIO(t, actor, actor.Behavior().(*daemon), 0)
+	mark := actor.Mark()
 	actor.SendMessage(gen.PID{}, core.MessageLaunchOneDaemon{
 		Launcher: gen.Atom("missing-launcher"),
 		Process:  core.DaemonProcess{ProcessName: daemonName},
 		Owner:    gen.Atom("remote@localhost"),
 		Epoch:    7,
 	})
-	runDaemonIO(t, actor, actor.Behavior().(*daemon), 0)
+	runDaemonIO(t, actor, actor.Behavior().(*daemon), mark)
 	if !hasDaemonSend(actor, gen.ProcessID{Name: ProcessName, Node: "remote@localhost"}, func(message any) bool {
 		msg, ok := message.(core.MessageDaemonLaunchResult)
 		return ok && msg.Name == daemonName && msg.State == daemonLaunchFailed && strings.Contains(msg.Err, "missing-launcher")
@@ -299,13 +287,14 @@ func TestDaemonLaunchOneDaemonSpawnsWorker(t *testing.T) {
 	}
 	t.Cleanup(func() { core.UnregisterLauncher(launcherName) })
 
+	actor.SendMessage(gen.PID{}, core.MessageDaemonLaunchOffer{Name: "worker-daemon", Owner: self, Epoch: 8})
 	actor.SendMessage(gen.PID{}, core.MessageLaunchOneDaemon{
 		Launcher: launcherName,
 		Process:  core.DaemonProcess{ProcessName: gen.Atom("worker-daemon")},
 		Owner:    self,
 		Epoch:    8,
 	})
-	actor.ShouldSpawn().Once().Assert()
+	actor.ShouldSpawn().Times(daemonLaunchWorkers).Assert()
 }
 
 func TestDaemonLaunchResultAndTimeoutStateMachine(t *testing.T) {
@@ -314,7 +303,7 @@ func TestDaemonLaunchResultAndTimeoutStateMachine(t *testing.T) {
 	book.SetAvailableNodes(core.NewNodeList(self))
 	actor := spawnDaemonUnit(t, book, self)
 	w := actor.Behavior().(*daemon)
-	for _, result := range []core.MessageDaemonLaunchResult{{State: daemonLaunchStarted}, {State: daemonLaunchTaken}, {State: daemonLaunchNotNeeded}, {State: daemonLaunchFailed, Err: gen.TerminateReasonNormal.Error()}} {
+	for _, result := range []core.MessageDaemonLaunchResult{{State: daemonLaunchStarted}, {State: daemonLaunchTaken}, {State: daemonLaunchNotNeeded}} {
 		w.launching["key"] = daemonLaunchState{Epoch: 11, TargetNode: self}
 		result.Name = "key"
 		result.Node = self
@@ -324,8 +313,8 @@ func TestDaemonLaunchResultAndTimeoutStateMachine(t *testing.T) {
 			t.Fatal("completed launch holds capacity", result)
 		}
 	}
-	w.launching["key"] = daemonLaunchState{Epoch: 11, TargetNode: self, Attempt: 1}
-	w.handleDaemonLaunchTimeout(messageDaemonLaunchTimeout{Name: "key", Epoch: 11})
+	w.launching["key"] = daemonLaunchState{Epoch: 11, TargetNode: self, Attempt: 1, Phase: daemonLaunchPhaseLaunching}
+	w.handleDaemonLaunchTimeout(messageDaemonLaunchTimeout{Name: "key", Epoch: 11, Phase: daemonLaunchPhaseLaunching})
 	if len(w.launching) != 1 || len(w.retries) != 1 {
 		t.Fatal("retry lost capacity accounting")
 	}
@@ -622,32 +611,18 @@ func TestDaemonRetriesForwardConnectionFailure(t *testing.T) {
 
 func driveRecoveryScan(t *testing.T, actor *unit.Subject, w *daemon) {
 	t.Helper()
-	pages := w.Node().(*scanResultNode).pages
-	cursor := 0
-	deadline := time.Now().Add(time.Second)
-	for w.scan != nil && time.Now().Before(deadline) {
-		events := actor.Records()
-		for cursor < len(events) {
-			event := events[cursor]
-			cursor++
-			var message any
-			switch send := event.(type) {
-			case check.Send:
-				message = send.Message
-			case check.SendAfter:
-				message = send.Message
-			}
-			if message != nil {
-				switch message.(type) {
-				case messageScanStep, messageScanPage:
-					w.HandleMessage(actor.PID(), message)
+	worker := &daemonIOWorker{parent: actor.PID()}
+	worker.Process = w.Process
+	for cursor := 0; w.scan != nil && cursor < len(actor.Records()); cursor++ {
+		if send, ok := actor.Records()[cursor].(check.Send); ok {
+			switch msg := send.Message.(type) {
+			case messageScanStep, messageScanPage:
+				w.HandleMessage(actor.PID(), msg)
+			case messageIO:
+				if msg.scanPage != nil {
+					worker.HandleMessage(actor.PID(), msg)
 				}
 			}
-		}
-		select {
-		case page := <-pages:
-			w.HandleMessage(actor.PID(), page)
-		case <-time.After(time.Millisecond):
 		}
 	}
 	if w.scan != nil {
@@ -706,17 +681,17 @@ func runDaemonIO(t *testing.T, actor *unit.Subject, w *daemon, after int) {
 	t.Helper()
 	worker := &daemonIOWorker{book: w.book, release: w.release, parent: actor.PID()}
 	worker.Process = w.Process
-	for _, event := range actor.Records()[after:] {
-		if send, ok := event.(check.Send); ok {
-			if job, ok := send.Message.(messageIO); ok {
-				worker.HandleMessage(actor.PID(), job)
-			}
-		}
-	}
-	for _, event := range actor.Records()[after:] {
-		if send, ok := event.(check.Send); ok {
-			if result, ok := send.Message.(messageIOResult); ok {
-				w.handleIOResult(result)
+	for i := after; i < len(actor.Records()); i++ {
+		if send, ok := actor.Records()[i].(check.Send); ok {
+			switch msg := send.Message.(type) {
+			case messageIO:
+				worker.HandleMessage(actor.PID(), msg)
+			case messagePeerMonitor:
+				w.handlePeerMonitor(msg)
+			case messageIOResult:
+				w.handleIOResult(msg)
+			case messageDeliveryFinished:
+				w.handleDeliveryFinished(msg)
 			}
 		}
 	}
@@ -739,6 +714,8 @@ func TestDaemonRetriesMissingLaunchResult(t *testing.T) {
 				t.Fatal(err)
 			}
 			runDaemonIO(t, actor, w, 0)
+			state := w.launching[key]
+			w.handleLaunchPull(core.MessageDaemonLaunchPull{Name: key, Node: remote, Epoch: state.Epoch})
 			state, ok := w.launching[key]
 			if !ok || state.Phase != daemonLaunchPhaseLaunching || state.Cancel == nil {
 				t.Fatal("sent request must wait for a launch result with a timeout")
@@ -746,7 +723,7 @@ func TestDaemonRetriesMissingLaunchResult(t *testing.T) {
 			if started {
 				setDaemonRoute(book, key, gen.PID{Node: remote, ID: 42, Creation: 1})
 			}
-			w.handleDaemonLaunchTimeout(messageDaemonLaunchTimeout{Name: key, Epoch: state.Epoch})
+			w.handleDaemonLaunchTimeout(messageDaemonLaunchTimeout{Name: key, Epoch: state.Epoch, Phase: daemonLaunchPhaseLaunching})
 			if len(w.retries) != 1 {
 				t.Fatal("missing result did not schedule retry")
 			}
@@ -760,13 +737,13 @@ func TestDaemonRetriesMissingLaunchResult(t *testing.T) {
 				return
 			}
 			if !hasDaemonSend(actor, gen.ProcessID{Name: ProcessName, Node: remote}, func(message any) bool {
-				msg, ok := message.(core.MessageLaunchOneDaemon)
-				return ok && msg.Process.ProcessName == key && msg.Epoch != state.Epoch
+				msg, ok := message.(core.MessageDaemonLaunchOffer)
+				return ok && msg.Name == key && msg.Epoch != state.Epoch
 			}) {
 				t.Fatal("missing request was not sent again with a new epoch")
 			}
-			if w.launching[key].Phase != daemonLaunchPhaseLaunching {
-				t.Fatal("retry must wait for its launch result")
+			if w.launching[key].Phase != daemonLaunchPhaseOffering {
+				t.Fatal("retry must offer the task again")
 			}
 		})
 	}

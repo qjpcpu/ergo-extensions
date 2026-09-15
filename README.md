@@ -76,9 +76,9 @@ Each node instance opens a fresh `SessionID`. A route stores its key and `RouteO
 - `ValidFor` describes remaining validity when the operation executes. Local deadlines use the request start time plus `ValidFor`, less a safety margin.
 - An acquisition error has an uncertain outcome unless it wraps `ErrRouteNotApplied`, which certifies that the operation did not write. Backends must preserve that distinction and avoid implicitly replaying uncertain acquisitions. Successful operations must remain durable within the backend's documented failure model.
 
-Lookup and takeover use the same persisted validity rule: an unexpired route and a live owner session. The current owner retains the route while registrar discovery converges; discovery supplies addressing for network delivery.
+Lookup and takeover use the same validity rule: an unexpired route, a live owner session, and an online owner node. Remote membership is checked directly through `registrar.Nodes()`; self uses `node.IsAlive()`. Registrar errors propagate and prevent takeover. Node membership is deliberately part of this shared rule: temporary overlap during discovery lag is accepted to allow prompt recovery when a node disappears.
 
-An invalid route can be replaced by comparing its exact observed owner. This replacement affects that route; the owner closes its own session. Graceful exit releases its route, while an abnormally terminated owner's session expires before takeover. The session identity distinguishes node incarnations, including restarts with the same node name.
+An invalid route can be replaced by comparing its exact observed owner. This replacement affects that route; the owner closes its own session. Graceful exit releases its route. An absent node can be replaced before its session expires. Name-only membership cannot distinguish a same-name restart; that case still depends on the prior session closing or expiring.
 
 The new contract replaces the previous per-actor lease interface. Custom persistence implementations must implement all six operations. `system.NewMemoryActorRoutePersistence()` supplies an in-process backend for examples and tests; call its `Close` when finished.
 
@@ -86,7 +86,7 @@ The new contract replaces the previous per-actor lease interface. Custom persist
 
 Acquisition completes before business Init. The route remains associated with the instance through Init and business Terminate; after cleanup, an exact-owner release is queued. Failed releases remain queued for retry. Admission returns `ErrActorRouterBusy` when pending cleanup reaches `ReleaseQueueSize`, or the route operation queue is full.
 
-One heartbeat renews the node session, independently of the bounded route operation workers. A shared timing wheel schedules each route's local expiration. Defaults are:
+One heartbeat renews the node session, independently of the bounded route operation workers. A shared timing wheel schedules route renewals and local expiration; renewals run on the existing bounded route operation workers. Defaults are:
 
 | Option | Default |
 | --- | --- |
@@ -94,16 +94,32 @@ One heartbeat renews the node session, independently of the bounded route operat
 | `SessionRenewInterval` | 10 seconds, with bounded jitter |
 | `OperationTimeout` | 3 seconds |
 | `LeaseSafetyMargin` | 3 seconds |
-| `RouteTTL` | 24 hours |
+| `RouteTTL` | 2 hours |
+| `RouteRenewInterval` | 100 minutes, with ±10% per-actor jitter |
 | `RouteChangeWorkers` | 16 |
 | `RouteChangeQueueSize` | 65,536 |
 | `ReleaseQueueSize` | 65,536 pending releases before admission backpressure |
 
-Renewal traffic is approximately `nodes / SessionRenewInterval`. Routes retain their initial independent TTL; reaching the route deadline stops that actor and lets daemon recovery start a fresh instance where configured. Repeated acquisition by the same owner extends TTL at the persistence API.
+Renewal traffic is approximately `nodes / SessionRenewInterval + actors / RouteRenewInterval`. Each route renewal calls `AcquireRoute` with its own exact `(SessionID, PID)` as the expected owner. Success extends both the stored TTL and local deadline. An owner mismatch stops only the displaced actor. Errors retain the last confirmed deadline and retry; a late response cannot revive an expired actor. Renewal never adopts another owner's identity to reclaim its route. The first and subsequent renewals use independent per-actor jitter seeded by the key and full PID. Storage failures and a full worker queue retry with exponential backoff from 1 second to a 60-second base, capped by the configured interval, plus ±10% jitter. Waiting for workers or retry never extends the last confirmed deadline. The worker count limits concurrent operations; it is not a storage writes-per-second limit. Route expiry stops that actor and lets daemon recovery start a fresh instance where configured.
 
-A confirmed lost session, an uncertain acquisition, or the local session deadline moves the router to Lost. It stops admissions and renewal, kills its exact managed PIDs, and independently closes its own session with an operation timeout. Temporary renewal errors retain the last confirmed deadline. A late response cannot reactivate a Lost router. Routed admission resumes with a fresh node/router instance. Business dispatch checks both local deadlines before processing another mailbox item; a route deadline stops only that actor.
+Configure both values through the existing `StartSimpleNode` options:
 
-Already-running Init, callbacks, and application goroutines cannot be forcibly interrupted by these checks. Likewise, a registrar-based takeover can overlap an old actor that still has a valid local session and route deadline. That overlap can last until the old route deadline, up to the configured route TTL. Applications must account for this behavior when performing external side effects; routing does not provide exactly-once business execution.
+```go
+node, err := app.StartSimpleNode(app.SimpleNodeOptions{
+    Registrar: registrar,
+    ActorRoutePersistence: persistence,
+    ActorRouterOptions: system.ActorRouterOptions{
+        RouteTTL:           2 * time.Hour,
+        RouteRenewInterval: 100 * time.Minute,
+    },
+})
+```
+
+`RouteTTL` must exceed `RouteRenewInterval + RouteRenewInterval/10 + OperationTimeout + LeaseSafetyMargin`. Zero uses the default for each option; when shortening the TTL, configure the renewal interval as well.
+
+A confirmed lost session, an uncertain initial acquisition, or the local session deadline moves the router to Lost. It stops admissions and renewal, kills its exact managed PIDs, and independently closes its own session with an operation timeout. Temporary renewal errors retain the last confirmed deadline. A late response cannot reactivate a Lost router. Routed admission resumes with a fresh node/router instance. Business dispatch checks both local deadlines before processing another mailbox item; a route deadline stops only that actor.
+
+Concurrent old and new actors after a membership-based takeover are an accepted availability tradeoff. With responsive storage/workers, the old actor detects replacement at its next renewal (normally within 90–110 minutes of the last successful acquisition/renewal by default); if renewal fails or stalls, its existing local deadline stops further dispatch (up to the remaining 2-hour route TTL, less the safety margin). Already-running Init, callbacks, and application goroutines must finish cooperatively. Routing does not provide exactly-once business execution; mailbox work, direct-PID messages, and self-timers can still execute on the old actor during the overlap.
 
 Shutdown enters Draining before stopping the node, then `router.Close()` stops local route management and closes the shared session. Session closure invalidates all associated routes; their records expire through their own TTLs. Session closure is bounded by `OperationTimeout`; a failure is logged and the session expires naturally. Custom bootstrap should call `router.Drain()`, stop the node, then call `router.Close()`. Business cleanup belongs to the node/application shutdown flow: `node.Wait()` can finish before Terminate callbacks return, and closing the session permits takeover while those callbacks are still running.
 
@@ -133,15 +149,19 @@ err := system.RegisterLauncher("worker", system.Launcher{
 })
 ```
 
-Register launchers before starting the node. The leader rotates through one page per launcher and sends launches directly to the consistent-hash target. `DaemonOptions.ScanBatchSize` defaults to 32; `MaxInFlight` defaults to 64 per initiating daemon and covers local and remote recovery, including retained per-key retries. Failed scanner-backed tasks release capacity and retry through a coalesced scan after `RetryMaxDelay` (default 60 seconds); pending exact-PID cleanup retains its retry state. A fixed pool of eight I/O workers handles lookup, exact-owner cleanup, and remote delivery outside the daemon callback. At most one scanner fetch runs at a time; scanner implementations must bound their I/O.
+Register launchers before starting the node. The leader rotates through one page per launcher. `DaemonOptions.ScanBatchSize` defaults to 32; `MaxInFlight` defaults to 64 per initiating daemon and covers lookup, waiting for a target, local and remote launches, and retained per-key retries. A fixed pool of sixteen I/O workers handles scanner page reads, lookup, exact-owner cleanup, and remote delivery. The daemon dispatches one page task at a time and resumes scanning when the worker returns its result. Scanner implementations must bound their I/O.
 
-Each target admits up to eight outstanding launches and coalesces duplicate keys. If Init times out but keeps running, its worker remains occupied until Init returns or the launch pool stops. Business Init should bound its external calls. Retries use exponential backoff and jitter and retain their admission slot. Successful starts release capacity immediately; `RunningGrace` is retained for source compatibility and no longer delays completion. Init returning `gen.TerminateReasonNormal` ends recovery for that key until a later scanner includes it again.
+The initiator retains launch arguments and announces each task to its consistent-hash target. Targets acknowledge task identities and coalesce duplicate keys. Each of eight launch workers requests a task when idle; its target daemon reserves the worker before asking the initiator for the launch arguments. On completion, the worker immediately becomes available to request another task. The initiator releases the completed task's capacity and resumes its scanner. A full initiator keeps remaining items in the current scanner page until capacity is released. `ScanBatchSize` bounds work per callback; batches continue through messages as capacity becomes available.
+
+Waiting for a worker has no launch deadline. Unconfirmed announcements are resent after `LaunchTimeout`; the launch deadline starts when the initiator answers a target's pull request. A target also expires reservations whose launch arguments never arrive. If Init times out but keeps running, its worker remains occupied until Init returns or the worker stops. Business Init should bound its external calls. Failed scanner-backed tasks release capacity and retry through a coalesced scan after `RetryMaxDelay` (default 60 seconds). Exact-PID cleanup and tasks without scanners retain per-key retries with exponential backoff and jitter. Successful starts release capacity immediately; `RunningGrace` no longer delays completion. Init returning `gen.TerminateReasonNormal` ends recovery for that key until a later scanner includes it again.
 
 After membership publishes the updated topology, it notifies daemon recovery. A launched daemon's termination wrapper notifies recovery after cleanup; recovery conditionally releases that exact exited PID and retries cleanup failures before ensuring a replacement. Overflow notifications coalesce into a full recovery request. Full recovery defaults to 15 minutes as a repair pass. Node shutdown relies on membership recovery and configured scanners.
 
 For application-driven spawning, `system.NewSpawner(process, router, "worker").SpawnRegister(...)` installs the same route and exit-recovery lifecycle when using custom bootstrap with an explicit router.
 
 ## Deployment and upgrades
+
+Deploy the daemon pull-protocol change to all cluster nodes together.
 
 Existing actors stay on their current nodes after expansion. Rolling upgrades recover actors as old instances exit; business state should be restored by the new instance's Init. Keep launcher names, recovery arguments, and message types compatible across coexisting versions. Placement uses node membership rather than launcher-version capabilities.
 
@@ -156,5 +176,3 @@ v1 imports remain available at the root module. In v2, durable route persistence
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
-Recovery scans pace batches with `DaemonOptions.ScanBatchInterval` (default 50 ms). With the default batch size of 32, each leader admits at most about 640 scanned items per second, plus the initial batch; completion messages do not bypass this interval. This trades recovery speed for lower persistence load. Session renewals scale with the number of nodes; route acquisition, lookup, release, and TTL reclamation account for the remaining backend load.

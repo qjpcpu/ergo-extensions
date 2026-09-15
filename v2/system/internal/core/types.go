@@ -17,6 +17,21 @@ type (
 		Process  DaemonProcess
 		Attempt  int
 	}
+	MessageDaemonLaunchOffer struct {
+		Name  gen.Atom
+		Owner gen.Atom
+		Epoch int64
+	}
+	MessageDaemonLaunchPull struct {
+		Name  gen.Atom
+		Node  gen.Atom
+		Epoch int64
+	}
+	MessageDaemonLaunchWithdraw struct {
+		Name  gen.Atom
+		Owner gen.Atom
+		Epoch int64
+	}
 	MessageLaunchOneDaemon struct {
 		Launcher gen.Atom
 		Process  DaemonProcess
@@ -38,6 +53,9 @@ func init() {
 		DaemonProcess{},
 		MessageEnsureDaemon{},
 		MessageLaunchOneDaemon{},
+		MessageDaemonLaunchOffer{},
+		MessageDaemonLaunchPull{},
+		MessageDaemonLaunchWithdraw{},
 		MessageDaemonLaunchResult{},
 	}
 	for _, value := range types {

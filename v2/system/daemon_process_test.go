@@ -1,6 +1,7 @@
 package system_test
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,6 +14,154 @@ import (
 	"github.com/qjpcpu/ergo-extensions/v2/system"
 	"github.com/qjpcpu/ergo-extensions/v2/system/internal/core"
 )
+
+func TestDaemonRecoveryPullsAcrossNodes(t *testing.T) {
+	const pageSize = 100
+	for _, tc := range []struct {
+		total, limit int
+		initDelay    time.Duration
+	}{
+		{1000, 64, 0}, {100, 64, 200 * time.Millisecond}, {20, 4, 0},
+	} {
+		t.Run(fmt.Sprintf("tasks-%d-limit-%d", tc.total, tc.limit), func(t *testing.T) {
+			ready, release := make(chan struct{}), make(chan struct{})
+			var readyOnce, releaseOnce sync.Once
+			publish := func() { readyOnce.Do(func() { close(ready) }) }
+			unblock := func() { releaseOnce.Do(func() { close(release) }) }
+			defer publish()
+			defer unblock()
+			entered := make(chan gen.Atom, tc.total)
+			var active, peak, completed, scans, pages atomic.Int32
+			var processes []system.DaemonProcess
+			launcher := gen.Atom(t.Name())
+			if err := system.RegisterLauncher(launcher, system.Launcher{
+				Factory: func() gen.ProcessBehavior {
+					return &pullRecoveryProc{onInit: func(node gen.Atom) {
+						n := active.Add(1)
+						for old := peak.Load(); n > old; old = peak.Load() {
+							if peak.CompareAndSwap(old, n) {
+								break
+							}
+						}
+						entered <- node
+						<-release
+						if tc.initDelay > 0 {
+							time.Sleep(tc.initDelay)
+						}
+						active.Add(-1)
+						completed.Add(1)
+					}}
+				},
+				RecoveryScanner: func() system.DaemonIterator {
+					<-ready
+					scans.Add(1)
+					offset := 0
+					return func() ([]system.DaemonProcess, bool, error) {
+						pages.Add(1)
+						end := min(offset+pageSize, len(processes))
+						page := processes[offset:end]
+						offset = end
+						return page, offset < len(processes), nil
+					}
+				},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			defer system.UnregisterLauncher(launcher)
+			cluster := mem.NewCluster()
+			store := system.NewMemoryActorRoutePersistence()
+			start := func(name string, limit int) app.Node {
+				opts := system.DefaultDaemonOptions()
+				opts.MaxInFlight = limit
+				opts.InitialRecoveryDelay, opts.LeaderRecoveryDelay, opts.NodeLeftRecoveryDelay = time.Hour, time.Hour, time.Hour
+				opts.FullRecoveryInterval, opts.RetryMaxDelay = time.Hour, time.Hour
+				opts.RecoveryJitterMax = -1
+				opts.LaunchTimeout = time.Second
+				node, err := app.StartSimpleNode(app.SimpleNodeOptions{
+					NodeName: uniqueNodeName(name), Cookie: "pull-recovery",
+					Registrar: mem.CreateWithCluster(cluster), ActorRoutePersistence: store,
+					DaemonOptions: opts, LogLevel: gen.LogLevelDisabled,
+					MembershipOptions: system.MembershipOptions{RefreshInterval: 50 * time.Millisecond},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { publish(); unblock(); node.Stop(); node.WaitWithTimeout(3 * time.Second) })
+				return node
+			}
+			source := start("pull-source@127.0.0.1", tc.limit)
+			target := start("pull-target@127.0.0.1", 4)
+			stats := func(node app.Node) map[string]string {
+				pid, err := node.ProcessPID("extensions_daemon")
+				if err != nil {
+					return nil
+				}
+				result, _ := node.Inspect(pid)
+				return result
+			}
+			waitUntil(t, 5*time.Second, func() bool {
+				return source.Topology().GetAvailableNodes().Len() == 2 && target.Topology().GetAvailableNodes().Len() == 2 && stats(source)["is_leader"] == "true"
+			})
+			for i := 0; len(processes) < tc.total; i++ {
+				name := gen.Atom(fmt.Sprintf("pulled-%d", i))
+				if source.Topology().PickNode(name) == target.Name() {
+					processes = append(processes, system.DaemonProcess{ProcessName: name})
+				}
+			}
+			publish()
+			if err := source.Send(gen.Atom("extensions_daemon"), core.MessageLaunchAllDaemon{}); err != nil {
+				t.Fatal(err)
+			}
+			workers := min(8, tc.limit)
+			deadline := time.NewTimer(5 * time.Second)
+			defer deadline.Stop()
+			for i := 0; i < workers; i++ {
+				select {
+				case node := <-entered:
+					if node != target.Name() {
+						t.Fatalf("Init ran on %s, want %s", node, target.Name())
+					}
+				case <-deadline.C:
+					t.Fatalf("only %d workers began Init; source=%v target=%v", i, stats(source), stats(target))
+				}
+			}
+			waitUntil(t, 5*time.Second, func() bool {
+				return stats(source)["launching_count"] == fmt.Sprint(tc.limit) && stats(target)["pending_launches"] == fmt.Sprint(tc.limit)
+			})
+			if got := stats(source)["scan_pending"]; got != fmt.Sprint(min(tc.total, pageSize)-tc.limit) {
+				t.Fatalf("remaining scanner items = %s", got)
+			}
+			unblock()
+			waitUntil(t, 10*time.Second, func() bool {
+				return completed.Load() == int32(tc.total) && stats(source)["launching_count"] == "0" && stats(target)["pending_launches"] == "0"
+			})
+			if got := peak.Load(); got != int32(workers) {
+				t.Fatalf("Init concurrency = %d, want %d", got, workers)
+			}
+			if got := scans.Load(); got != 1 {
+				t.Fatalf("recovery needed %d scans, want 1", got)
+			}
+			if got, want := pages.Load(), int32((tc.total+pageSize-1)/pageSize); got != want {
+				t.Fatalf("scanner pages = %d, want %d", got, want)
+			}
+			for i := workers; i < tc.total; i++ {
+				if node := <-entered; node != target.Name() {
+					t.Fatalf("Init ran on %s, want %s", node, target.Name())
+				}
+			}
+		})
+	}
+}
+
+type pullRecoveryProc struct {
+	act.Actor
+	onInit func(gen.Atom)
+}
+
+func (p *pullRecoveryProc) Init(...any) error {
+	p.onInit(p.Node().Name())
+	return nil
+}
 
 type mockLauncher struct {
 	processes []system.DaemonProcess

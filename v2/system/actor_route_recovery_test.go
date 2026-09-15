@@ -11,7 +11,7 @@ import (
 )
 
 func TestActorRouteLookupAndTakeoverShareValidity(t *testing.T) {
-	for _, mode := range []string{"discovered", "discovery pending", "session closed", "expired route", "local"} {
+	for _, mode := range []string{"online", "offline", "session closed", "expired route", "local"} {
 		t.Run(mode, func(t *testing.T) {
 			s := routeStore(t)
 			r := routeRouter(t, s, ActorRouterOptions{})
@@ -25,7 +25,7 @@ func TestActorRouteLookupAndTakeoverShareValidity(t *testing.T) {
 			}
 			id := routeSeed(t, s, "key", old)
 			reg, _ := n.Network().Registrar()
-			if mode != "discovery pending" {
+			if mode != "offline" {
 				reg.(*routeFailRegistrar).nodes = []gen.Atom{old.Node}
 			}
 			if mode == "session closed" {
@@ -35,7 +35,7 @@ func TestActorRouteLookupAndTakeoverShareValidity(t *testing.T) {
 				s.AcquireRoute(context.Background(), id, "key", old, nil, -time.Second)
 			}
 			_, found, e := r.lookup(nil, "key")
-			want := mode != "session closed" && mode != "expired route"
+			want := mode == "online" || mode == "local"
 			if e != nil || found != want {
 				t.Fatal(found, e)
 			}
@@ -58,7 +58,7 @@ func TestActorRouteLookupAndTakeoverShareValidity(t *testing.T) {
 		})
 	}
 }
-func TestActorRouteOwnerRemainsValidUntilSessionCloses(t *testing.T) {
+func TestActorRouteOwnerFollowsNodeMembership(t *testing.T) {
 	s := routeStore(t)
 	r := routeRouter(t, s, ActorRouterOptions{})
 	n := routeNode(t)
@@ -72,8 +72,8 @@ func TestActorRouteOwnerRemainsValidUntilSessionCloses(t *testing.T) {
 		t.Fatal(found, e)
 	}
 	registrar.nodes = nil
-	if owner, found, e := r.lookup(nil, "key"); e != nil || !found || owner != pid {
-		t.Fatal(owner, found, e)
+	if _, found, e := r.lookup(nil, "key"); e != nil || found {
+		t.Fatal(found, e)
 	}
 	if e := s.CloseSession(context.Background(), id); e != nil {
 		t.Fatal(e)
@@ -105,7 +105,7 @@ type routeFailRegistrar struct {
 }
 
 func (r routeFailRegistrar) Nodes() ([]gen.Atom, error) { return r.nodes, r.err }
-func TestActorRouteOwnerSurvivesDiscoveryFailure(t *testing.T) {
+func TestActorRouteDiscoveryFailurePreventsTakeover(t *testing.T) {
 	want := errors.New("registrar unavailable")
 	for _, network := range []gen.Network{nil, routeFailNetwork{err: want}, routeFailNetwork{registrar: routeFailRegistrar{err: want}}} {
 		s := routeStore(t)
@@ -114,11 +114,11 @@ func TestActorRouteOwnerSurvivesDiscoveryFailure(t *testing.T) {
 		r.Bind(n)
 		pid := gen.PID{Node: "remote", ID: 1}
 		routeSeed(t, s, "key", pid)
-		if owner, found, e := r.lookup(nil, "key"); e != nil || !found || owner != pid {
-			t.Fatal(owner, found, e)
+		if _, _, e := r.lookup(nil, "key"); e == nil {
+			t.Fatal("lookup hid discovery failure")
 		}
 		i := &localRouteInstance{key: "key", pid: gen.PID{Node: n.Name(), ID: 2}, acquiring: true}
-		if e := r.acquire(context.Background(), i); !errors.Is(e, ErrActorRouteTaken) {
+		if e := r.acquire(context.Background(), i); !errors.Is(e, ErrRouteNotApplied) {
 			t.Fatal(e)
 		}
 		snapshot, _, _ := s.ReadRoute(context.Background(), "key")

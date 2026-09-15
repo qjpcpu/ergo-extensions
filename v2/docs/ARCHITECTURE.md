@@ -12,9 +12,9 @@
 
 Binding opens a fresh session and starts an independent heartbeat and deadline watchdog. All routed actors on that node share its session. The router progresses through Active, Draining, Lost, and Closed. A Lost session remains terminal, even if an earlier renewal succeeds late.
 
-Acquisition runs through a bounded worker pool before business Init. `AcquireRoute` atomically checks the requesting session and the expected `(SessionID, full PID)` owner. Concurrent contenders re-read after comparison failure. A storage error certified with `ErrRouteNotApplied` leaves the session usable; an uncertain write stops the router and initiates owner-side session closure.
+Acquisition runs through a bounded worker pool before business Init. `AcquireRoute` atomically checks the requesting session and the expected `(SessionID, full PID)` owner. Concurrent contenders re-read after comparison failure. A storage error certified with `ErrRouteNotApplied` leaves the session usable; an uncertain initial acquisition stops the router and initiates owner-side session closure.
 
-The process view preserves the original behavior for Ergo's callback discovery and checks session/route deadlines through `Process.State`. This prevents another mailbox item from entering business dispatch after a local deadline. Each route has one timing-wheel entry for its deadline. Due work is handled in bounded batches, continuing immediately while more expired work remains. Already-running callbacks and goroutines must finish cooperatively.
+The process view preserves the original behavior for Ergo's callback discovery and checks session/route deadlines through `Process.State`. This prevents another mailbox item from entering business dispatch after a local deadline. Each route has one timing-wheel entry for its next renewal or deadline. Renewals use the existing bounded route worker pool; an in-flight renewal keeps the local deadline scheduled. Due work is handled in bounded batches, continuing immediately while more expired work remains. Already-running callbacks and goroutines must finish cooperatively.
 
 Lifecycle records remain associated through acquisition, Init, and business Terminate. After cleanup, exact-owner release enters a retained retry queue. Release work receives bounded priority bursts. When pending cleanup reaches the configured threshold, new actor admission applies backpressure. Session renewal runs separately from route workers, so slow lookup, acquisition, or release cannot occupy the heartbeat worker.
 
@@ -22,14 +22,19 @@ Normal shutdown enters Draining, stops the node, then closes the router. Router 
 
 ## Lookup and takeover
 
-A valid route requires both conditions:
+A valid route requires all three conditions:
 
 1. Its independent route TTL remains live.
 2. The referenced session remains live in the consistent storage snapshot.
+3. The owner node is present in a direct `registrar.Nodes()` result, or `node.IsAlive()` for self.
 
-Lookup reads storage synchronously in the caller with an operation timeout, then checks validity. Acquisition and release use the route worker pool. Lookup and acquisition use this same predicate. Invalid routes can be replaced with an exact-owner comparison. Only a session's owning router closes it. A live route/session retains its owner while registrar discovery catches up; registrar data supplies network addressing. Graceful shutdown releases routes, and abnormal node termination leaves its existing session to expire before takeover.
+Lookup reads storage synchronously in the caller with an operation timeout, then checks validity. Acquisition and release use the route worker pool. Lookup and acquisition use this same predicate. Invalid routes can be replaced with an exact-owner comparison. Only a session's owning router closes it. Registrar failures propagate and prevent takeover. An absent node makes its route reclaimable even while its session remains live. This deliberately accepts overlapping actors during discovery lag in exchange for prompt recovery. Name-only membership cannot distinguish a same-name restart until the old session closes or expires.
 
-Route/session checks govern routing and future dispatch. Expiration can stop an actor while its current callback is still returning; these checks cannot reverse external business side effects.
+Route TTL defaults to 2 hours and route renewal to 100 minutes with ±10% per-actor jitter (90–110 minutes). Both are configurable through `StartSimpleNode(SimpleNodeOptions{ActorRouterOptions: ...})` using `RouteTTL` and `RouteRenewInterval`. The TTL must cover the renewal interval plus its 10% jitter, operation timeout, and safety margin.
+
+Renewal calls `AcquireRoute` with the actor's own exact session and PID as the expected owner. It extends the deadline on success, stops the displaced actor on an owner mismatch, and retries errors without extending the last confirmed deadline. It never re-reads another owner to take the route back. Late results cannot restart dispatch after expiry. Pending cleanup waits for in-flight renewal before releasing the exact owner. First and subsequent renewal times are spread using jitter seeded by the key and full PID. Storage failures and queue saturation back off from a 1-second base to at most 60 seconds (or the configured renewal interval when shorter), with ±10% jitter; deadlines remain scheduled throughout. The worker pool bounds concurrency, not storage writes per second.
+
+Concurrent execution after takeover is accepted. An old actor normally detects replacement at its next renewal; failures or blocked workers leave its original route deadline as the bound on further dispatch. Already-running callbacks must finish cooperatively. Direct-PID messages, mailbox work, and self-timers can execute on the old actor during this interval; routing does not serialize external side effects.
 
 ## Membership
 
@@ -39,9 +44,13 @@ AddressBook canonicalizes the node list, updates one consistent-hash ring, publi
 
 ## Daemon recovery
 
-Every node runs a daemon. The leader fetches one scanner page at a time outside its actor callback and rotates launchers after each page. The initiating daemon tracks a recovery from lookup through the target's launch result using the existing launch/result messages. Consistent hashing selects the target.
+Every node runs a daemon. The leader sends one scanner page task at a time to the I/O pool and rotates launchers after each page. The I/O worker creates or resumes the iterator and returns `messageScanPage`; the daemon owns page admission, scheduling, and retry state. Consistent hashing selects each task's target. `ScanBatchSize` defaults to 32 and bounds one scanner callback; `MaxInFlight` defaults to 64 per initiator and includes lookup, waiting tasks, local and remote launches, and retained retries. A full initiator keeps remaining items in its current scanner page. Completion releases capacity and schedules the next scanner step immediately. Sixteen I/O workers perform scanner page reads, lookup, exact-PID cleanup, and remote delivery.
 
-`ScanBatchSize` defaults to 32; `MaxInFlight` defaults to 64 per initiator, including remote work and retries. Eight I/O workers perform lookup, exact-PID cleanup, and remote delivery. Targets admit eight outstanding launches and coalesce keys. Successful completion immediately releases admission capacity. Init returning Normal ends that recovery; Failures of scanner-backed tasks release their slot and retry through a coalesced recovery scan after `RetryMaxDelay` (default 60 seconds). Exact exited-PID cleanup and tasks without a scanner retain per-key retries. Init that outlives spawn timeout occupies its launch worker until it returns or the launch pool stops. Scanner callbacks must bound their own I/O.
+After lookup, the initiator retains the launch arguments and sends a task offer containing the name, owner, and epoch. The target acknowledges the offer and queues its identity. It coalesces same-name offers from multiple initiators and records each request for result delivery. An idle launch worker reserves a queued task, and the target requests its arguments from the initiator. Only that reservation receives the corresponding launch message. When the worker finishes, the target replies to all waiting requests and immediately pulls another task for that worker. Eight workers execute Init, with one reservation or running task per worker. Protocol delivery proceeds independently of the initiator's task admission limit.
+
+Unacknowledged offers are resent after `LaunchTimeout`. Acknowledged tasks wait for worker capacity without a launch timer. The initiator starts its launch deadline when responding to a pull; the target also times out reservations whose arguments never arrive. Withdrawal removes a queued request or an unstarted reservation and acknowledges a terminal result. Targets retain terminal results and resend them after `LaunchTimeout` until acknowledged or the initiating daemon exits; acknowledged capacity waits therefore also recover from a lost completion. A running Init keeps its worker until it returns or the worker stops, including when spawn times out. Peer monitoring is established by an I/O worker, which owns the remote monitor and forwards down notifications. The daemon coalesces pending monitor requests per node and resumes offers after completion; withdrawals cancel pending offers, and task placement is checked before resuming. It monitors the owning worker locally so worker or pool exit releases abandoned reservations and retries affected tasks. Topology changes withdraw old offers and recheck placement.
+
+Init returning Normal ends that recovery. Scanner-backed failures release their slot and retry through a coalesced recovery scan after `RetryMaxDelay` (default 60 seconds). Exact exited-PID cleanup and tasks without scanners retain per-key retries. Scanner callbacks and business Init must bound their own I/O.
 
 Membership notifies recovery after publishing its topology snapshot, including registrar incarnation events that preserve the node-name set. Launched daemons and the custom-bootstrap spawner notify recovery after business termination. Recovery retries conditional cleanup of that exact exited PID before ensuring another instance. Shutdown recovery uses scanner data after membership changes; the 15-minute full scan repairs missed notifications.
 
@@ -49,10 +58,10 @@ Expired routed daemons terminate and recover as fresh actor instances through th
 
 ## Scaling and persistence
 
-Session renewal traffic is proportional to node count. Acquisition, lookup, release, and garbage collection remain proportional to route activity. Route TTL is independent of session renewal. The default worker count is 16, with a 65,536-entry operation queue and a 65,536 pending-release admission threshold.
+Session renewal traffic is proportional to node count; route renewal traffic is proportional to actor count divided by `RouteRenewInterval`. Acquisition, lookup, release, and garbage collection remain proportional to route activity. Route TTL is independent of session renewal. The default worker count is 16, with a 65,536-entry operation queue and a 65,536 pending-release admission threshold.
 
 The backend must atomically check sessions and compare owners, return remaining validity, honor operation contexts, reclaim unread expired records, and keep session closure terminal against concurrent requests. Local deadlines are anchored to the monotonic request start plus returned validity minus the configured safety margin. Successful persistence operations must remain durable within the backend's stated failure model.
 
 `MemoryActorRoutePersistence` implements this contract for one process using a mutex and indexed expiration heap. Updating TTL replaces the existing heap entry, so repeated session renewal and same-owner registration retain bounded expiration metadata. A bounded background sweep reclaims unread records.
 
-Recovery scans pace batches with `DaemonOptions.ScanBatchInterval` (default 50 ms). At the default batch size of 32, each leader admits about 640 scanned items per second plus the initial batch. This pacing limits recovery storage pressure independently of session heartbeat traffic.
+Recovery throughput follows task capacity and worker completion. Scanner batches yield through self-messages, and capacity release resumes pending work. Persistence concurrency remains bounded by the sixteen I/O workers per daemon.

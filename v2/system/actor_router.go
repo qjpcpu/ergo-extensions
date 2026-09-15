@@ -41,7 +41,13 @@ type ActorRouterOptions struct {
 	SessionRenewInterval time.Duration
 	OperationTimeout     time.Duration
 	LeaseSafetyMargin    time.Duration
-	RouteTTL             time.Duration
+	// RouteTTL bounds how long an old actor can keep dispatching after takeover
+	// if renewal cannot reach storage. Defaults to 2 hours.
+	RouteTTL time.Duration
+	// RouteRenewInterval defaults to 100 minutes, with +/-10% per-actor jitter
+	// to spread writes from actors started together. Renewal compares the exact
+	// owner and stops this actor if another node has taken over its route.
+	RouteRenewInterval   time.Duration
 	RouteChangeWorkers   int
 	RouteChangeQueueSize int
 	ReleaseQueueSize     int
@@ -53,7 +59,8 @@ func DefaultActorRouterOptions() ActorRouterOptions {
 		SessionRenewInterval: 10 * time.Second,
 		OperationTimeout:     3 * time.Second,
 		LeaseSafetyMargin:    3 * time.Second,
-		RouteTTL:             24 * time.Hour,
+		RouteTTL:             2 * time.Hour,
+		RouteRenewInterval:   100 * time.Minute,
 		RouteChangeWorkers:   16,
 		RouteChangeQueueSize: 65536,
 		ReleaseQueueSize:     65536,
@@ -61,7 +68,7 @@ func DefaultActorRouterOptions() ActorRouterOptions {
 }
 func normalizeActorRouterOptions(o ActorRouterOptions) (ActorRouterOptions, error) {
 	d := DefaultActorRouterOptions()
-	for _, pair := range [][2]*time.Duration{{&o.SessionTTL, &d.SessionTTL}, {&o.SessionRenewInterval, &d.SessionRenewInterval}, {&o.OperationTimeout, &d.OperationTimeout}, {&o.LeaseSafetyMargin, &d.LeaseSafetyMargin}, {&o.RouteTTL, &d.RouteTTL}} {
+	for _, pair := range [][2]*time.Duration{{&o.SessionTTL, &d.SessionTTL}, {&o.SessionRenewInterval, &d.SessionRenewInterval}, {&o.OperationTimeout, &d.OperationTimeout}, {&o.LeaseSafetyMargin, &d.LeaseSafetyMargin}, {&o.RouteTTL, &d.RouteTTL}, {&o.RouteRenewInterval, &d.RouteRenewInterval}} {
 		if *pair[0] == 0 {
 			*pair[0] = *pair[1]
 		}
@@ -77,7 +84,7 @@ func normalizeActorRouterOptions(o ActorRouterOptions) (ActorRouterOptions, erro
 			return o, errors.New("actor router capacities must be positive")
 		}
 	}
-	if o.SessionRenewInterval+o.SessionRenewInterval/10+o.OperationTimeout+o.LeaseSafetyMargin >= o.SessionTTL || o.RouteTTL <= o.LeaseSafetyMargin {
+	if o.SessionRenewInterval+o.SessionRenewInterval/10+o.OperationTimeout+o.LeaseSafetyMargin >= o.SessionTTL || o.RouteRenewInterval+o.RouteRenewInterval/10+o.OperationTimeout+o.LeaseSafetyMargin >= o.RouteTTL {
 		return o, errors.New("actor router TTL must cover renewal, operation timeout and safety margin")
 	}
 	return o, nil
@@ -116,6 +123,10 @@ type localRouteInstance struct {
 	key                                            gen.Atom
 	pid                                            gen.PID
 	deadline                                       time.Time
+	renewAt                                        time.Time
+	renewing                                       bool
+	renewJitter                                    uint64
+	renewRetryDelay                                time.Duration
 	acquiring, writing, acquired, cleanup, stopped bool
 	releasing                                      bool
 	release                                        *list.Element
@@ -288,7 +299,37 @@ func (r *ActorRouter) lose() {
 	}
 }
 func (r *ActorRouter) valid(snapshot RouteSnapshot) (bool, error) {
-	return snapshot.ValidFor > 0 && snapshot.SessionValid, nil
+	if snapshot.ValidFor <= 0 || !snapshot.SessionValid {
+		return false, nil
+	}
+	node, err := r.boundNode()
+	if err != nil {
+		return false, err
+	}
+	if snapshot.Owner.PID.Node == node.Name() {
+		return node.IsAlive(), nil
+	}
+	if node.Network() == nil {
+		return false, gen.ErrNoRoute
+	}
+	registrar, err := node.Network().Registrar()
+	if err != nil {
+		return false, err
+	}
+	nodes, err := registrar.Nodes()
+	if err != nil {
+		return false, err
+	}
+	// Lookup and takeover intentionally include node membership. Discovery lag
+	// can permit concurrent actors; this is an accepted availability tradeoff.
+	// The old actor stops on an owner mismatch at renewal, or at its local route
+	// deadline if renewal fails. Already-running callbacks must finish themselves.
+	for _, name := range nodes {
+		if name == snapshot.Owner.PID.Node {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 func (r *ActorRouter) lookup(ctx context.Context, key gen.Atom) (gen.PID, bool, error) {
 	if key == "" {
@@ -389,6 +430,7 @@ func (r *ActorRouter) acquire(ctx context.Context, i *localRouteInstance) error 
 			}
 			i.acquired = true
 			i.deadline = start.Add(result.ValidFor - r.options.LeaseSafetyMargin)
+			i.scheduleRenewal(start, r.options.RouteRenewInterval)
 			if r.state == routerActive || r.state == routerDraining {
 				r.manager.scheduleLocked(i)
 			}
@@ -448,7 +490,7 @@ func (r *ActorRouter) finishLocked(i *localRouteInstance) {
 		delete(r.instances, i.pid)
 		return
 	}
-	if i.acquiring {
+	if i.acquiring || i.renewing {
 		return
 	}
 	r.manager.removeLocked(i)

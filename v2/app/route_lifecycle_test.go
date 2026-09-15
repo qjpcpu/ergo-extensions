@@ -102,12 +102,12 @@ func TestRoutedChildRestartsAfterBusinessCleanup(t *testing.T) {
 }
 
 func TestDaemonRouteExpirationCreatesFreshInstance(t *testing.T) {
-	s := newTestRoutePersistence(t)
+	s := &failedRouteRenewalStore{newTestRoutePersistence(t)}
 	var inits atomic.Int64
 	name := gen.Atom("ttl-daemon")
 	system.RegisterLauncher("ttl-launcher", system.Launcher{Factory: func() gen.ProcessBehavior { return &persistentLaunchActor{inits: &inits} }, Option: gen.ProcessOptions{LinkParent: true}, RecoveryScanner: system.SingletonDaemon(name, nil)})
 	defer system.UnregisterLauncher("ttl-launcher")
-	n, e := StartSimpleNode(SimpleNodeOptions{NodeName: "route-ttl@localhost", Port: 11923, Registrar: mem.Create(), ActorRoutePersistence: s, NodeForwardWorker: 1, LogLevel: gen.LogLevelDisabled, ActorRouterOptions: system.ActorRouterOptions{RouteTTL: 500 * time.Millisecond, LeaseSafetyMargin: 20 * time.Millisecond}, DaemonOptions: system.DaemonOptions{InitialRecoveryDelay: time.Millisecond, LeaderRecoveryDelay: time.Millisecond, FullRecoveryInterval: time.Hour, RetryInitialDelay: time.Millisecond, RetryMaxDelay: 20 * time.Millisecond, RecoveryJitterMax: -1, RetryJitterMax: -1}})
+	n, e := StartSimpleNode(SimpleNodeOptions{NodeName: "route-ttl@localhost", Port: 11923, Registrar: mem.Create(), ActorRoutePersistence: s, NodeForwardWorker: 1, LogLevel: gen.LogLevelDisabled, ActorRouterOptions: system.ActorRouterOptions{RouteTTL: 500 * time.Millisecond, RouteRenewInterval: 100 * time.Millisecond, OperationTimeout: 50 * time.Millisecond, LeaseSafetyMargin: 20 * time.Millisecond}, DaemonOptions: system.DaemonOptions{InitialRecoveryDelay: time.Millisecond, LeaderRecoveryDelay: time.Millisecond, FullRecoveryInterval: time.Hour, RetryInitialDelay: time.Millisecond, RetryMaxDelay: 20 * time.Millisecond, RecoveryJitterMax: -1, RetryJitterMax: -1}})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -365,7 +365,7 @@ func TestDaemonRetriesExactExitCleanupWithHourLease(t *testing.T) {
 	var inits atomic.Int64
 	system.RegisterLauncher("release-retry-launcher", system.Launcher{Factory: func() gen.ProcessBehavior { return &persistentLaunchActor{inits: &inits} }, RecoveryScanner: system.SingletonDaemon("release-retry", nil)})
 	defer system.UnregisterLauncher("release-retry-launcher")
-	n, err := StartSimpleNode(SimpleNodeOptions{Registrar: mem.Create(), NodeName: "release-retry@localhost", Port: 11921, ActorRoutePersistence: store, NodeForwardWorker: 1, LogLevel: gen.LogLevelDisabled, ActorRouterOptions: system.ActorRouterOptions{RouteTTL: time.Hour}, DaemonOptions: system.DaemonOptions{LeaderRecoveryDelay: time.Millisecond, InitialRecoveryDelay: time.Millisecond, FullRecoveryInterval: time.Hour, RetryInitialDelay: 10 * time.Millisecond, RetryMaxDelay: 20 * time.Millisecond, RecoveryJitterMax: -1, RetryJitterMax: -1}})
+	n, err := StartSimpleNode(SimpleNodeOptions{Registrar: mem.Create(), NodeName: "release-retry@localhost", Port: 11921, ActorRoutePersistence: store, NodeForwardWorker: 1, LogLevel: gen.LogLevelDisabled, ActorRouterOptions: system.ActorRouterOptions{RouteTTL: time.Hour, RouteRenewInterval: 50 * time.Minute}, DaemonOptions: system.DaemonOptions{LeaderRecoveryDelay: time.Millisecond, InitialRecoveryDelay: time.Millisecond, FullRecoveryInterval: time.Hour, RetryInitialDelay: 10 * time.Millisecond, RetryMaxDelay: 20 * time.Millisecond, RecoveryJitterMax: -1, RetryJitterMax: -1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,4 +420,45 @@ func (s *restartingRouteSupervisor) Init(...any) (act.SupervisorSpec, error) {
 		}
 		return s.routes.WithActorRoute("restart-child", a)
 	}}}}, nil
+}
+
+// New instances can acquire their route, while renewal I/O remains unavailable.
+type failedRouteRenewalStore struct{ *testRoutePersistence }
+
+func (s *failedRouteRenewalStore) AcquireRoute(ctx context.Context, id system.SessionID, key gen.Atom, pid gen.PID, expected *system.RouteOwner, ttl time.Duration) (system.AcquireRouteResult, error) {
+	if expected != nil && *expected == (system.RouteOwner{SessionID: id, PID: pid}) {
+		return system.AcquireRouteResult{}, errors.New("renewal unavailable")
+	}
+	return s.testRoutePersistence.AcquireRoute(ctx, id, key, pid, expected, ttl)
+}
+
+func TestSimpleNodeRenewsConfiguredRouteLifetime(t *testing.T) {
+	s := newTestRoutePersistence(t)
+	n, err := StartSimpleNode(SimpleNodeOptions{
+		NodeName: "configured-route-renewal@localhost", Port: 11924, Registrar: mem.Create(),
+		ActorRoutePersistence: s, NodeForwardWorker: 1, LogLevel: gen.LogLevelDisabled,
+		ActorRouterOptions: system.ActorRouterOptions{RouteTTL: 300 * time.Millisecond, RouteRenewInterval: 100 * time.Millisecond, OperationTimeout: 50 * time.Millisecond, LeaseSafetyMargin: 20 * time.Millisecond},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Stop()
+	var inits atomic.Int64
+	pid, err := n.Spawn(func() gen.ProcessBehavior {
+		return n.ActorRoutes().WithActorRoute("renewed-route", &persistentLaunchActor{inits: &inits})
+	}, gen.ProcessOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(750 * time.Millisecond)
+	got, found, err := n.ActorRoutes().Locate(context.Background(), "renewed-route")
+	if err != nil || !found || got != pid {
+		t.Fatal("configured renewal did not retain actor", got, found, err)
+	}
+	if _, err := n.ProcessState(pid); err != nil {
+		t.Fatal(err)
+	}
+	if inits.Load() != 1 {
+		t.Fatal("renewal restarted business Init")
+	}
 }

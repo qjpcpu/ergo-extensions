@@ -126,7 +126,7 @@ func TestActorRouterOptionsAndValidation(t *testing.T) {
 	if _, e := NewActorRouter(nil, ActorRouterOptions{}); !errors.Is(e, ErrActorRoutePersistenceNil) {
 		t.Fatal(e)
 	}
-	for _, o := range []ActorRouterOptions{{SessionTTL: -1}, {RouteChangeWorkers: -1}, {SessionTTL: time.Second}, {RouteTTL: time.Second}} {
+	for _, o := range []ActorRouterOptions{{SessionTTL: -1}, {RouteRenewInterval: -1}, {RouteChangeWorkers: -1}, {SessionTTL: time.Second}, {RouteTTL: time.Second}, {RouteRenewInterval: 2 * time.Hour}} {
 		if _, e := NewActorRouter(s, o); e == nil {
 			t.Fatal(o)
 		}

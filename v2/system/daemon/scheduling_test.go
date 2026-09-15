@@ -19,7 +19,6 @@ func TestRemoteRecoveryCapacityIncludesRetries(t *testing.T) {
 	book.SetAvailableNodes(core.NewNodeList(remote))
 	actor := spawnDaemonUnit(t, book, self)
 	w := actor.Behavior().(*daemon)
-	w.options.ScanBatchInterval = 0
 	w.options.MaxInFlight = 64
 	w.options.ScanBatchSize = 32
 	w.isLeader = true
@@ -127,31 +126,29 @@ func TestSlowLookupLeavesDaemonResponsive(t *testing.T) {
 	<-done
 }
 
-func TestRecoveryPacesBatchesAfterCompletion(t *testing.T) {
+func TestRecoveryResumesOnCompletion(t *testing.T) {
 	self, remote := gen.Atom("paced-a@localhost"), gen.Atom("paced-b@localhost")
 	book := core.NewAddressBook()
 	book.SetAvailableNodes(core.NewNodeList(remote))
 	actor := spawnDaemonUnit(t, book, self)
 	w := actor.Behavior().(*daemon)
 	w.isLeader = true
-	w.options.ScanBatchSize = 2
-	w.options.ScanBatchInterval = 100 * time.Millisecond
+	w.options.ScanBatchSize, w.options.MaxInFlight = 2, 2
 	scan := &recoveryScan{launchers: []core.Launcher{{Name: "l"}}, loaded: true, started: time.Now(), page: []core.DaemonProcess{{ProcessName: "a"}, {ProcessName: "b"}, {ProcessName: "c"}}}
 	w.scan = scan
 	w.scanStep(scan)
-	for key, state := range w.launching {
-		w.handleDaemonLaunchResult(core.MessageDaemonLaunchResult{Name: key, Node: remote, Epoch: state.Epoch, State: daemonLaunchStarted})
+	actor.SendMessage(actor.PID(), messageScanStep{scan})
+	if len(scan.page) != 1 || scan.scheduled {
+		t.Fatal("full scan should retain its page until capacity is released")
 	}
-	for i := 0; i < 100; i++ {
-		w.scanStep(scan)
+	state := w.launching["a"]
+	w.handleDaemonLaunchResult(core.MessageDaemonLaunchResult{Name: "a", Node: remote, Epoch: state.Epoch, State: daemonLaunchStarted})
+	if !scan.scheduled {
+		t.Fatal("completion did not wake scanner")
 	}
-	if len(scan.page) != 1 {
-		t.Fatal("completion bypassed batch interval")
-	}
-	time.Sleep(time.Until(scan.nextBatchAt))
-	w.scanStep(scan)
-	if len(scan.page) != 0 {
-		t.Fatal("next batch did not progress")
+	actor.SendMessage(actor.PID(), messageScanStep{scan})
+	if len(scan.page) != 0 || len(w.launching) != 2 {
+		t.Fatal("completion did not admit next task")
 	}
 }
 
@@ -162,7 +159,6 @@ func TestFailedScannerTasksReleaseCapacityForOtherLaunchers(t *testing.T) {
 	actor := spawnDaemonUnit(t, book, self)
 	w := actor.Behavior().(*daemon)
 	w.isLeader = true
-	w.options.ScanBatchInterval = 0
 	launcher := gen.Atom(t.Name())
 	if err := core.RegisterLauncher(launcher, core.Launcher{Factory: func() gen.ProcessBehavior { return &daemonTestProc{} }, RecoveryScanner: core.SingletonDaemon("failed", nil)}); err != nil {
 		t.Fatal(err)

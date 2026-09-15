@@ -67,7 +67,10 @@ var (
 // timestamp. Backends reclaim expired data even if it is never read again.
 //
 // Acquisition errors are uncertain unless errors.Is(err, ErrRouteNotApplied).
-// Do not implicitly resend an acquisition after an uncertain transport failure.
+// Do not implicitly resend an initial acquisition after an uncertain transport
+// failure. Periodic renewal supplies its own exact owner as expected and may
+// retry while its last confirmed local deadline remains live; it must stop on
+// an owner mismatch instead of acquiring the replacement owner's route.
 // Successful operations must not silently roll back within the backend's stated
 // failure model. Session renewal must not refresh individual route records.
 type ActorRoutePersistence interface {
