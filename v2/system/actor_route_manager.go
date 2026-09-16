@@ -222,6 +222,9 @@ func (m *routeLeaseManager) expire(now time.Time) []gen.PID {
 	r := m.router
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.state == routerClosed {
+		return nil
+	}
 	pids := make([]gen.PID, 0, 128)
 	processed := 0
 	target := int64(now.Sub(m.started) / m.resolution)

@@ -121,7 +121,7 @@ A confirmed lost session or the local session deadline moves the router to Lost.
 
 Concurrent old and new actors after a membership-based takeover are an accepted availability tradeoff. With responsive storage/workers, the old actor detects replacement at its next renewal (normally within 90–110 minutes of the last successful acquisition/renewal by default); if renewal fails or stalls, its existing local deadline stops further dispatch (up to the remaining 2-hour route TTL, less the safety margin). Already-running Init, callbacks, and application goroutines must finish cooperatively. Routing does not provide exactly-once business execution; mailbox work, direct-PID messages, and self-timers can still execute on the old actor during the overlap.
 
-Shutdown enters Draining before stopping the node, then `router.Close()` stops local route management and closes the shared session. Session closure invalidates all associated routes; their records expire through their own TTLs. Session closure is bounded by `OperationTimeout`; a failure is logged and the session expires naturally. Custom bootstrap should call `router.Drain()`, stop the node, then call `router.Close()`. Business cleanup belongs to the node/application shutdown flow: `node.Wait()` can finish before Terminate callbacks return, and closing the session permits takeover while those callbacks are still running.
+Both `Stop()` and `StopForce()` call `router.Close()` before stopping the node. Router closure stops admission and local route management, then closes the shared session. Session closure invalidates all associated routes independently of business cleanup; their records expire through their own TTLs. Session closure is bounded by `OperationTimeout`; a failure is logged, node shutdown continues, and the session expires naturally. Custom bootstrap should call `router.Close()` before stopping the node. Business cleanup belongs to the node/application shutdown flow: already-running callbacks must finish cooperatively and may overlap a replacement actor. Existing actors follow the node's normal shutdown lifecycle, including shutdown messages and business termination callbacks.
 
 `ActorRoutes().Stats()` reports tracked lifecycle records, route queue depth, pending releases, session renewal failures, session losses, and release failures.
 
@@ -165,7 +165,7 @@ Deploy the daemon pull-protocol change to all cluster nodes together.
 
 Existing actors stay on their current nodes after expansion. Rolling upgrades recover actors as old instances exit; business state should be restored by the new instance's Init. Keep launcher names, recovery arguments, and message types compatible across coexisting versions. Placement uses node membership rather than launcher-version capabilities.
 
-Pod readiness does not remove a node from the registrar. The application must stop its Ergo node during shutdown. Give the container enough termination time for business cleanup and route release.
+Pod readiness does not remove a node from the registrar. The application must stop its Ergo node during shutdown. Give the container enough termination time for session closure and business cleanup.
 
 ## Cron and migration
 

@@ -117,6 +117,29 @@ func (a *routerTestActor) Terminate(reason error) {
 	a.terminated = true
 }
 
+func TestRoutedActorFollowsNodeShutdown(t *testing.T) {
+	r := routeRouter(t, routeStore(t), ActorRouterOptions{})
+	b := &routerTestActor{}
+	a, err := unit.Spawn(t, func() gen.ProcessBehavior {
+		return r.WithActorRoute("key", b)
+	}, gen.ProcessOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Close()
+	a.SendMessage(gen.PID{}, "finish shutdown work")
+	if b.messages != 1 {
+		t.Fatal("actor could not finish shutdown work")
+	}
+	a.DeliverExit(b.Parent(), gen.TerminateReasonShutdown)
+	if !b.terminated || !errors.Is(a.Reason(), gen.TerminateReasonShutdown) {
+		t.Fatal("actor did not complete node shutdown", a.Reason())
+	}
+	if r.Stats().Tracked != 0 {
+		t.Fatal("completed actor remained tracked")
+	}
+}
+
 func TestActorRouterOptionsAndValidation(t *testing.T) {
 	s := routeStore(t)
 	r := routeRouter(t, s, ActorRouterOptions{})

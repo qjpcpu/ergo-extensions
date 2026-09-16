@@ -503,6 +503,68 @@ func TestActorRouteCloseInvalidatesSession(t *testing.T) {
 	}
 }
 
+func TestActorRouteCloseDuringRenewal(t *testing.T) {
+	for _, kind := range []string{"session", "route"} {
+		t.Run(kind, func(t *testing.T) {
+			s := &faultRouteStore{MemoryActorRoutePersistence: routeStore(t)}
+			entered, finish, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			defer func() {
+				select {
+				case <-finish:
+				default:
+					close(finish)
+				}
+			}()
+			if kind == "session" {
+				s.renew = func(ctx context.Context, id SessionID, ttl time.Duration) (SessionLease, error) {
+					lease, err := s.MemoryActorRoutePersistence.RenewSession(ctx, id, ttl)
+					close(entered)
+					<-finish
+					defer close(returned)
+					return lease, err
+				}
+			} else {
+				s.acquire = func(ctx context.Context, id SessionID, key gen.Atom, pid gen.PID, expected *RouteOwner, ttl time.Duration) (AcquireRouteResult, error) {
+					result, err := s.MemoryActorRoutePersistence.AcquireRoute(ctx, id, key, pid, expected, ttl)
+					if expected != nil && *expected == (RouteOwner{SessionID: id, PID: pid}) {
+						close(entered)
+						<-finish
+						close(returned)
+					}
+					return result, err
+				}
+			}
+			o := shortRouteOptions()
+			o.RouteTTL = 500 * time.Millisecond
+			o.RouteRenewInterval = 50 * time.Millisecond
+			r := routeRouter(t, s, o)
+			b := &routerTestActor{}
+			wrapped := r.WithActorRoute("key", b)
+			_, err := unit.Spawn(t, func() gen.ProcessBehavior { return wrapped }, gen.ProcessOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				t.Fatal("renewal did not start")
+			}
+			r.Close()
+			snapshot, found, err := s.ReadRoute(context.Background(), "key")
+			if err != nil || !found || snapshot.SessionValid {
+				t.Fatal("in-flight renewal prevented session closure", snapshot, found, err)
+			}
+			wrapped.ProcessTerminate(gen.TerminateReasonShutdown)
+			close(finish)
+			<-returned
+			routeEventually(t, func() bool { return r.Stats().Tracked == 0 })
+			if _, err := s.MemoryActorRoutePersistence.RenewSession(context.Background(), r.session, time.Hour); !errors.Is(err, ErrSessionLost) {
+				t.Fatal("closed session became renewable", err)
+			}
+		})
+	}
+}
+
 func TestActorRouteLookupFailureDoesNotWrite(t *testing.T) {
 	s := &faultRouteStore{MemoryActorRoutePersistence: routeStore(t)}
 	want := errors.New("read unavailable")

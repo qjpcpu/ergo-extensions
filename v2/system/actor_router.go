@@ -230,7 +230,8 @@ func (r *ActorRouter) Drain() {
 }
 
 // Close stops local route management and closes the shared session.
-// Call after stopping the node; business callbacks must finish cooperatively.
+// Call before stopping the node so route invalidation does not wait for business
+// cleanup. Actor termination follows the node shutdown lifecycle.
 func (r *ActorRouter) Close() {
 	r.closeOnce.Do(func() {
 		r.mu.Lock()
@@ -384,84 +385,99 @@ func (r *ActorRouter) acquire(ctx context.Context, i *localRouteInstance) error 
 		r.finishLocked(i)
 		r.mu.Unlock()
 	}()
-	return func() error {
-		for {
-			if err := ctx.Err(); err != nil {
-				return notApplied(err)
-			}
-			snapshot, found, err := r.persistence.ReadRoute(ctx, i.key)
-			if err != nil {
-				return notApplied(err)
-			}
-			var expected *RouteOwner
-			if found {
-				valid, err := r.valid(snapshot)
-				if err != nil {
-					return notApplied(err)
-				}
-				if valid {
-					released, err := r.releaseCompletedLocal(ctx, snapshot)
-					if err != nil {
-						return notApplied(err)
-					}
-					if released {
-						continue
-					}
-					return ErrActorRouteTaken
-				}
-				owner := snapshot.Owner
-				expected = &owner
-			}
-			r.mu.Lock()
-			active := r.state == routerActive && time.Now().Before(r.deadline) && ctx.Err() == nil && !i.cleanup
-			id := r.session
-			r.mu.Unlock()
-			if !active {
-				if err := ctx.Err(); err != nil {
-					return notApplied(err)
-				}
-				return notApplied(ErrSessionLost)
-			}
-			start := time.Now()
-			result, err := safeRouteCall(func() (AcquireRouteResult, error) {
-				return r.persistence.AcquireRoute(ctx, id, i.key, i.pid, expected, r.options.RouteTTL)
-			})
-			if err != nil {
-				if !errors.Is(err, ErrRouteNotApplied) {
-					r.mu.Lock()
-					i.releaseNeeded = true
-					r.mu.Unlock()
-				}
-				if errors.Is(err, ErrSessionLost) {
-					r.lose()
-				}
-				return err
-			}
-			r.mu.Lock()
-			if result.Status != RouteAcquired {
-				r.mu.Unlock()
-				continue
-			}
-			i.releaseNeeded = true
-			i.deadline = start.Add(result.ValidFor - r.options.LeaseSafetyMargin)
-			i.scheduleRenewal(start, r.options.RouteRenewInterval)
-			if !i.cleanup && (r.state == routerActive || r.state == routerDraining) {
-				r.manager.scheduleLocked(i)
-			}
-			active = r.state == routerActive && time.Now().Before(r.deadline) && time.Now().Before(i.deadline)
-			r.mu.Unlock()
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if !active {
-				if err := r.instanceError(i); err != nil {
-					return err
-				}
-				return ErrActorRouterClosed
-			}
-			return nil
+	for {
+		expected, err := r.expectedRouteOwner(ctx, i.key)
+		if err != nil {
+			return err
 		}
-	}()
+		acquired, err := r.tryAcquireRoute(ctx, i, expected)
+		if err != nil || acquired {
+			return err
+		}
+	}
+}
+
+func (r *ActorRouter) expectedRouteOwner(ctx context.Context, key gen.Atom) (*RouteOwner, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, notApplied(err)
+		}
+		snapshot, found, err := r.persistence.ReadRoute(ctx, key)
+		if err != nil {
+			return nil, notApplied(err)
+		}
+		if !found {
+			return nil, nil
+		}
+		valid, err := r.valid(snapshot)
+		if err != nil {
+			return nil, notApplied(err)
+		}
+		if !valid {
+			return &snapshot.Owner, nil
+		}
+		released, err := r.releaseCompletedLocal(ctx, snapshot)
+		if err != nil {
+			return nil, notApplied(err)
+		}
+		if !released {
+			return nil, ErrActorRouteTaken
+		}
+	}
+}
+
+func (r *ActorRouter) tryAcquireRoute(ctx context.Context, i *localRouteInstance, expected *RouteOwner) (bool, error) {
+	r.mu.Lock()
+	active := r.state == routerActive && time.Now().Before(r.deadline) && ctx.Err() == nil && !i.cleanup
+	id := r.session
+	r.mu.Unlock()
+	if !active {
+		if err := ctx.Err(); err != nil {
+			return false, notApplied(err)
+		}
+		return false, notApplied(ErrSessionLost)
+	}
+	start := time.Now()
+	result, err := safeRouteCall(func() (AcquireRouteResult, error) {
+		return r.persistence.AcquireRoute(ctx, id, i.key, i.pid, expected, r.options.RouteTTL)
+	})
+	if err != nil {
+		if !errors.Is(err, ErrRouteNotApplied) {
+			r.mu.Lock()
+			i.releaseNeeded = true
+			r.mu.Unlock()
+		}
+		if errors.Is(err, ErrSessionLost) {
+			r.lose()
+		}
+		return false, err
+	}
+	if result.Status != RouteAcquired {
+		return false, nil
+	}
+	return true, r.acceptAcquiredRoute(ctx, i, start, result.ValidFor)
+}
+
+func (r *ActorRouter) acceptAcquiredRoute(ctx context.Context, i *localRouteInstance, start time.Time, validFor time.Duration) error {
+	r.mu.Lock()
+	i.releaseNeeded = true
+	i.deadline = start.Add(validFor - r.options.LeaseSafetyMargin)
+	i.scheduleRenewal(start, r.options.RouteRenewInterval)
+	if !i.cleanup && (r.state == routerActive || r.state == routerDraining) {
+		r.manager.scheduleLocked(i)
+	}
+	active := r.state == routerActive && time.Now().Before(r.deadline) && time.Now().Before(i.deadline)
+	r.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !active {
+		if err := r.instanceError(i); err != nil {
+			return err
+		}
+		return ErrActorRouterClosed
+	}
+	return nil
 }
 
 // A supervisor can receive an exit before Ergo invokes business Terminate.
@@ -531,6 +547,10 @@ func (r *ActorRouter) releaseExitedRoute(ctx context.Context, key gen.Atom, pid 
 func (r *ActorRouter) instanceError(i *localRouteInstance) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.instanceErrorLocked(i)
+}
+
+func (r *ActorRouter) instanceErrorLocked(i *localRouteInstance) error {
 	now := time.Now()
 	if r.state == routerLost || r.state == routerClosed || !now.Before(r.deadline) {
 		return ErrSessionLost
@@ -567,7 +587,10 @@ type behaviorPreservingProcess struct {
 
 func (p behaviorPreservingProcess) Behavior() gen.ProcessBehavior { return p.behavior }
 func (p behaviorPreservingProcess) State() gen.ProcessState {
-	if p.router.instanceError(p.instance) != nil {
+	p.router.mu.Lock()
+	expired := p.router.state != routerClosed && p.router.instanceErrorLocked(p.instance) != nil
+	p.router.mu.Unlock()
+	if expired {
 		return gen.ProcessStateZombee
 	}
 	return p.Process.State()
