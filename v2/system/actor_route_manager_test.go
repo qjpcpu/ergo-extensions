@@ -67,40 +67,71 @@ func (s *faultRouteStore) ReleaseRoute(c context.Context, id SessionID, k gen.At
 	}
 	return s.MemoryActorRoutePersistence.ReleaseRoute(c, id, k, p)
 }
-func TestActorRouteUncertainAcquireClosesSession(t *testing.T) {
-	for _, mode := range []string{"unknown", "panic", "not applied"} {
+
+type routeTestProcess struct {
+	gen.Process
+	pid gen.PID
+}
+
+func (p routeTestProcess) PID() gen.PID { return p.pid }
+
+func TestActorRouteFailedAcquireKeepsExistingActor(t *testing.T) {
+	for _, mode := range []string{"unknown", "panic", "not applied", "session lost"} {
 		t.Run(mode, func(t *testing.T) {
 			s := &faultRouteStore{MemoryActorRoutePersistence: routeStore(t)}
 			s.acquire = func(c context.Context, id SessionID, k gen.Atom, p gen.PID, o *RouteOwner, d time.Duration) (AcquireRouteResult, error) {
+				if k == "existing" {
+					return s.MemoryActorRoutePersistence.AcquireRoute(c, id, k, p, o, d)
+				}
 				if mode == "not applied" {
 					return AcquireRouteResult{}, notApplied(errors.New("unavailable"))
 				}
-				s.MemoryActorRoutePersistence.AcquireRoute(c, id, k, p, o, d)
+				if mode == "session lost" {
+					return AcquireRouteResult{}, notApplied(ErrSessionLost)
+				}
+				if _, err := s.MemoryActorRoutePersistence.AcquireRoute(c, id, k, p, o, d); err != nil {
+					return AcquireRouteResult{}, err
+				}
 				if mode == "panic" {
 					panic("response lost")
 				}
 				return AcquireRouteResult{}, errors.New("response lost")
 			}
 			r := routeRouter(t, s, shortRouteOptions())
+			node := unit.StartNode(t, "acquire@localhost", gen.NodeOptions{})
+			existing := &routerTestActor{}
+			first := r.WithActorRoute("existing", existing)
+			a, err := node.Spawn(func() gen.ProcessBehavior { return first }, gen.ProcessOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer first.ProcessTerminate(gen.TerminateReasonNormal)
 			b := &routerTestActor{}
 			wrapped := r.WithActorRoute("key", b)
-			_, e := unit.Spawn(t, func() gen.ProcessBehavior { return wrapped }, gen.ProcessOptions{})
-			if e == nil || b.initialized {
-				t.Fatal("uncertain acquisition ran Init", e)
+			pid := a.PID()
+			pid.ID++
+			err = wrapped.ProcessInit(routeTestProcess{Process: first, pid: pid})
+			if err == nil || b.initialized {
+				t.Fatal("failed acquisition ran Init", err)
 			}
-			wrapped.ProcessTerminate(e)
-			if mode == "not applied" {
-				if r.Stats().LeaseLosses != 0 {
-					t.Fatal("confirmed no-write lost session")
-				}
-			} else {
-				routeEventually(t, func() bool {
-					snapshot, found, _ := s.ReadRoute(context.Background(), "key")
-					return found && !snapshot.SessionValid
-				})
+			wrapped.ProcessTerminate(err)
+			if mode == "session lost" {
 				if r.Stats().LeaseLosses != 1 {
 					t.Fatal(r.Stats())
 				}
+				return
+			}
+			routeEventually(t, func() bool { return r.Stats().Tracked == 1 })
+			if _, found, err := s.ReadRoute(context.Background(), "key"); err != nil || found {
+				t.Fatal("failed route was not released", found, err)
+			}
+			snapshot, found, err := s.ReadRoute(context.Background(), "existing")
+			if err != nil || !found || !snapshot.SessionValid || r.Stats().LeaseLosses != 0 {
+				t.Fatal("existing route lost its session", snapshot, err, r.Stats())
+			}
+			a.SendMessage(gen.PID{}, "still running")
+			if existing.messages != 1 {
+				t.Fatal("existing actor stopped dispatching")
 			}
 		})
 	}
@@ -291,7 +322,13 @@ func TestActorRouteFailedBusinessInitReleasesAfterCleanup(t *testing.T) {
 	}
 }
 func TestActorRouteQueuedCancellationKeepsSession(t *testing.T) {
-	r := routeRouter(t, routeStore(t), shortRouteOptions())
+	s := &faultRouteStore{MemoryActorRoutePersistence: routeStore(t)}
+	var reads atomic.Int64
+	s.read = func(ctx context.Context, key gen.Atom) (RouteSnapshot, bool, error) {
+		reads.Add(1)
+		return s.MemoryActorRoutePersistence.ReadRoute(ctx, key)
+	}
+	r := routeRouter(t, s, shortRouteOptions())
 	base, e := unit.Spawn(t, func() gen.ProcessBehavior { return &routerTestActor{} }, gen.ProcessOptions{})
 	if e != nil {
 		t.Fatal(e)
@@ -315,7 +352,13 @@ func TestActorRouteQueuedCancellationKeepsSession(t *testing.T) {
 		close(finish)
 		t.Fatal("queued cancellation lost session")
 	}
+	// Execute the queued work after admission has already timed out.
+	job := <-r.manager.jobs
+	job()
 	close(finish)
+	if reads.Load() != 0 {
+		t.Fatal("expired queued admission accessed storage")
+	}
 	routeEventually(t, func() bool { return r.Stats().Tracked == 0 })
 }
 func TestActorRouteAdmissionBackpressure(t *testing.T) {
@@ -500,35 +543,48 @@ func TestActorRouteLookupContext(t *testing.T) {
 	}
 }
 
-func TestActorRouteUnknownInFlightWriteClosesBeforeLateResult(t *testing.T) {
-	s := &faultRouteStore{MemoryActorRoutePersistence: routeStore(t)}
-	finish := make(chan struct{})
-	returned := make(chan error, 1)
-	s.acquire = func(_ context.Context, id SessionID, k gen.Atom, p gen.PID, o *RouteOwner, d time.Duration) (AcquireRouteResult, error) {
-		<-finish
-		v, e := s.MemoryActorRoutePersistence.AcquireRoute(context.Background(), id, k, p, o, d)
-		returned <- e
-		return v, e
-	}
-	r := routeRouter(t, s, shortRouteOptions())
-	b := &routerTestActor{}
-	wrapped := r.WithActorRoute("key", b)
-	_, e := unit.Spawn(t, func() gen.ProcessBehavior { return wrapped }, gen.ProcessOptions{})
-	wrapped.ProcessTerminate(e)
-	if !errors.Is(e, context.DeadlineExceeded) && (e == nil || !strings.Contains(e.Error(), context.DeadlineExceeded.Error())) {
-		close(finish)
-		t.Fatal(e)
-	}
-	routeEventually(t, func() bool {
-		_, e := s.MemoryActorRoutePersistence.RenewSession(context.Background(), r.session, time.Second)
-		return errors.Is(e, ErrSessionLost)
-	})
-	close(finish)
-	if e := <-returned; !errors.Is(e, ErrSessionLost) {
-		t.Fatal(e)
-	}
-	if b.initialized {
-		t.Fatal("late write initialized actor")
+func TestActorRouteLateAcquireIsReleasedAfterReturn(t *testing.T) {
+	for _, uncertain := range []bool{false, true} {
+		t.Run(fmt.Sprint(uncertain), func(t *testing.T) {
+			s := &faultRouteStore{MemoryActorRoutePersistence: routeStore(t)}
+			finish := make(chan struct{})
+			var releases atomic.Int64
+			s.acquire = func(_ context.Context, id SessionID, k gen.Atom, p gen.PID, o *RouteOwner, d time.Duration) (AcquireRouteResult, error) {
+				<-finish
+				result, err := s.MemoryActorRoutePersistence.AcquireRoute(context.Background(), id, k, p, o, d)
+				if uncertain && err == nil {
+					err = errors.New("response lost")
+				}
+				return result, err
+			}
+			s.release = func(c context.Context, id SessionID, k gen.Atom, p gen.PID) error {
+				if releases.Add(1) == 1 {
+					return errors.New("temporary release failure")
+				}
+				return s.MemoryActorRoutePersistence.ReleaseRoute(c, id, k, p)
+			}
+			r := routeRouter(t, s, shortRouteOptions())
+			b := &routerTestActor{}
+			wrapped := r.WithActorRoute("key", b)
+			_, err := unit.Spawn(t, func() gen.ProcessBehavior { return wrapped }, gen.ProcessOptions{})
+			wrapped.ProcessTerminate(err)
+			if err == nil || !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+				close(finish)
+				t.Fatal(err)
+			}
+			if r.Stats().Tracked != 1 || r.Stats().LeaseLosses != 0 || releases.Load() != 0 {
+				close(finish)
+				t.Fatal("in-flight write lost cleanup responsibility", r.Stats(), releases.Load())
+			}
+			close(finish)
+			routeEventually(t, func() bool { return r.Stats().Tracked == 0 })
+			if b.initialized || releases.Load() < 2 || r.Stats().LeaseLosses != 0 {
+				t.Fatal("late result was not cleaned locally", b.initialized, releases.Load(), r.Stats())
+			}
+			if _, found, err := s.ReadRoute(context.Background(), "key"); err != nil || found {
+				t.Fatal("late write retained its route", found, err)
+			}
+		})
 	}
 }
 func TestActorRouteQueueSaturationIsBounded(t *testing.T) {

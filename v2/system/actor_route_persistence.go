@@ -68,7 +68,8 @@ var (
 //
 // Acquisition errors are uncertain unless errors.Is(err, ErrRouteNotApplied).
 // Do not implicitly resend an initial acquisition after an uncertain transport
-// failure. Periodic renewal supplies its own exact owner as expected and may
+// failure. Failed admission releases the exact owner after acquisition returns,
+// including when its outcome is uncertain. Periodic renewal supplies its own exact owner as expected and may
 // retry while its last confirmed local deadline remains live; it must stop on
 // an owner mismatch instead of acquiring the replacement owner's route.
 // Successful operations must not silently roll back within the backend's stated

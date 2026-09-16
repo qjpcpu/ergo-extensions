@@ -2,12 +2,15 @@ package system
 
 import (
 	"context"
+	"errors"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
 	"ergo.services/ergo/act"
 	"ergo.services/ergo/gen"
 	"ergo.services/ergo/testing/unit"
-	"sync"
-	"testing"
-	"time"
 )
 
 type handoffActor struct {
@@ -63,7 +66,7 @@ func TestActorRouteLocalRestartWaitsForConfirmedCleanup(t *testing.T) {
 	r.Bind(n)
 	oldPID := gen.PID{Node: n.Name(), ID: 100}
 	s.AcquireRoute(context.Background(), r.session, "key", oldPID, nil, time.Hour)
-	old := &localRouteInstance{key: "key", pid: oldPID, acquired: true, done: make(chan struct{})}
+	old := &localRouteInstance{key: "key", pid: oldPID, releaseNeeded: true, done: make(chan struct{})}
 	r.mu.Lock()
 	r.instances[oldPID] = old
 	r.mu.Unlock()
@@ -82,7 +85,6 @@ func TestActorRouteLocalRestartWaitsForConfirmedCleanup(t *testing.T) {
 	}
 	r.mu.Lock()
 	old.cleanup = true
-	close(old.done)
 	r.finishLocked(old)
 	r.mu.Unlock()
 	if e := <-result; e != nil {
@@ -91,5 +93,65 @@ func TestActorRouteLocalRestartWaitsForConfirmedCleanup(t *testing.T) {
 	snapshot, found, e = s.ReadRoute(context.Background(), "key")
 	if e != nil || !found || snapshot.Owner.PID != next.pid {
 		t.Fatal(snapshot, found, e)
+	}
+}
+
+func TestLocalReplacementWaitsForTimedOutAcquire(t *testing.T) {
+	s := &faultRouteStore{MemoryActorRoutePersistence: routeStore(t)}
+	r := routeRouter(t, s, ActorRouterOptions{})
+	n := &routeExitedNode{Node: routeNode(t), entered: make(chan struct{})}
+	if err := r.Bind(n); err != nil {
+		t.Fatal(err)
+	}
+	oldPID := gen.PID{Node: n.Name(), ID: 100}
+	written, finish := make(chan struct{}), make(chan struct{})
+	var releases atomic.Int64
+	s.acquire = func(c context.Context, id SessionID, k gen.Atom, p gen.PID, expected *RouteOwner, ttl time.Duration) (AcquireRouteResult, error) {
+		result, err := s.MemoryActorRoutePersistence.AcquireRoute(c, id, k, p, expected, ttl)
+		if p == oldPID {
+			close(written)
+			<-finish
+		}
+		return result, err
+	}
+	s.release = func(c context.Context, id SessionID, k gen.Atom, p gen.PID) error {
+		releases.Add(1)
+		return s.MemoryActorRoutePersistence.ReleaseRoute(c, id, k, p)
+	}
+	old := &localRouteInstance{key: "key", pid: oldPID, done: make(chan struct{})}
+	r.mu.Lock()
+	r.instances[oldPID] = old
+	r.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- r.acquire(ctx, old) }()
+	<-written
+	cancel()
+	lifecycle := routeLifecycle{router: r, instance: old}
+	lifecycle.cleanup()
+	next := &localRouteInstance{key: "key", pid: gen.PID{Node: n.Name(), ID: 101}}
+	replaced := make(chan error, 1)
+	go func() { replaced <- r.acquire(context.Background(), next) }()
+	<-n.entered
+	if releases.Load() != 0 {
+		t.Error("release preceded acquisition completion")
+	}
+	select {
+	case err := <-replaced:
+		t.Error("replacement passed an unfinished write", err)
+	default:
+	}
+	close(finish)
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	if err := <-replaced; err != nil {
+		t.Fatal(err)
+	}
+	routeEventually(t, func() bool { return r.Stats().Tracked == 0 })
+	snapshot, found, err := s.ReadRoute(context.Background(), "key")
+	if err != nil || !found || snapshot.Owner.PID != next.pid {
+		t.Fatal("cleanup deleted replacement", snapshot, found, err)
 	}
 }

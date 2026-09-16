@@ -2,6 +2,7 @@ package system_test
 
 import (
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,12 +18,15 @@ import (
 
 func TestDaemonRecoveryPullsAcrossNodes(t *testing.T) {
 	const pageSize = 100
-	for _, tc := range []struct {
+	type scenario struct {
 		total, limit int
 		initDelay    time.Duration
-	}{
-		{1000, 64, 0}, {100, 64, 200 * time.Millisecond}, {20, 4, 0},
-	} {
+	}
+	cases := []scenario{{1000, 64, 0}, {100, 64, 200 * time.Millisecond}, {20, 4, 0}}
+	if os.Getenv("ERGO_TEST_DAEMON_SCALE") != "" {
+		cases = append(cases, scenario{10000, 64, 0})
+	}
+	for _, tc := range cases {
 		t.Run(fmt.Sprintf("tasks-%d-limit-%d", tc.total, tc.limit), func(t *testing.T) {
 			ready, release := make(chan struct{}), make(chan struct{})
 			var readyOnce, releaseOnce sync.Once
@@ -131,10 +135,12 @@ func TestDaemonRecoveryPullsAcrossNodes(t *testing.T) {
 			if got := stats(source)["scan_pending"]; got != fmt.Sprint(min(tc.total, pageSize)-tc.limit) {
 				t.Fatalf("remaining scanner items = %s", got)
 			}
+			started := time.Now()
 			unblock()
-			waitUntil(t, 10*time.Second, func() bool {
+			waitUntil(t, 60*time.Second, func() bool {
 				return completed.Load() == int32(tc.total) && stats(source)["launching_count"] == "0" && stats(target)["pending_launches"] == "0"
 			})
+			t.Logf("launched=%d duration=%s", tc.total, time.Since(started))
 			if got := peak.Load(); got != int32(workers) {
 				t.Fatalf("Init concurrency = %d, want %d", got, workers)
 			}
@@ -147,6 +153,27 @@ func TestDaemonRecoveryPullsAcrossNodes(t *testing.T) {
 			for i := workers; i < tc.total; i++ {
 				if node := <-entered; node != target.Name() {
 					t.Fatalf("Init ran on %s, want %s", node, target.Name())
+				}
+			}
+			if tc.total == 10000 {
+				started = time.Now()
+				target.Stop()
+				target.WaitWithTimeout(5 * time.Second)
+				waitUntil(t, 5*time.Second, func() bool { return source.Topology().GetAvailableNodes().Len() == 1 })
+				if err := source.Send(gen.Atom("extensions_daemon"), core.MessageLaunchAllDaemon{}); err != nil {
+					t.Fatal(err)
+				}
+				waitUntil(t, 60*time.Second, func() bool { return completed.Load() == int32(2*tc.total) && stats(source)["launching_count"] == "0" })
+				t.Logf("recovered_after_node_stop=%d duration=%s", tc.total, time.Since(started))
+				for range tc.total {
+					if node := <-entered; node != source.Name() {
+						t.Fatalf("recovered on %s, want %s", node, source.Name())
+					}
+				}
+				for _, proc := range processes {
+					if node, found := locateNode(source, proc.ProcessName); !found || node != source.Name() {
+						t.Fatalf("recovery route %s: node=%s found=%v", proc.ProcessName, node, found)
+					}
 				}
 			}
 		})

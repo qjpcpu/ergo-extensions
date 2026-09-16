@@ -119,19 +119,19 @@ type ActorRouter struct {
 	sessionCloseOnce                            sync.Once
 }
 type localRouteInstance struct {
-	done                                           chan struct{}
-	key                                            gen.Atom
-	pid                                            gen.PID
-	deadline                                       time.Time
-	renewAt                                        time.Time
-	renewing                                       bool
-	renewJitter                                    uint64
-	renewRetryDelay                                time.Duration
-	acquiring, writing, acquired, cleanup, stopped bool
-	releasing                                      bool
-	release                                        *list.Element
-	retryAt                                        time.Time
-	slot                                           int64
+	done                                                 chan struct{}
+	key                                                  gen.Atom
+	pid                                                  gen.PID
+	deadline                                             time.Time
+	renewAt                                              time.Time
+	renewing                                             bool
+	renewJitter                                          uint64
+	renewRetryDelay                                      time.Duration
+	acquiring, releaseNeeded, cleanup, stopped, finished bool
+	releasing                                            bool
+	release                                              *list.Element
+	retryAt                                              time.Time
+	slot                                                 int64
 }
 
 func NewActorRouter(p ActorRoutePersistence, o ActorRouterOptions) (*ActorRouter, error) {
@@ -367,9 +367,20 @@ func (r *ActorRouter) lookup(ctx context.Context, key gen.Atom) (gen.PID, bool, 
 	return value.pid, true, nil
 }
 func (r *ActorRouter) acquire(ctx context.Context, i *localRouteInstance) error {
+	r.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		r.mu.Unlock()
+		return notApplied(err)
+	}
+	if i.cleanup {
+		r.mu.Unlock()
+		return notApplied(ErrActorRouterClosed)
+	}
+	i.acquiring = true
+	r.mu.Unlock()
 	defer func() {
 		r.mu.Lock()
-		i.acquiring, i.writing = false, false
+		i.acquiring = false
 		r.finishLocked(i)
 		r.mu.Unlock()
 	}()
@@ -402,8 +413,7 @@ func (r *ActorRouter) acquire(ctx context.Context, i *localRouteInstance) error 
 				expected = &owner
 			}
 			r.mu.Lock()
-			active := r.state == routerActive && time.Now().Before(r.deadline) && ctx.Err() == nil
-			i.writing = active
+			active := r.state == routerActive && time.Now().Before(r.deadline) && ctx.Err() == nil && !i.cleanup
 			id := r.session
 			r.mu.Unlock()
 			if !active {
@@ -417,25 +427,32 @@ func (r *ActorRouter) acquire(ctx context.Context, i *localRouteInstance) error 
 				return r.persistence.AcquireRoute(ctx, id, i.key, i.pid, expected, r.options.RouteTTL)
 			})
 			if err != nil {
-				if !errors.Is(err, ErrRouteNotApplied) || errors.Is(err, ErrSessionLost) {
+				if !errors.Is(err, ErrRouteNotApplied) {
+					r.mu.Lock()
+					i.releaseNeeded = true
+					r.mu.Unlock()
+				}
+				if errors.Is(err, ErrSessionLost) {
 					r.lose()
 				}
 				return err
 			}
 			r.mu.Lock()
-			i.writing = false
 			if result.Status != RouteAcquired {
 				r.mu.Unlock()
 				continue
 			}
-			i.acquired = true
+			i.releaseNeeded = true
 			i.deadline = start.Add(result.ValidFor - r.options.LeaseSafetyMargin)
 			i.scheduleRenewal(start, r.options.RouteRenewInterval)
-			if r.state == routerActive || r.state == routerDraining {
+			if !i.cleanup && (r.state == routerActive || r.state == routerDraining) {
 				r.manager.scheduleLocked(i)
 			}
 			active = r.state == routerActive && time.Now().Before(r.deadline) && time.Now().Before(i.deadline)
 			r.mu.Unlock()
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if !active {
 				if err := r.instanceError(i); err != nil {
 					return err
@@ -482,19 +499,16 @@ func (r *ActorRouter) releaseCompletedLocal(ctx context.Context, snapshot RouteS
 }
 
 func (r *ActorRouter) finishLocked(i *localRouteInstance) {
-	if !i.cleanup {
+	if !i.cleanup || i.acquiring || i.renewing {
 		return
 	}
-	if r.state == routerLost || r.state == routerClosed {
-		r.manager.removeLocked(i)
-		delete(r.instances, i.pid)
-		return
-	}
-	if i.acquiring || i.renewing {
-		return
+	// Replacements may release this owner only after its callbacks and writes finish.
+	if !i.finished {
+		i.finished = true
+		close(i.done)
 	}
 	r.manager.removeLocked(i)
-	if !i.acquired || r.state == routerLost || r.state == routerClosed {
+	if !i.releaseNeeded || r.state == routerLost || r.state == routerClosed {
 		delete(r.instances, i.pid)
 		return
 	}
@@ -589,7 +603,12 @@ func isNilBehavior(b gen.ProcessBehavior) bool {
 	return false
 }
 func (l *routeLifecycle) init(p gen.Process, args ...any) (err error) {
-	defer func() { l.initErr = err }()
+	defer func() {
+		l.initErr = err
+		if err != nil && !l.initialized {
+			l.cleanup()
+		}
+	}()
 	if l.initErr != nil {
 		return l.initErr
 	}
@@ -609,7 +628,7 @@ func (l *routeLifecycle) init(p gen.Process, args ...any) (err error) {
 		r.mu.Unlock()
 		return ErrActorRouterBusy
 	}
-	i := &localRouteInstance{key: l.key, pid: p.PID(), acquiring: true, done: make(chan struct{})}
+	i := &localRouteInstance{key: l.key, pid: p.PID(), done: make(chan struct{})}
 	l.instance = i
 	r.instances[i.pid] = i
 	r.mu.Unlock()
@@ -617,16 +636,9 @@ func (l *routeLifecycle) init(p gen.Process, args ...any) (err error) {
 	defer cancel()
 	_, err = routeWork(r, ctx, func() (struct{}, error) { return struct{}{}, r.acquire(ctx, i) })
 	if err != nil {
-		r.mu.Lock()
-		if errors.Is(err, ErrActorRouterBusy) || errors.Is(err, ErrRouteNotApplied) {
-			i.acquiring = false
-		}
-		if i.writing {
-			r.mu.Unlock()
-			r.lose()
-		} else {
-			r.mu.Unlock()
-		}
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := r.instanceError(i); err != nil {
@@ -645,20 +657,22 @@ func (l *routeLifecycle) init(p gen.Process, args ...any) (err error) {
 	return err
 }
 func (l *routeLifecycle) terminate(reason error) {
-	defer func() {
-		if l.instance != nil {
-			r := l.router
-			r.mu.Lock()
-			if !l.instance.cleanup {
-				l.instance.cleanup = true
-				close(l.instance.done)
-			}
-			r.finishLocked(l.instance)
-			r.mu.Unlock()
-		}
-	}()
+	defer l.cleanup()
 	if l.initialized {
 		l.behavior.ProcessTerminate(reason)
+	}
+}
+
+func (l *routeLifecycle) cleanup() {
+	if l.instance == nil {
+		return
+	}
+	r := l.router
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !l.instance.cleanup {
+		l.instance.cleanup = true
+		r.finishLocked(l.instance)
 	}
 }
 
