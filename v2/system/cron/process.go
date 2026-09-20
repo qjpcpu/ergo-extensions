@@ -76,6 +76,15 @@ func Factory(source Source, options SchedulerOptions) gen.ProcessFactory {
 }
 
 func (p *Process) Init(args ...any) error {
+	if network := p.Node().Network(); network.Mode() != gen.NetworkModeDisabled {
+		if err := network.RegisterTypes([]any{
+			InspectRequest{},
+			MessageTrigger{},
+			MessageTriggerBatch{},
+		}); err != nil {
+			return err
+		}
+	}
 	if p.source == nil {
 		return nil
 	}

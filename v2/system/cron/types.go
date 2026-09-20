@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"ergo.services/ergo/gen"
-	"ergo.services/ergo/net/edf"
 )
 
 const (
@@ -214,18 +213,4 @@ type MessageTrigger struct {
 
 type MessageTriggerBatch struct {
 	Jobs []MessageTrigger
-}
-
-func init() {
-	for _, item := range []any{
-		InspectRequest{},
-		MessageTrigger{},
-		MessageTriggerBatch{},
-	} {
-		err := edf.RegisterTypeOf(item)
-		if err == nil || err == gen.ErrTaken {
-			continue
-		}
-		panic(err)
-	}
 }

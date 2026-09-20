@@ -207,6 +207,20 @@ func FactoryWithRouteCleanup(book core.IAddressBook, decorate RouteDecorator, op
 }
 
 func (w *daemon) Init(args ...any) error {
+	if network := w.Node().Network(); network.Mode() != gen.NetworkModeDisabled {
+		if err := network.RegisterTypes([]any{
+			core.MessageLaunchAllDaemon{},
+			core.DaemonProcess{},
+			core.MessageEnsureDaemon{},
+			core.MessageLaunchOneDaemon{},
+			core.MessageDaemonLaunchOffer{},
+			core.MessageDaemonLaunchPull{},
+			core.MessageDaemonLaunchWithdraw{},
+			core.MessageDaemonLaunchResult{},
+		}); err != nil {
+			return err
+		}
+	}
 	w.SetTrapExit(true)
 	w.SendAfter(w.PID(), messageInit{}, time.Second*1)
 	return nil

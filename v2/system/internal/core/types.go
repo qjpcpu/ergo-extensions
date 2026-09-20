@@ -1,9 +1,6 @@
 package core
 
-import (
-	"ergo.services/ergo/gen"
-	"ergo.services/ergo/net/edf"
-)
+import "ergo.services/ergo/gen"
 
 type (
 	MessageLaunchAllDaemon struct{}
@@ -46,23 +43,3 @@ type (
 		Err   string
 	}
 )
-
-func init() {
-	types := []any{
-		MessageLaunchAllDaemon{},
-		DaemonProcess{},
-		MessageEnsureDaemon{},
-		MessageLaunchOneDaemon{},
-		MessageDaemonLaunchOffer{},
-		MessageDaemonLaunchPull{},
-		MessageDaemonLaunchWithdraw{},
-		MessageDaemonLaunchResult{},
-	}
-	for _, value := range types {
-		err := edf.RegisterTypeOf(value)
-		if err == nil || err == gen.ErrTaken {
-			continue
-		}
-		panic(err)
-	}
-}
